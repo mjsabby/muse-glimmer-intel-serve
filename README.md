@@ -36,9 +36,11 @@ sibling stacks it is derived from.
 | drafter | `-assistant`: DFlash block diffusion, 5 layers, 16-token blocks |
 
 Weights load from Hugging Face safetensors or from the official GGUFs
-(`muse-glimmer` main, `clip` mmproj, `dflash` drafter). BF16 for the full model
-is ~59.6 GB and does not fit two B70s — **Q8 is the two-card configuration and
-Q4_K the one-card configuration.**
+(`muse-glimmer` main, `clip` mmproj, `dflash` drafter). BF16 weights are
+55.5 GiB and **do** fit two B70s (27.7 GiB/card, 4.2 GiB/card free); with only
+2 KV heads the cache is 13 KiB/token, so even the full 131 K window is under
+0.9 GiB/card. Q8 is the comfortable tier and the one that leaves room for a
+resident drafter. See [the memory budget](docs/plan.md#memory-budget-and-weight-tiers).
 
 ## References
 

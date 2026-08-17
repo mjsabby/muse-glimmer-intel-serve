@@ -251,17 +251,98 @@ Kernel inventory, in dependency order:
    regardless of `--max-seq`), linear cache for the 13 global layers. This is
    gemma4's design and it maps 1:1.
 5. Chunked prefill with a bounded activation scratch.
-6. Q8_0 weight tier with activation-quantized MMVQ decode.
+6. Q8_0 weight tier, quantized at load from the same BF16 checkpoint the oracle
+   binds (see "The Q8 tier and MMVQ" below).
 
-Memory sketch, BF16, per B70 (31.9 GiB): weights are ~59.6 GB for the full
-model, so **BF16 does not fit on two cards** — Q8 (~30 GB) is the two-card
-configuration and Q4_K (~17–20 GB) is the one-card configuration. This is the
-opposite balance from gemma4's 31B, and it means the Q8/Q4 tiers are not an
-optimization, they are the product. Plan the allocation planner accordingly and
-prewarm-then-seal as both siblings do.
+Allocation planning and prewarm-then-seal follow both siblings: prewarm the
+widest prefill and deepest decode at startup, then arm allocation seal mode 2 so
+memory failure is a startup event, not a mid-request event.
 
 **Exit gates**: per-kernel bitwise/envelope gates vs the twin; decode
 bit-reproducible across reruns and thread counts; `run_gpu_gates.sh` green.
+
+### Memory budget and weight tiers
+
+Two Arc Pro B70s = 63.8 GiB. Target 29.777 B params, drafter 2.556 B (both
+counts exact, from the checkpoint indices).
+
+| tier | target | /card | drafter | free/card after both |
+|---|---:|---:|---:|---:|
+| BF16 | 55.46 GiB | 27.73 | 4.76 GiB | 1.79 |
+| Q8_0 | 29.46 GiB | 14.73 | 2.53 GiB | 15.90 |
+| Q4_K_M | 16.81 GiB | 8.41 | 1.44 GiB | 22.77 |
+
+**BF16 fits two cards.** 27.73 GiB/card leaves 4.17 GiB/card before caches. The
+KV cache is unusually cheap here: 2 KV heads × head_dim 128 in bf16 is
+**1 KiB per layer per token**, and only the 13 global layers grow — the 39
+sliding layers hold a fixed `sliding_window + chunk` ring.
+
+| context | global KV | sliding rings | per card |
+|---|---:|---:|---:|
+| 32 768 | 0.406 GiB | 0.114 GiB | 0.26 |
+| 65 536 | 0.812 GiB | 0.114 GiB | 0.46 |
+| 131 072 (full window) | 1.625 GiB | 0.114 GiB | 0.87 |
+
+So BF16 at the **full 131 K window** still leaves ~3.3 GiB/card. The binding
+constraint on BF16 is not the cache — it is prefill chunk scratch, the vision
+tower's patch reserve, oneDNN workspaces, and (decisively) a resident drafter:
+a BF16 drafter costs 2.38 GiB/card and drops the margin to ~0.9 GiB, which is
+not enough. Meta ships `dflash-Muse-Glimmer-30B-Q4_K_M.gguf` and
+`dflash-kquant.gguf` for exactly this reason, so **BF16 target + quantized
+drafter** (0.72 GiB/card) is the configuration to plan for.
+
+Q8 target on **one card** is 29.46 GiB against 31.9 — 2.44 GiB free, viable at
+modest context, the same shape as qwen35's one-card 27B Q8 at 16 K. Q4_K_M on
+one card leaves 15 GiB and is the obvious consumer-hardware tier.
+
+Planned defaults, to be replaced by measured prewarm depths:
+
+| config | cards | expected context |
+|---|---:|---|
+| BF16 plain | 2 | full 131 072 (validate by prewarm) |
+| BF16 + Q4 drafter | 2 | 131 072, tighter scratch |
+| Q8 plain | 2 | 131 072, comfortable |
+| Q8 plain | 1 | ~16 384–32 768 |
+| Q4_K_M | 1 | 131 072 |
+
+Every row above is paper arithmetic. gemma4's hard-won lesson applies verbatim:
+**`max ctx` is an allocation ceiling, not a usable-prefill one** — the number
+that counts is the deepest position that prewarms *and* decodes, and that has to
+be measured on the box.
+
+### The Q8 tier and MMVQ
+
+MMVQ ("mat-vec quantized") is the decode-path GEMV that keeps the activation
+quantized instead of dequantizing the weight to float first: the activation
+vector is quantized once per 32-element block, and the block dot runs
+`int8 × int8 → int32` (the dp4a idiom, pattern-matched by IGC on Arc). It is
+not specific to Q8 — llama.cpp uses the same scheme for every quantized weight
+format, Q4_K included; Q8_0 is just the easiest case because the weight blocks
+are already int8 + f16 scale.
+
+Both siblings implement it, and they reached **opposite defaults** — this is the
+single most useful thing to inherit here:
+
+- qwen35 runs MMVQ for Q8 decode by default.
+- gemma4 measured it and turned it **off** (`docs/gpu.md`, 2026-07-16). Variant
+  A — dequantize per-element in-register into the standard lane-strided f32-fma
+  structure — beat MMVQ by 2–5% on every model at 12718 depth (E2B 89.8 vs 85.7,
+  31B 17.7 vs 17.5). The reasoning: decode is **weight-bandwidth-bound**, both
+  variants stream identical weight bytes, and MMVQ adds an activation-quant
+  launch per GEMV while its integer dots buy nothing at these shapes.
+
+Muse Glimmer's decode shapes are dense and wide (no MoE, `H = 6656`,
+`I = 19968`), which is exactly the regime where gemma4's negative result was
+measured. So: **implement variant A first, keep MMVQ behind
+`ORACLE_GPU_MMVQ=1`, and re-measure rather than assume.** If MMVQ ever wins it
+will be on the Q4_K tier, where the bits-per-weight is lower and the dequant
+cost per streamed byte is higher — that is the one configuration neither sibling
+tested, and it is worth a bench line of its own.
+
+Q8 is a **separate accuracy tier, not the bf16 twin band**: quantize at load
+with `quantize_row_q8_0_ref` semantics so the weights are bit-identical to a
+llama.cpp Q8_0 GGUF, then gate against llama.cpp-Q8_0 and against the f64
+oracle, per gemma4's `docs/q8_vs_llamacpp.md`.
 
 ## Phase 8 — Dual-GPU tensor parallelism
 
@@ -343,6 +424,13 @@ The engine work the block drafter needs, once Phase 5 has pinned the semantics:
   MTP taps only the pre-final-norm hidden. The tap must survive tensor-parallel
   sharding: those hiddens are the full 6656-wide residual, so they need a gather
   across cards before the drafter's `fc`.
+- **The drafter must support its own weight tier, independent of the target's.**
+  A BF16 target plus a BF16 drafter leaves ~0.9 GiB/card, which is not enough
+  (see the memory budget). Meta publishes `dflash-Muse-Glimmer-30B-Q4_K_M.gguf`
+  and `dflash-kquant.gguf` precisely for this; the loader should accept a
+  quantized drafter against a BF16 target, and the drafter's accuracy tier is
+  gated separately (against the f64 drafter oracle from Phase 5) since a lossier
+  drafter costs acceptance rate, not correctness.
 - One drafter call proposes 16 tokens; the target verifies all 16 rows in one
   batched forward; rejection rolls back to the first mismatch and replays.
   Distribution-preserving acceptance (llama.cpp-style target sampling) so greedy
@@ -353,6 +441,27 @@ The engine work the block drafter needs, once Phase 5 has pinned the semantics:
 
 **Exit gate**: `spec_parity.py` shows greedy spec output bit-identical to plain
 greedy; measured acceptance and tok/s published per tier.
+
+### Write the block-drafter engine model-generically
+
+DFlash is a *trained* companion network, not an architecture trick — there is no
+DFlash drafter for Gemma 4 or Qwen3.6 today, and one cannot be derived from
+their weights; it would have to be trained against each target. But nothing in
+the **serving machinery** is Muse-Glimmer-specific: a multi-layer hidden-state
+tap, a context projection, a bidirectional block of `B` mask tokens, one target
+verification pass over `B` rows, and block-level rollback are all generic. The
+model-specific parts are just `block_size`, `target_layer_ids`, `mask_token_id`,
+and the drafter's own layer stack.
+
+The siblings would benefit if such drafters ever existed: Gemma 4 uses EAGLE
+heads at k=6 and Qwen3.6 an in-checkpoint MTP at k=4, both of which draft a
+*chain* one token at a time, where DFlash proposes 16 in a single pass (Meta
+measures 3.1× on a 5090 vs 2.77× for gemma4's 31B EAGLE at k=6). So the block
+path should be built behind the same draft-backend interface the gemma4 engine
+already uses for `--draft-assistant` / `--draft-model`, with the block
+parameters read from config rather than hardcoded. That costs nothing here and
+makes the work portable if a DFlash head is ever trained for either sibling.
+It is explicitly **not** in this repo's scope to train one.
 
 ## Phase 11 — Benchmarks and comparison
 
@@ -394,8 +503,46 @@ first.
 | Norm convention mix-up (centered vs plain, two eps) | logits drift subtly; passes smoke tests | load-time assertions + a dedicated tiny-model gate per norm site (Phase 1) |
 | GGUF `-1` on the wrong tensor set | GGUF and safetensors paths silently disagree | byte-probe assertion at load: GGUF `output_norm` must equal safetensors `norm`; the four layer norms must differ by exactly 1.0 |
 | Vision RoPE `(w, h)` flip and `+1` offset | every vision logit wrong, image captions merely "worse" | fixture test against reference `position_ids` before the tower is written |
-| BF16 does not fit two B70s | a BF16-first plan strands at Phase 7 | Q8 is the two-card target and Q4_K the one-card target from the start; BF16 stays an oracle/twin concept |
+| BF16 + BF16 drafter does not fit two B70s | speculative BF16 serving strands late, after the drafter engine work is done | plan the drafter as a **quantized** resident from the start (Meta ships Q4_K and kquant drafter GGUFs); BF16 target + Q4 drafter is the configuration |
+| Paper memory budget vs. measured prewarm depth | `max ctx` is an allocation ceiling, not a usable-prefill one — a config that allocates can still die in the forward | publish only depths that prewarm *and* decode, per gemma4's 31B experience |
 | `transformers` version drift | the oracle contract is version-relative | pin the exact version and record the modeling-file hash in `VERIFICATION.md` |
+
+## Handoff — start here
+
+For the agent picking this up. The plan is finalized; nothing below needs
+re-deciding, and the architecture questions are already answered in
+[ARCHITECTURE.md](../ARCHITECTURE.md) — read it before writing any kernel, and
+treat it as the spec rather than re-deriving from `modeling_muse_glimmer.py`.
+
+**First session = Phases 0 → 2, entirely on CPU.** Concretely, in order:
+
+1. Stand up the reference venv and pin the `transformers` version + modeling-file
+   hash into `VERIFICATION.md`. The oracle contract is version-relative and
+   meaningless without this.
+2. Port the model-independent files listed in Phase 0 out of
+   `vendor/qwen35-intel-serve/src` unchanged. Do not rewrite them; they are
+   already gated in that repo.
+3. `py/make_tiny.py` → the three tiny models of Phase 1. **Do not touch the 30 B
+   checkpoint until the tiny models are bitwise green.**
+4. Phase 2's op list, in the order given. The three-norm-flavor assertion in step
+   2 of that list is the single highest-value guard in the whole build.
+
+Three things that are already known and must not be rediscovered the hard way:
+
+- The four per-layer norms are `(1+w)`, the final norm is `w`. Byte-verified.
+- Global layers are NoPE; only the 39 sliding layers rotate.
+- QK-norm is weight-less; `qk_scale_factor = 3.87` multiplies **q only** and is
+  *in addition to* `head_dim^-0.5`.
+
+One question is genuinely open and blocks Phase 5 only: the DFlash **denoising
+iteration count and acceptance rule**, which live in the reference generation
+utility rather than in `MuseGlimmerAssistantModel.forward`. Resolve it against
+both the reference generation loop and llama.cpp's `dflash` path before writing
+the drafter gate. It does not block Phases 0–4 or 6, so it is not a reason to
+stall.
+
+`tools/probe/README.md` lists three checkpoint checks worth re-running if the
+checkpoint is ever revised.
 
 ## Deliverable docs (mirroring the siblings)
 
