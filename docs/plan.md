@@ -475,20 +475,20 @@ model tier, GPU count, quantization, and depth.
 
 ## What can be done in the cloud, and what needs the box
 
-| phase | cloud | needs the B70 box |
-|---|---|---|
-| 0 Skeleton, reference env | ✅ | |
-| 1 Tiny harness | ✅ | |
-| 2 f64 text oracle | ✅ (CPU only; 30 B f64 forward is slow but runnable) | |
-| 3 bf16/f16 twin | ✅ | |
-| 4 GGUF ingest | ✅ | |
-| 5 DFlash oracle | ✅ | |
-| 6 Vision oracle | ✅ | |
-| 7 SYCL single-GPU | design only | ✅ |
-| 8 Dual-GPU TP | design only | ✅ |
-| 9 Serving frontend | ✅ except live gates | ✅ for `live_api_tests.py` |
-| 10 DFlash serving | design only | ✅ |
-| 11 Benchmarks | | ✅ |
+| phase | cloud | needs the B70 box | status |
+|---|---|---|---|
+| 0 Skeleton, reference env | ✅ | | **done** |
+| 1 Tiny harness | ✅ | | **done** |
+| 2 f64 text oracle | ✅ (CPU only; the 30 B f64 forward runs in ~17 s for 6 tokens) | | **done** |
+| 3 bf16/f16 twin | ✅ | | **done** (text; drafter/tower twins written, not gated) |
+| 4 GGUF ingest | ✅ | | not started |
+| 5 DFlash oracle | ✅ | | **done** |
+| 6 Vision oracle | ✅ | | tower + projector **done**; pixel ingestion and video not started |
+| 7 SYCL single-GPU | design only | ✅ | not started |
+| 8 Dual-GPU TP | design only | ✅ | not started |
+| 9 Serving frontend | ✅ except live gates | ✅ for `live_api_tests.py` | not started |
+| 10 DFlash serving | design only | ✅ | not started |
+| 11 Benchmarks | | ✅ | not started |
 
 Phases 0–6 and most of 9 are pure CPU work and are the natural first session.
 Everything from Phase 7 on needs the hardware, but its *design* is fixed by the
@@ -509,23 +509,29 @@ first.
 
 ## Handoff — start here
 
-For the agent picking this up. The plan is finalized; nothing below needs
-re-deciding, and the architecture questions are already answered in
-[ARCHITECTURE.md](../ARCHITECTURE.md) — read it before writing any kernel, and
-treat it as the spec rather than re-deriving from `modeling_muse_glimmer.py`.
+**Status: Phases 0, 1, 2, 3, 5 and the model-function half of 6 are
+implemented and gated.** Run `./build.sh --cpu-only && ./run_tiny.sh` — 22
+checks, all green — and read [VERIFICATION.md](../VERIFICATION.md) for what each
+gate proves and every measured number. Everything below the line is what is
+left.
 
-**First session = Phases 0 → 2, entirely on CPU.** Concretely, in order:
+What exists now: `src/muse_glimmer.hpp` (f64 text oracle + bf16/f16 twins),
+`src/dflash.hpp` (the block drafter and the greedy speculative loop),
+`src/vision.hpp` (tower + adapter + projection), the instrumented references
+`py/ref_forward.py` / `py/ref_dflash.py` / `py/ref_vision.py`, the tiny-model
+factory `py/make_tiny.py`, and `tools/spec_baseline.sh` for the acceptance-rate
+regression baseline.
 
-1. Stand up the reference venv and pin the `transformers` version + modeling-file
-   hash into `VERIFICATION.md`. The oracle contract is version-relative and
-   meaningless without this.
-2. Port the model-independent files listed in Phase 0 out of
-   `vendor/qwen35-intel-serve/src` unchanged. Do not rewrite them; they are
-   already gated in that repo.
-3. `py/make_tiny.py` → the three tiny models of Phase 1. **Do not touch the 30 B
-   checkpoint until the tiny models are bitwise green.**
-4. Phase 2's op list, in the order given. The three-norm-flavor assertion in step
-   2 of that list is the single highest-value guard in the whole build.
+**Next, in order of value:**
+
+1. **Phase 4, GGUF ingest** — nothing about it changed; the three conversions in
+   that section are still the whole job, and `assert_norm_flavours()` in
+   `src/muse_glimmer.hpp` documents why the +1 check has to be the cross-source
+   one rather than a per-tensor statistic.
+2. **The rest of Phase 6**: C++ pixel ingestion (see the correction below) and a
+   video (`t > 1`) gate. The tower takes `t` already; no video gate has been run.
+3. **Phase 9, the serving frontend** — the largest remaining CPU-side chunk.
+4. Phases 7, 8, 10, 11 need the B70 box.
 
 Three things that are already known and must not be rediscovered the hard way:
 
@@ -534,12 +540,30 @@ Three things that are already known and must not be rediscovered the hard way:
 - QK-norm is weight-less; `qk_scale_factor = 3.87` multiplies **q only** and is
   *in addition to* `head_dim^-0.5`.
 
-One question is genuinely open and blocks Phase 5 only: the DFlash **denoising
-iteration count and acceptance rule**, which live in the reference generation
-utility rather than in `MuseGlimmerAssistantModel.forward`. Resolve it against
-both the reference generation loop and llama.cpp's `dflash` path before writing
-the drafter gate. It does not block Phases 0–4 or 6, so it is not a reason to
-stall.
+### Corrections this plan needed, found while implementing it
+
+- **The DFlash open item is closed.** One pass per block, no denoising loop;
+  a round proposes `block_size - 1` = **15** tokens, not 16; the head is the
+  **bare** `lm_head` with no `output_multiplier` and no softcap; acceptance is
+  HF's ordinary assisted-decoding rule. And the block's queries are placed at
+  absolute positions `n … n+B-1` by `DFlashCache.get_query_offset()`, not by
+  `position_ids` — get that wrong and the drafter runs without erroring and
+  proposes different tokens. See ARCHITECTURE.md §"The drafting loop".
+- **Preprocessing is not PIL.** `MuseGlimmerImageProcessor` is a
+  `TorchvisionBackend`; `resample: 1` runs **torchvision's** antialiased
+  LANCZOS, and only on torchvision ≥ 0.27 (below that it silently substitutes
+  BICUBIC). gemma4's PIL port is the wrong target. VERIFICATION.md §6c.
+- **The norm-flavour guard cannot be a per-tensor statistic.** A zero-centered
+  norm in this checkpoint reaches mean +2.09 with no negative entries, while the
+  plain final norm has mean +0.017 and 49.9% negatives. The sound check is the
+  aggregate (`min(w) ≥ -1` everywhere, negatives present in most of the 208).
+  VERIFICATION.md §6.
+- **`-march=native` is required for the scalar-vs-vector gate to mean
+  anything.** Without it `__AVX512F__` compiles out and the gate compares the
+  scalar path with itself. Both sibling repos' CMakeLists have the same gap.
+- **torch's f64 `sqrt` is the approximate one, not its division.** `rsqrt` and
+  `pow(·, -0.5)` are correctly rounded and equal C's `1.0/std::sqrt`;
+  `1/torch.sqrt(x)` is not. VERIFICATION.md §3.
 
 `tools/probe/README.md` lists three checkpoint checks worth re-running if the
 checkpoint is ever revised.
@@ -548,8 +572,9 @@ checkpoint is ever revised.
 
 - `ARCHITECTURE.md` — the contract. **Written.**
 - `docs/plan.md` — this file.
-- `docs/oracle.md` — how to build and run the f64 oracle, once it exists.
+- `docs/oracle.md` — how to build and run the f64 oracle. **Written.**
 - `VERIFICATION.md` — methodology, per-layer error tables, measured gates.
+  **Written** for Phases 0–3, 5, 6.
 - `docs/gpu.md` — engine design, memory model, hardware pitfalls, kernel tracker.
 - `docs/serving.md` — protocols, tools, JSON, media.
 - `docs/comparison.md` — head-to-head vs llama.cpp and the sibling engines.
