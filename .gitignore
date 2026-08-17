@@ -1,0 +1,10 @@
+build/
+build-gpu/
+out/
+__pycache__/
+*.pyc
+*.gguf
+*.safetensors
+*.npy
+.venv/
+compile_commands.json
