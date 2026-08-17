@@ -13,7 +13,9 @@ if [[ "${1:-}" == "--cpu-only" ]]; then
 fi
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j"$jobs" --target muse-oracle fmath-test unit_tests
+# muse_refkernels is the oracle's arithmetic exposed to
+# py/ref_forward.py --fixed-reduce; run_tiny.sh needs it.
+cmake --build build -j"$jobs" --target muse-oracle fmath-test unit_tests muse_refkernels
 ctest --test-dir build --output-on-failure
 
 if (( cpu_only )); then
