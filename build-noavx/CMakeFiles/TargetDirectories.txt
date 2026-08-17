@@ -1,0 +1,8 @@
+/home/muks/muse-glimmer-intel-serve/build-noavx/CMakeFiles/muse-oracle.dir
+/home/muks/muse-glimmer-intel-serve/build-noavx/CMakeFiles/fmath-test.dir
+/home/muks/muse-glimmer-intel-serve/build-noavx/CMakeFiles/muse_refkernels.dir
+/home/muks/muse-glimmer-intel-serve/build-noavx/CMakeFiles/muse_core.dir
+/home/muks/muse-glimmer-intel-serve/build-noavx/CMakeFiles/unit_tests.dir
+/home/muks/muse-glimmer-intel-serve/build-noavx/CMakeFiles/test.dir
+/home/muks/muse-glimmer-intel-serve/build-noavx/CMakeFiles/edit_cache.dir
+/home/muks/muse-glimmer-intel-serve/build-noavx/CMakeFiles/rebuild_cache.dir

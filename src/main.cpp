@@ -17,6 +17,7 @@
 #include <omp.h>
 #endif
 
+#include "bf16exec.hpp"
 #include "dflash.hpp"
 #include "hf.hpp"
 #include "muse_glimmer.hpp"
@@ -93,6 +94,12 @@ namespace
                 "                                       round after the target forward\n"
                 "                   [--draft-rounds N]  greedy speculative loop, for the\n"
                 "                                       acceptance-rate baseline\n"
+                "                   [--exec f64|bf16]   f64 = the oracle; bf16 = the fast\n"
+                "                        AVX-512 vdpbf16ps engine with a KV cache, refereed\n"
+                "                        against --dtype bf16 --attn flash\n"
+                "                   [--decode N] [--chunk N] [--max-seq N]\n"
+                "                        --exec bf16 only: greedy decode after prefill, and\n"
+                "                        the prefill/decode tok/s that go with it\n"
                 "                   [--pixels FILE --grid t,h,w[;t,h,w...]]\n"
                 "                        run the vision tower over f64 pixel_values\n"
                 "                        [N, patch_dim] and scatter the result at the\n"
@@ -109,7 +116,8 @@ int main(int argc, char **argv)
 {
     std::string model, ids_spec, out_dir, revision = "main";
     std::string dtype_s = "f64", attn_s = "eager", kernels_s = "auto", trace_dir, assistant;
-    std::string pixels_path, grid_spec;
+    std::string pixels_path, grid_spec, exec_s = "f64";
+    int64_t decode_n = 0, chunk = 256, max_seq = 0;
     bool dump_hidden = false, hf_f32_compat = false;
     int threads = 0, topk = 5;
     int64_t draft_rounds = 0;
@@ -141,6 +149,14 @@ int main(int argc, char **argv)
             assistant = next();
         else if (a == "--draft-rounds")
             draft_rounds = atoll(next().c_str());
+        else if (a == "--exec")
+            exec_s = next();
+        else if (a == "--decode")
+            decode_n = atoll(next().c_str());
+        else if (a == "--chunk")
+            chunk = atoll(next().c_str());
+        else if (a == "--max-seq")
+            max_seq = atoll(next().c_str());
         else if (a == "--pixels")
             pixels_path = next();
         else if (a == "--grid")
@@ -336,6 +352,97 @@ int main(int argc, char **argv)
                                 "(%lld / %lld); wrote vision.bin only\n",
                         (long long)cfg.image_token_id, (long long)cfg.video_token_id);
         }
+
+        if (exec_s == "bf16")
+        {
+            // The fast candidate engine. Not combinable with the oracle-only
+            // options: it is a different implementation, refereed against the
+            // twin rather than defining it.
+            if (hf_f32_compat || fopt.dtype != prec::Dtype::F64 || !assistant.empty() ||
+                !pixels_path.empty() || dump_hidden || !trace_dir.empty())
+                throw std::runtime_error(
+                    "--exec bf16 is a standalone engine; not combinable with --dtype / "
+                    "--hf-f32-compat / --assistant / --pixels / --dump-hidden / --trace-dir");
+            const int64_t T = int64_t(ids.size());
+            const int64_t ms = max_seq > 0 ? max_seq : T + decode_n + 8;
+            if (T + decode_n > ms)
+                throw std::runtime_error("--max-seq smaller than prompt + --decode");
+
+            muse::bf16::Engine eng;
+            auto ti = std::chrono::steady_clock::now();
+            eng.init(cfg, w, ms, std::max<int64_t>(1, chunk));
+            auto ti2 = std::chrono::steady_clock::now();
+
+            std::vector<float> lg(size_t(cfg.vocab_size));
+            auto p0 = std::chrono::steady_clock::now();
+            eng.prefill(ids, lg.data());
+            auto p1 = std::chrono::steady_clock::now();
+
+            std::vector<int64_t> seq = ids;
+            auto d0 = p1, d1 = p1;
+            if (decode_n > 0)
+            {
+                d0 = std::chrono::steady_clock::now();
+                for (int64_t i = 0; i < decode_n; ++i)
+                {
+                    seq.push_back(eng.argmax(lg.data(), cfg.vocab_size));
+                    eng.forward_block(seq, int64_t(seq.size()) - 1, 1, lg.data());
+                }
+                d1 = std::chrono::steady_clock::now();
+            }
+
+            auto secs = [](auto a, auto b)
+            { return std::chrono::duration<double>(b - a).count(); };
+            const double ps = secs(p0, p1), ds = secs(d0, d1);
+            fprintf(stderr,
+                    "exec bf16: cache %.2f MiB (max_seq %lld), alloc %.2f s\n"
+                    "  prefill %lld tok in %.3f s = %.2f tok/s (chunk %lld)\n",
+                    double(eng.kv.bytes()) / 1048576.0, (long long)ms, secs(ti, ti2),
+                    (long long)T, ps, double(T) / ps, (long long)chunk);
+            if (decode_n > 0)
+                fprintf(stderr, "  decode  %lld tok in %.3f s = %.2f tok/s (%.1f ms/tok)\n",
+                        (long long)decode_n, ds, double(decode_n) / ds,
+                        1000.0 * ds / double(decode_n));
+
+            std::vector<double> lgd(size_t(cfg.vocab_size));
+            for (int64_t i = 0; i < cfg.vocab_size; ++i)
+                lgd[size_t(i)] = double(lg[size_t(i)]);
+            write_bin(out_dir + "/logits.bin", lgd.data(), lgd.size());
+            std::ostringstream bm;
+            bm << "{\n \"kind\": \"cpp_bf16exec\",\n \"T\": 1,\n \"V\": " << cfg.vocab_size
+               << ",\n \"prompt_len\": " << T << ",\n \"decode\": " << decode_n
+               << ",\n \"prefill_tok_s\": " << double(T) / ps
+               << ",\n \"decode_tok_s\": " << (decode_n ? double(decode_n) / ds : 0.0)
+               << ",\n \"chunk\": " << chunk << ",\n \"max_seq\": " << ms
+               << ",\n \"kv_bytes\": " << eng.kv.bytes() << ",\n \"ids\": [";
+            for (size_t i = 0; i < ids.size(); ++i)
+                bm << (i ? "," : "") << ids[i];
+            bm << "],\n \"generated\": [";
+            for (size_t i = ids.size(); i < seq.size(); ++i)
+                bm << (i > ids.size() ? "," : "") << seq[i];
+            bm << "],\n \"n_hidden\": 0\n}\n";
+            std::ofstream(out_dir + "/meta.json") << bm.str();
+            if (decode_n > 0)
+            {
+                printf("generated:");
+                for (size_t i = ids.size(); i < seq.size(); ++i)
+                    printf(" %lld", (long long)seq[i]);
+                printf("\n");
+            }
+            std::vector<int64_t> idx(static_cast<size_t>(cfg.vocab_size));
+            for (int64_t i = 0; i < cfg.vocab_size; ++i)
+                idx[size_t(i)] = i;
+            std::partial_sort(idx.begin(), idx.begin() + topk, idx.end(),
+                              [&](int64_t a, int64_t b)
+                              { return lg[size_t(a)] > lg[size_t(b)]; });
+            printf("last-position top%d:", topk);
+            for (int k = 0; k < topk; ++k)
+                printf(" (%lld, %.6f)", (long long)idx[size_t(k)], lg[size_t(idx[size_t(k)])]);
+            printf("\n");
+            return 0;
+        }
+        if (exec_s != "f64")
+            throw std::runtime_error("unknown --exec: " + exec_s + " (want f64|bf16)");
 
         std::vector<double> logits = muse::forward(cfg, w, ids, fopt);
         auto t2 = std::chrono::steady_clock::now();

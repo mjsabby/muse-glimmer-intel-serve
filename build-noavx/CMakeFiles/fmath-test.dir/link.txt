@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/fmath-test.dir/link.d "CMakeFiles/fmath-test.dir/tests/fmath_test.cpp.o" -o fmath-test  -lm /usr/lib/gcc/x86_64-linux-gnu/15/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a

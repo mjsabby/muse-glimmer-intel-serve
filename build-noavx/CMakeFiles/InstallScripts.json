@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/muks/muse-glimmer-intel-serve/build-noavx/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

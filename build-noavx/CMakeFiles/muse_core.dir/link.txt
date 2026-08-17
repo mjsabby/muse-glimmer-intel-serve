@@ -1,0 +1,2 @@
+/usr/bin/ar qc libmuse_core.a CMakeFiles/muse_core.dir/src/json.cpp.o CMakeFiles/muse_core.dir/src/hf_resolver.cpp.o CMakeFiles/muse_core.dir/src/safetensors.cpp.o CMakeFiles/muse_core.dir/src/sha256.cpp.o CMakeFiles/muse_core.dir/src/tensor.cpp.o CMakeFiles/muse_core.dir/src/tokenizer.cpp.o
+/usr/bin/ranlib libmuse_core.a

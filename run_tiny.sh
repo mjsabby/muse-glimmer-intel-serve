@@ -102,6 +102,25 @@ if cmp -s "$OUT/vision_oracle/vision.bin" "$OUT/vision_ref/vision.bin"; then
 if cmp -s "$OUT/vision_oracle/logits.bin" "$OUT/vision_ref/logits.bin"; then
     pass "image+text logits"; else fail "image+text logits"; fi
 
+echo "== tiny_text: fast bf16 engine vs the twin (envelope, not bitwise) =="
+for ch in 256 4 1; do
+    if $PY tools/bf16_parity.py --model "$TINY/tiny_text" --ids "$IDS" --topk 20 \
+        --chunk "$ch" --assert-argmax --out "$OUT/bf16_par_$ch" 2>&1 | grep -q "AGREE"; then
+        pass "--exec bf16 chunk $ch: top-1 agrees with the twin"
+    else
+        fail "--exec bf16 chunk $ch"
+    fi
+done
+# chunk must not change the answer: the sliding ring has to hold
+# `window + chunk` rows, and sizing it at `window` alone corrupts prefill
+# chunks wider than the window without erroring
+if cmp -s "$OUT/bf16_par_256/fast/logits.bin" "$OUT/bf16_par_4/fast/logits.bin" &&
+   cmp -s "$OUT/bf16_par_256/fast/logits.bin" "$OUT/bf16_par_1/fast/logits.bin"; then
+    pass "--exec bf16 chunk-invariant (256 == 4 == 1)"
+else
+    fail "--exec bf16 depends on --chunk"
+fi
+
 echo "== determinism: kernels x thread count =="
 ref=""
 for k in scalar avx512; do

@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,--dependency-file=CMakeFiles/muse_refkernels.dir/link.d -Wl,-soname,libmuse_refkernels.so -o libmuse_refkernels.so CMakeFiles/muse_refkernels.dir/tools/oracle_kernels.cpp.o  /usr/lib/gcc/x86_64-linux-gnu/15/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a
