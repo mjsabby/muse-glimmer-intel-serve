@@ -276,11 +276,37 @@ metadata.
 
 ## Vision ops
 
-Preprocessing (`MuseGlimmerImageProcessor`): RGB, rescale `1/255`, normalize
-`mean = std = 0.5`, bilinear-ish resize (`resample: 1` = PIL `LANCZOS`), patch
-14, temporal patch 2, merge 2, `max_image_tokens: 4096`. Video
-(`MuseGlimmerVideoProcessor`): 2 fps sampling, `num_frames: 96`,
-`max_video_frame_tokens: 144`, `return_metadata: true`.
+Preprocessing (`MuseGlimmerImageProcessor`): RGB, resize (`resample: 1`), rescale
+`1/255`, normalize `mean = std = 0.5`, patch 14, temporal patch 2, merge 2,
+`max_image_tokens: 4096`. Video (`MuseGlimmerVideoProcessor`): 2 fps sampling,
+`num_frames: 96`, `max_video_frame_tokens: 144`, `return_metadata: true`.
+
+Four things about the resize that decide what "byte-exact preprocessing" means
+here, and none of them is what a PIL-based port would assume:
+
+1. **The processor is a `TorchvisionBackend`, not a PIL one.** `resample: 1` is
+   `PILImageResampling.LANCZOS`, but it is mapped to
+   `tvF.InterpolationMode.LANCZOS` and executed by
+   `torchvision.transforms.v2.functional.resize(..., antialias=True)`. The C++
+   target is torchvision's antialiased Lanczos, not PIL's.
+2. **Only torchvision ≥ 0.27 has LANCZOS for tensors.** Below that,
+   `TorchvisionBackend.resize` logs a warning and *silently substitutes
+   BICUBIC*. The resample kernel is therefore a property of the installed
+   torchvision, and has to be pinned alongside `transformers` — see
+   VERIFICATION.md §1.
+3. **The resize runs on uint8 and returns uint8** (measured: `do_rescale` /
+   `do_normalize` happen afterwards). That clamps and rounds, which is what
+   keeps it within 1/255 of PIL's LANCZOS; the same call on a float tensor
+   diverges from PIL by up to 46/255 because nothing clamps Lanczos' negative
+   lobes.
+4. **`smart_resize` uses `patch_size * merge_size` = 28 as the unit**, not 14,
+   and picks the candidate grid from `{floor, ceil}²` of the ideal patch counts
+   minimizing `|h/w − H/W|` under the `max_image_tokens` cap. The image grid is
+   then `resized / patch_size`, so it is always even in both axes.
+
+`patchify` flattens each patch as **(temporal, channel, y, x)** — 2·3·14·14 =
+1176 — and a still image is *duplicated* along the temporal axis rather than
+padded with zeros.
 
 Tower (`MuseGlimmerVisionModel`), per image with grid `(t, h, w)` in patches:
 

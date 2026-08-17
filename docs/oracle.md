@@ -94,6 +94,37 @@ simulation of it: a GPU kernel that matches the twin bitwise is correct by
 construction, and one that does not can be diffed against it position by
 position with `py/diff_lp.py`.
 
+## The vision tower
+
+```bash
+# the reference produces the pixels AND the features
+.venv/bin/python py/ref_vision.py --model meta-models/Muse-Glimmer-30B \
+    --images cat.jpg --out out/vis --pure --load streamed --threads 32
+
+# the oracle consumes exactly those pixels
+./build/muse-oracle --model meta-models/Muse-Glimmer-30B --ids 1,2,3 \
+    --out out/vis_oracle --pixels out/vis/pixel_values.bin --grid 1,10,16
+```
+
+`--pixels` takes raw f64 `[N, patch_dim]` (`patch_dim` = 2·3·14² = 1176) and
+`--grid` the `t,h,w` patch grid per image, semicolon-separated for several. The
+tower's projected output is written to `vision.bin` as f64
+`[N / merge_size², text hidden]`; if `--ids` contains image (200092) or video
+(200091) placeholder tokens, those features are scattered into `inputs_embeds`
+and the run continues into the text stack, giving end-to-end multimodal logits.
+
+Pixels come from the reference on purpose. Pixel ingestion and the tower are two
+different correctness problems — the first is a bit-exactness question about
+**torchvision's** antialiased Lanczos kernel (not PIL's; see
+ARCHITECTURE.md §"Vision ops"), the second is about the model's architecture.
+Feeding the oracle the reference's own `pixel_values` gates the second cleanly
+and does not pretend the first is solved. C++ preprocessing is not implemented.
+
+The scatter happens **after** the weight-less embed-norm: the reference embeds
+the placeholder ids as 0 and then `masked_scatter`s, and the features already
+carry `perception_emb_norm`. Normalizing them again would be wrong, and would
+look almost right.
+
 ## The DFlash drafter
 
 ```bash

@@ -22,6 +22,7 @@
 #include "fmath.hpp"
 #include "muse_glimmer.hpp"
 #include "simd.hpp"
+#include "vision.hpp"
 
 extern "C"
 {
@@ -71,6 +72,26 @@ extern "C"
     {
         for (int64_t i = 0; i < n; ++i)
             y[i] = muse::sigmoid(x[i]);
+    }
+    // nn.LayerNorm with the oracle's blocked-8 mean and variance. torch's
+    // f64 layer_norm uses its own (Welford-ish) accumulation, so this is the
+    // vision tower's equivalent of ok_meansq for the text path.
+    void ok_layernorm(const double *X, const double *w, const double *b, double eps, double *Y,
+                      int64_t rows, int64_t dim)
+    {
+        muse::vision::layernorm_rows(X, w, b, eps, Y, rows, dim, prec::Dtype::F64);
+    }
+
+    void ok_erfv(const double *x, double *y, int64_t n)
+    {
+        for (int64_t i = 0; i < n; ++i)
+            y[i] = fmath::erf(x[i]);
+    }
+    // the vision tower's exact-erf gelu (ACT2FN["gelu"], not the tanh form)
+    void ok_geluv(const double *x, double *y, int64_t n)
+    {
+        for (int64_t i = 0; i < n; ++i)
+            y[i] = fmath::gelu(x[i]);
     }
     void ok_powv(double base, const double *e, double *y, int64_t n)
     {

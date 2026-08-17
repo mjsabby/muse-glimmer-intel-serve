@@ -740,6 +740,12 @@ namespace muse
         // consumes; MuseGlimmerTextNormedEmbedding cannot be folded into the
         // table because of this.
         std::vector<double> *raw_embedding = nullptr;
+        // vision features [n_media_tokens, hidden_size], scattered over the
+        // positions whose id is image_token_id / video_token_id. The reference
+        // embeds those ids as 0 and then `masked_scatter`s, i.e. the features
+        // REPLACE the row AFTER embed_norm — they carry their own
+        // perception_emb_norm and must not be normed twice.
+        const std::vector<double> *vision_embeds = nullptr;
     };
 
     struct AttnScratch
@@ -970,6 +976,25 @@ namespace muse
             opt.raw_embedding->assign(h.begin(), h.end());
         rmsnorm_rows(NormKind::Weightless, h.data(), nullptr, c.rms_norm_eps, h.data(), T, H,
                      compat, dt);
+        if (opt.vision_embeds)
+        {
+            int64_t k = 0;
+            for (int64_t t = 0; t < T; ++t)
+                if (ids[size_t(t)] == c.image_token_id || ids[size_t(t)] == c.video_token_id)
+                {
+                    if ((k + 1) * H > int64_t(opt.vision_embeds->size()))
+                        throw std::runtime_error(
+                            "more image/video placeholder tokens than vision features");
+                    std::memcpy(&h[size_t(t * H)], &(*opt.vision_embeds)[size_t(k * H)],
+                                size_t(H) * 8);
+                    ++k;
+                }
+            if (k * H != int64_t(opt.vision_embeds->size()))
+                throw std::runtime_error(
+                    "vision features and placeholder tokens do not match: " +
+                    std::to_string(k) + " placeholders, " +
+                    std::to_string(int64_t(opt.vision_embeds->size()) / H) + " features");
+        }
         if (hooks)
             hooks->on_hidden(0, h.data(), H);
         if (opt.taps && opt.tap_layers)

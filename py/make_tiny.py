@@ -179,6 +179,23 @@ def build_dflash(layers=2, block_size=4, target_layer_ids=(0, 2)):
     return model.to(torch.bfloat16)
 
 
+def save_processor(out, vc, max_image_tokens=64):
+    """The released repo ships processor_config.json / preprocessor_config.json;
+    the tiny vision model needs one too or AutoImageProcessor cannot load it.
+    `max_image_tokens` is scaled down so a test image stays a handful of
+    patches — but it is still an exact multiple of merge_size, so the window
+    reorder and the pixel shuffle are exercised."""
+    from transformers import MuseGlimmerImageProcessor
+
+    ip = MuseGlimmerImageProcessor(
+        patch_size=vc["patch_size"],
+        temporal_patch_size=vc["patch_temporal"],
+        merge_size=vc["merge_size"],
+        max_image_tokens=max_image_tokens,
+    )
+    ip.save_pretrained(out)
+
+
 def save(model, out):
     os.makedirs(out, exist_ok=True)
     model.save_pretrained(out, safe_serialization=True)
@@ -202,7 +219,9 @@ def main():
         save(build_full(with_vision=False, layers=4), os.path.join(a.out, "tiny_text"))
     if a.which in ("all", "vision"):
         torch.manual_seed(a.seed + 1)
-        save(build_full(with_vision=True, layers=4), os.path.join(a.out, "tiny_vision"))
+        d = os.path.join(a.out, "tiny_vision")
+        save(build_full(with_vision=True, layers=4), d)
+        save_processor(d, vision_config())
     if a.which in ("all", "dflash"):
         torch.manual_seed(a.seed + 2)
         save(build_dflash(), os.path.join(a.out, "tiny_dflash"))

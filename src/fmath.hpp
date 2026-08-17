@@ -564,6 +564,57 @@ namespace fmath
         }
     }
 
+    // ------------------------------------------------------------------ erf
+    //
+    // The vision tower's activation is `gelu` — ACT2FN["gelu"] is
+    // GELUActivation, i.e. the EXACT erf form `0.5*x*(1+erf(x/sqrt2))`, not the
+    // tanh approximation. (`gelu_pytorch_tanh` is a different registry entry
+    // and this checkpoint does not use it.)
+    //
+    // Confluent series with strictly positive terms — no cancellation at any
+    // argument:
+    //     erf(x) = (2x/sqrt(pi)) * exp(-x^2) * sum_{n>=0} (2x^2)^n / (2n+1)!!
+    // summed with Neumaier compensation in a fixed order, so the result is
+    // bit-reproducible and accurate to a few ulp (libm's is sub-ulp; the
+    // difference is ~1e-16 relative, four orders below the tower's own f64
+    // accumulation). |x| >= 6 returns +-1, which is exact in f64: erf(6) =
+    // 1 - 2.15e-17 and 2.15e-17 < eps/2.
+    inline double erf(double x)
+    {
+        if (x != x)
+            return x;
+        const double ax = std::fabs(x);
+        if (ax >= 6.0)
+            return x > 0 ? 1.0 : -1.0;
+        if (ax < 1e-10) // series is exactly 2x/sqrt(pi) to f64 here
+            return x * 1.1283791670955126;
+
+        const double z = x * x;
+        const double two_z = 2.0 * z;
+        double term = 1.0;   // n = 0
+        double sum = 1.0, c = 0.0; // Neumaier compensation
+        for (int n = 1; n <= 200; ++n)
+        {
+            term = term * two_z / double(2 * n + 1);
+            const double t = sum + term;
+            // both are positive, so |sum| >= |term| whenever the series has
+            // started decaying; keep the general Neumaier branch anyway
+            c += (std::fabs(sum) >= std::fabs(term)) ? ((sum - t) + term)
+                                                     : ((term - t) + sum);
+            sum = t;
+            if (term < 1e-22 * sum)
+                break;
+        }
+        sum += c;
+        return 1.1283791670955126 * x * exp(-z) * sum; // 2/sqrt(pi)
+    }
+
+    // GELUActivation: 0.5 * x * (1 + erf(x / sqrt(2)))
+    inline double gelu(double x)
+    {
+        return 0.5 * x * (1.0 + erf(x * 0.7071067811865476));
+    }
+
     inline double cos(double x)
     {
         uint32_t ix = hi_word(x) & 0x7fffffff;

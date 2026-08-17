@@ -77,6 +77,38 @@ int main()
     w = std::max(w, sweep("expm1", [](double x)
                           { return fmath::expm1(x); }, [](double x)
                           { return std::expm1(x); }, -50.0, 50.0, N, 7));
+    // erf feeds the vision tower's exact-gelu activation. The confluent series
+    // trades ~1 ulp for a bounded, cancellation-free, deterministic evaluation;
+    // it is checked here in ABSOLUTE terms too, because 1 + erf(x) cancels in
+    // the deep negative tail where gelu itself is ~1e-12 and the relative
+    // error there is meaningless. Reported separately from `w` for that reason.
+    {
+        int64_t we = sweep("erf", [](double x)
+                           { return fmath::erf(x); }, [](double x)
+                           { return std::erf(x); }, -6.0, 6.0, N, 20);
+        if (we > 32)
+        {
+            printf("FAIL: erf worse than 32 ulp vs glibc\n");
+            return 1;
+        }
+        std::mt19937_64 rng(21);
+        std::uniform_real_distribution<double> d(-20.0, 20.0);
+        double amax = 0;
+        for (int i = 0; i < N / 4; ++i)
+        {
+            double x = d(rng);
+            double a = fmath::gelu(x);
+            double b = 0.5 * x * (1.0 + std::erf(x * 0.7071067811865476));
+            amax = std::max(amax, std::fabs(a - b));
+        }
+        printf("gelu   [%12g, %12g]  n=%d  max ABS vs glibc-erf: %.3e\n", -20.0, 20.0, N / 4,
+               amax);
+        if (!(amax < 1e-13))
+        {
+            printf("FAIL: gelu absolute error above 1e-13\n");
+            return 1;
+        }
+    }
     // log1p feeds softplus(x) = log1p(exp(x)) in the GDN decay computation
     w = std::max(w, sweep("log1p", [](double x)
                           { return fmath::log1p(x); }, [](double x)

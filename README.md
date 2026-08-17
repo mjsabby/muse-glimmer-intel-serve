@@ -6,9 +6,10 @@ deterministic float64 CPU implementation defines the model function exactly, a
 bf16/f16 twin defines the deviation band any correct low-precision kernel must
 stay inside, and every GPU kernel is gated against them.
 
-**Status: the f64 text oracle, its bf16/f16 twins, and the DFlash drafter are
-done and gated** (Phases 0–3 and 5 of the plan). GGUF ingest, the vision tower,
-the SYCL engine and the serving frontend are not started.
+**Status: the oracle is done and gated** — the f64 text path, its bf16/f16
+twins, the DFlash block drafter, and the vision tower + projector (Phases 0–3,
+5 and most of 6). GGUF ingest, C++ pixel ingestion, the SYCL engine and the
+serving frontend are not started.
 
 ```bash
 ./build.sh --cpu-only                     # g++ only, no oneAPI needed
@@ -21,9 +22,12 @@ the SYCL engine and the serving frontend are not started.
 
 On the released 30B checkpoint the oracle agrees with a precision-lifted HF
 reference to **1.1e-13** max abs on logits with **exact argmax and exact top-64**
-at every position, and its `--dtype bf16`/`f16` twins are **bitwise** against the
-rounding-instrumented reference. Full numbers, methodology and the traps found
-along the way are in [VERIFICATION.md](VERIFICATION.md).
+at every position; with an image in the prompt, **1.3e-11** and still exact
+argmax and top-64 at all 46 positions. Its `--dtype bf16`/`f16` twins are
+**bitwise** against the rounding-instrumented reference, and on the tiny models
+the whole path — text, drafter, and image-to-logits — is bitwise. Full numbers,
+methodology and the traps found along the way are in
+[VERIFICATION.md](VERIFICATION.md).
 
 | phase | | |
 |---|---|---|
@@ -33,7 +37,7 @@ along the way are in [VERIFICATION.md](VERIFICATION.md).
 | 3 | bf16/f16 twin | ✅ |
 | 4 | GGUF ingest | ⬜ |
 | 5 | DFlash drafter in the oracle | ✅ |
-| 6 | vision tower | ⬜ |
+| 6 | vision tower + projector | ✅ · pixel ingestion ⬜ |
 | 7–8 | SYCL engine, dual-GPU tensor parallelism | ⬜ needs the B70 box |
 | 9 | serving frontend | ⬜ |
 | 10–11 | DFlash serving, benchmarks | ⬜ needs the B70 box |

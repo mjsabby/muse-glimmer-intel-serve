@@ -90,6 +90,18 @@ ta=$($PY -c "import json;print(json.load(open('$OUT/draft_oracle/draft/meta.json
 tb=$($PY -c "import json;print(json.load(open('$OUT/draft_ref/meta.json'))['draft_tokens'])")
 if [[ "$ta" == "$tb" ]]; then pass "draft tokens $ta"; else fail "draft tokens $ta vs $tb"; fi
 
+echo "== tiny_vision: tower + projector + end-to-end, bitwise =="
+VIDS="$($PY -c "print(','.join(['1'] + ['500'] * 20 + ['7']))")"
+$PY py/ref_vision.py --model "$TINY/tiny_vision" --images SYNTH:120,150,5 \
+    --out "$OUT/vision_ref" --pure --fixed-reduce --threads 1 --ids "$VIDS" >/dev/null
+VGRID=$($PY -c "import json;print(json.load(open('$OUT/vision_ref/meta.json'))['grid_arg'])")
+$ORACLE --model "$TINY/tiny_vision" --ids "$VIDS" --out "$OUT/vision_oracle" \
+    --pixels "$OUT/vision_ref/pixel_values.bin" --grid "$VGRID" >/dev/null
+if cmp -s "$OUT/vision_oracle/vision.bin" "$OUT/vision_ref/vision.bin"; then
+    pass "vision features (grid $VGRID)"; else fail "vision features"; fi
+if cmp -s "$OUT/vision_oracle/logits.bin" "$OUT/vision_ref/logits.bin"; then
+    pass "image+text logits"; else fail "image+text logits"; fi
+
 echo "== determinism: kernels x thread count =="
 ref=""
 for k in scalar avx512; do

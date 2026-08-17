@@ -20,6 +20,7 @@
 #include "dflash.hpp"
 #include "hf.hpp"
 #include "muse_glimmer.hpp"
+#include "vision.hpp"
 
 namespace
 {
@@ -92,6 +93,10 @@ namespace
                 "                                       round after the target forward\n"
                 "                   [--draft-rounds N]  greedy speculative loop, for the\n"
                 "                                       acceptance-rate baseline\n"
+                "                   [--pixels FILE --grid t,h,w[;t,h,w...]]\n"
+                "                        run the vision tower over f64 pixel_values\n"
+                "                        [N, patch_dim] and scatter the result at the\n"
+                "                        image/video placeholder tokens in --ids\n"
                 "  --model     snapshot directory, or repo id resolved via the local HF cache\n"
                 "  --ids       comma/space separated token ids, or a file containing them\n"
                 "  --out       output dir: logits.bin (f64 [T,V]) + meta.json (+ hidden_XX.bin,\n"
@@ -104,6 +109,7 @@ int main(int argc, char **argv)
 {
     std::string model, ids_spec, out_dir, revision = "main";
     std::string dtype_s = "f64", attn_s = "eager", kernels_s = "auto", trace_dir, assistant;
+    std::string pixels_path, grid_spec;
     bool dump_hidden = false, hf_f32_compat = false;
     int threads = 0, topk = 5;
     int64_t draft_rounds = 0;
@@ -135,6 +141,10 @@ int main(int argc, char **argv)
             assistant = next();
         else if (a == "--draft-rounds")
             draft_rounds = atoll(next().c_str());
+        else if (a == "--pixels")
+            pixels_path = next();
+        else if (a == "--grid")
+            grid_spec = next();
         else if (a == "--hf-f32-compat")
             hf_f32_compat = true;
         else if (a == "--threads")
@@ -261,6 +271,70 @@ int main(int argc, char **argv)
                                              " out of range for a " +
                                              std::to_string(cfg.num_hidden_layers) +
                                              "-layer target");
+        }
+
+        // --pixels/--grid: run the vision tower and scatter its output at the
+        // image/video placeholder tokens
+        std::vector<double> vision_out;
+        if (!pixels_path.empty() != !grid_spec.empty())
+            throw std::runtime_error("--pixels and --grid must be given together");
+        if (!pixels_path.empty())
+        {
+            muse::vision::Config vcfg = muse::vision::parse_config(*mf.config);
+            muse::vision::Weights vw = muse::vision::bind_weights(mf, vcfg, cfg);
+            std::vector<muse::vision::Grid> grids;
+            {
+                std::string spec = grid_spec;
+                for (auto &ch : spec)
+                    if (ch == ',' || ch == ';')
+                        ch = ' ';
+                std::istringstream gs(spec);
+                int64_t t, gh, gw;
+                while (gs >> t >> gh >> gw)
+                    grids.push_back({t, gh, gw});
+                if (grids.empty())
+                    throw std::runtime_error("--grid must be t,h,w[;t,h,w...]");
+            }
+            int64_t npatch = 0;
+            for (const auto &g : grids)
+                npatch += g.tokens();
+            std::vector<double> px(size_t(npatch * vcfg.patch_dim()));
+            {
+                std::ifstream f(pixels_path, std::ios::binary);
+                if (!f)
+                    throw std::runtime_error("cannot read " + pixels_path);
+                f.seekg(0, std::ios::end);
+                const std::streamoff have = f.tellg();
+                const std::streamoff want = std::streamoff(px.size() * 8);
+                if (have != want)
+                    throw std::runtime_error(
+                        pixels_path + ": " + std::to_string(int64_t(have)) +
+                        " bytes, expected " + std::to_string(int64_t(want)) + " (f64 [" +
+                        std::to_string(npatch) + ", " + std::to_string(vcfg.patch_dim()) + "])");
+                f.seekg(0);
+                f.read(reinterpret_cast<char *>(px.data()), want);
+                if (!f)
+                    throw std::runtime_error("short read from " + pixels_path);
+            }
+            muse::vision::Options vopt;
+            vopt.hf_f32_compat = hf_f32_compat;
+            vopt.dtype = fopt.dtype;
+            fprintf(stderr, "vision: %zu grid(s), %lld patches, tower %lld layers x %lld, "
+                            "%lld merged tokens\n",
+                    grids.size(), (long long)npatch, (long long)vcfg.num_hidden_layers,
+                    (long long)vcfg.hidden_size,
+                    (long long)(npatch / vcfg.merge_unit()));
+            vision_out = muse::vision::forward(vcfg, vw, cfg, px.data(), grids, vopt);
+            write_bin(out_dir + "/vision.bin", vision_out.data(), vision_out.size());
+            int64_t placeholders = 0;
+            for (int64_t id : ids)
+                placeholders += (id == cfg.image_token_id || id == cfg.video_token_id);
+            if (placeholders)
+                fopt.vision_embeds = &vision_out;
+            else
+                fprintf(stderr, "vision: --ids has no image/video placeholder token "
+                                "(%lld / %lld); wrote vision.bin only\n",
+                        (long long)cfg.image_token_id, (long long)cfg.video_token_id);
         }
 
         std::vector<double> logits = muse::forward(cfg, w, ids, fopt);

@@ -348,6 +348,33 @@ tokens are discrete argmax decisions, so a near-tie can legitimately flip
 between two correct implementations, and a token-only gate would eventually pass
 something wrong or fail something right.
 
+### Acceptance-rate baseline
+
+`tools/spec_baseline.sh 6` — greedy speculative decoding over the four prompts
+in `tools/prompts/`, 6 rounds each, measured with the f64 oracle so the number
+is a property of the **model**, not of a kernel's precision. Phase 10's engine
+must reproduce it; a lossier drafter tier costs acceptance rate, not
+correctness, and this is what that cost is measured against.
+
+| prompt | rounds | drafted | accepted | accept_rate | tokens/round |
+|---|---:|---:|---:|---:|---:|
+| `code` (a Python function body) | 6 | 90 | 46 | **0.5111** | **8.667** |
+| `list` (an enumerated list) | 6 | 90 | 16 | 0.1778 | 3.667 |
+| `fact` ("The capital of France is") | 6 | 90 | 8 | 0.0889 | 2.333 |
+| `prose` (open-ended narrative) | 6 | 90 | 8 | 0.0889 | 2.333 |
+| **all** | **24** | **360** | **78** | **0.2167** | **4.250** |
+
+A round always yields at least one token (the target's own bonus) and at most
+`block_size` = 16, so tokens/round is `1 + accepted/round`. Two of the six code
+rounds accepted all 15 proposals.
+
+Caveats to carry into Phase 10 rather than quote as a headline: this is 24
+rounds on four short prompts of a base (not instruction-tuned) checkpoint, and
+the spread by prompt type — 8.7 tokens/round on code versus 2.3 on prose — is
+much larger than the sampling noise. Compare per-prompt, not just the aggregate.
+Wall time was 8m10s: the oracle has no KV cache, so each round re-runs the whole
+f64 target forward.
+
 ### The mask offset that only the cache knows
 
 The drafter's mask is built without `position_ids`; the query index for the
@@ -360,6 +387,84 @@ instead of `[356, 356, 356]`. This is the kind of failure docs/plan.md warns
 about for DFlash — "plausible-looking but wrong acceptance rates rather than an
 obvious failure" — and it is why the gate compares against the oracle rather
 than against a smoke test.
+
+## 6c. Vision tower gates (Phase 6, partial)
+
+`src/vision.hpp` implements `MuseGlimmerVisionModel` + `MuseGlimmerVisionAdapter`
++ `vision_projection` + `perception_emb_norm`; `py/ref_vision.py` is the
+matching reference. The oracle consumes the **reference's own** `pixel_values`,
+so these gates cover the tower and the projector, not pixel ingestion — see
+"Not implemented" below.
+
+### tiny_vision — bitwise, end to end
+
+4-layer tower, hidden 32, 2 heads, `[window, window, window, full]`, pos grid
+4×4, patch 14, merge 2. A 120×150 synthetic image becomes an 8×10 patch grid
+(80 patches → 20 merged tokens):
+
+| artefact | differing bytes |
+|---|---:|
+| `vision.bin` (20 × 64 projected features) | **0** |
+| `logits.bin` (image + text, 22 × 512) | **0** |
+
+The end-to-end row is the stronger one: it covers the scatter into
+`inputs_embeds` at the placeholder positions as well as the tower.
+
+### The released 30B tower
+
+A 137×211 synthetic image → `smart_resize` 140×224 → grid 1×10×16 (160 patches
+→ 40 merged tokens), 50 tower layers:
+
+| quantity | value |
+|---|---|
+| max abs delta on the projected features | **1.42e-12** |
+| mean abs delta | 1.19e-14 |
+| max rel delta | 2.70e-09 |
+
+End to end (40 image placeholders + a 6-token text tail, 46 positions through
+the full 52-layer text stack):
+
+| quantity | value |
+|---|---|
+| max abs logit delta | **1.26e-11** |
+| mean abs logit delta | 2.73e-13 |
+| argmax agreement | **46/46** |
+| top-64 overlap | **100.00%** |
+
+The end-to-end logit delta is two orders above the text-only 1.11e-13 because
+the tower's 1.4e-12 feature error enters at the embedding and is then amplified
+through 52 decoder layers. Worth remembering when setting a gate threshold for
+image prompts: it is not the same number as the text one.
+
+Structure is pinned by the bitwise tiny gate; this number is the f64 noise floor
+of a 50-layer tower at the real dimensions, where the window path differs from
+the tiny one (32-patch windows, and the `pad = win - n % win` quirk that emits a
+whole extra all-padding window when `n` is already a multiple of `win`).
+
+### Not implemented: pixel ingestion
+
+The plan says "PIL-exact preprocessing in C++ … gemma4 already has a byte-exact
+PIL bicubic port; this needs the LANCZOS kernel added". That is the wrong target
+for this checkpoint, and the correction matters more than the missing code:
+
+* `MuseGlimmerImageProcessor` is a **`TorchvisionBackend`**. `resample: 1` is
+  `PILImageResampling.LANCZOS`, but it is mapped to
+  `tvF.InterpolationMode.LANCZOS` and executed by
+  `torchvision.transforms.v2.functional.resize(..., antialias=True)`.
+* Torchvision only supports LANCZOS **for tensors** from 0.27; below that,
+  `TorchvisionBackend.resize` warns once and silently substitutes **BICUBIC**.
+  The resample kernel is a property of the installed torchvision and is pinned
+  in §1 for that reason.
+* Measured on this build (torchvision 0.28.0+cpu): resize runs on **uint8** in,
+  uint8 out, and agrees with PIL's LANCZOS to ≤ 1/255 (0.49% of channels differ
+  by 1). The same call on a **float** tensor diverges from PIL by up to 46/255,
+  because nothing clamps Lanczos' negative lobes — so "which dtype does the
+  resize see" is a real question, not a detail.
+
+So a C++ port must reproduce torchvision's antialiased Lanczos on uint8, and a
+PIL port would be off by up to 1/255 per channel before the model even starts.
+`smart_resize`, rescale/normalize and `patchify` are deterministic integer/affine
+work and are the easy part.
 
 ## 7. DFlash — the plan's one open item, resolved
 

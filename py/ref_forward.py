@@ -92,9 +92,11 @@ class OracleKernels:
         i64 = ctypes.c_int64
         self.lib.ok_gemm.argtypes = [d, d, d, i64, i64, i64]
         self.lib.ok_meansq.argtypes = [d, d, i64, i64]
-        for fn in ("ok_expv", "ok_tanhv", "ok_sinv", "ok_cosv", "ok_siluv", "ok_sigmoidv"):
+        for fn in ("ok_expv", "ok_tanhv", "ok_sinv", "ok_cosv", "ok_siluv", "ok_sigmoidv",
+                   "ok_erfv", "ok_geluv"):
             getattr(self.lib, fn).argtypes = [d, d, i64]
         self.lib.ok_powv.argtypes = [ctypes.c_double, d, d, i64]
+        self.lib.ok_layernorm.argtypes = [d, d, d, ctypes.c_double, d, i64, i64]
 
     @staticmethod
     def _c(a):
@@ -145,6 +147,23 @@ class OracleKernels:
 
     def sigmoid(self, x):
         return self._map("ok_sigmoidv", x)
+
+    def erf(self, x):
+        return self._map("ok_erfv", x)
+
+    def gelu(self, x):
+        return self._map("ok_geluv", x)
+
+    def layernorm(self, X, w, b, eps):
+        """nn.LayerNorm in the oracle's blocked-8 mean/variance order."""
+        X, xp = self._c(X)
+        w, wp = self._c(w)
+        b, bp = self._c(b)
+        rows, dim = X.shape
+        Y = np.empty_like(X)
+        _, yp = self._c(Y)
+        self.lib.ok_layernorm(xp, wp, bp, ctypes.c_double(eps), yp, rows, dim)
+        return Y
 
     def pow(self, base, e):
         e, ep = self._c(e)
@@ -317,6 +336,26 @@ def apply_fixed_reduce_patches():
     probe = torch.tensor([0.7], dtype=torch.float64)
     assert bool(ACT2FN["silu"](probe) == n2t(OK.silu(t2n(probe)), probe)), \
         "failed to route the SwiGLU activation through the oracle's silu"
+
+    # the vision tower and the projector use the EXACT erf gelu
+    def gelu(x):
+        return n2t(OK.gelu(t2n(x)), x).reshape(x.shape)
+
+    gelu_cls = type(ACT2FN["gelu"])
+    gelu_cls.forward = lambda self, x: gelu(x)
+    assert bool(ACT2FN["gelu"](probe) == n2t(OK.gelu(t2n(probe)), probe)), \
+        "failed to route the gelu activation through the oracle's gelu"
+
+    # nn.LayerNorm is the vision tower's normalizer; torch's f64 reduction
+    # order for it matches no simple blocked form, same as for the text norms
+    def layernorm_forward(self, x):
+        shp = x.shape
+        y = OK.layernorm(t2n(x).reshape(-1, shp[-1]), t2n(self.weight), t2n(self.bias),
+                         float(self.eps))
+        return torch.from_numpy(y).reshape(shp).to(x.dtype)
+
+    torch.nn.LayerNorm.forward = layernorm_forward
+
     MG.torch.sigmoid = sigmoid  # the attention output gate
 
 
