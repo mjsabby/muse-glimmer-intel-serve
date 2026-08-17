@@ -23,8 +23,9 @@ Modes:
 
   --fixed-reduce   : additionally execute HF's modules with the ORACLE's
                      reduction orders and transcendentals (src/simd.hpp's
-                     8-lane fma dot, the blocked-8 mean of squares, and
-                     src/fmath.hpp's FDLIBM exp/tanh/sin/cos/pow), loaded from
+                     8-lane fma dot, the blocked-8 mean of squares and
+                     LayerNorm, and src/fmath.hpp's exp / tanh / sin / cos /
+                     pow / silu / sigmoid / gelu), loaded from
                      libmuse_refkernels.so. This is what makes a BITWISE gate
                      possible: without it the reference uses BLAS' unspecified
                      dot order and libm's transcendentals, and agreement is

@@ -22,6 +22,7 @@ content are pinned, because a change to either changes what "correct" means.
 | python | 3.14.4 |
 | torch | 2.13.0+cpu |
 | transformers | **5.15.0** (checkpoint declares `transformers_version` `5.15.0.dev0`) |
+| torchvision | **0.28.0+cpu** — load-bearing: `MuseGlimmerImageProcessor` is a `TorchvisionBackend`, and below **0.27** its `resize` silently substitutes BICUBIC for the LANCZOS the checkpoint asks for (§6c) |
 | numpy | 2.5.2 |
 | host | AMD Ryzen 9 9950X (16C/32T), AVX-512 incl. `avx512_bf16` / `avx512_vnni` |
 | compiler | g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0, `-O3 -ffp-contract=off -fno-math-errno -march=native` |
@@ -494,13 +495,20 @@ per-position logit agreement, acceptance rate). Phase 5 is not implemented.
 
 | phase | gate | status |
 |---|---|---|
-| 4 | GGUF ingest, Q8/Q4_K bands vs llama.cpp | not started |
-| 5 | DFlash oracle: block token + per-position logit agreement, acceptance rate | semantics resolved (§7), not implemented |
-| 6 | vision: byte-exact preprocessing, tower + projector parity | not started |
+| 4 | GGUF ingest, Q8/Q4_K bands vs llama.cpp | **not started** |
+| 6 | vision: byte-exact **preprocessing** (torchvision Lanczos in C++) | **not started** — §6c explains why the plan's PIL target is wrong |
+| 6 | video: `t > 1` grids, 2 fps sampling, per-frame pixel-shuffle offsets | **not started** (the tower code takes `t`, but no video gate has been run) |
 | 7–8 | SYCL kernels, dual-GPU TP | needs the B70 box |
-| 9 | serving: `serve_tests.py`, `live_api_tests.py` | not started |
+| 9 | serving: `serve_tests.py`, `live_api_tests.py` | **not started** |
 | 10 | DFlash serving: `spec_parity.py` | needs the B70 box |
 | 11 | benchmarks vs llama.cpp | needs the B70 box |
 
-The tiny `tiny_vision` and `tiny_dflash` checkpoints exist (`py/make_tiny.py`)
-but their gates are Phase 5/6 work and have not been run.
+Two more honest gaps inside what *is* implemented:
+
+* the **bf16/f16 twins of the drafter and the tower** are written (`--dtype`
+  threads through `src/dflash.hpp` and `src/vision.hpp`) but only the text
+  twin is gated. `py/ref_dflash.py` and `py/ref_vision.py` have no
+  low-precision instrumentation yet.
+* `--hf-f32-compat` covers the vision tower's f32 sites (the
+  `apply_rotary_pos_emb_vision` downcast, the f32 softmax) but that path has not
+  been compared against stock, only the text one (§5).
