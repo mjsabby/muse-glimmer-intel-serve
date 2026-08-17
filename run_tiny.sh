@@ -58,13 +58,37 @@ $PY py/diff_logits.py "$OUT/f64_oracle" "$OUT/f64_ref" --topk 20 --assert-max-ab
     | sed 's/^/  /'
 
 for dt in bf16 f16; do
-    echo "== tiny_text: $dt twin, bitwise =="
-    $ORACLE --model "$TINY/tiny_text" --ids "$IDS" --out "$OUT/${dt}_oracle" \
-        --dtype "$dt" --dump-hidden >/dev/null
-    $PY py/ref_forward.py --model "$TINY/tiny_text" --ids "$IDS" --out "$OUT/${dt}_ref" \
-        --pure --dtype "$dt" --dump-hidden --threads 1 >/dev/null
-    bitwise "$dt logits" "$OUT/${dt}_oracle" "$OUT/${dt}_ref"
+    for at in eager flash; do
+        echo "== tiny_text: $dt twin, --attn $at, bitwise =="
+        $ORACLE --model "$TINY/tiny_text" --ids "$IDS" --out "$OUT/${dt}_${at}_oracle" \
+            --dtype "$dt" --attn "$at" --dump-hidden >/dev/null
+        $PY py/ref_forward.py --model "$TINY/tiny_text" --ids "$IDS" \
+            --out "$OUT/${dt}_${at}_ref" --pure --dtype "$dt" --attn "$at" \
+            --dump-hidden --threads 1 >/dev/null
+        bitwise "$dt/$at logits" "$OUT/${dt}_${at}_oracle" "$OUT/${dt}_${at}_ref"
+    done
+    # the flash twin must differ from the eager one: it is a DIFFERENT
+    # (looser) contract, and a flash kernel gated against the eager twin would
+    # be gated against something no fused kernel can meet
+    if cmp -s "$OUT/${dt}_eager_oracle/logits.bin" "$OUT/${dt}_flash_oracle/logits.bin"; then
+        fail "$dt eager and flash twins are identical — the S/P materializations are not being applied"
+    else
+        pass "$dt eager != flash (the twins are distinct contracts)"
+    fi
 done
+
+echo "== tiny_dflash: one drafting round, bitwise =="
+$ORACLE --model "$TINY/tiny_text" --ids "$IDS" --out "$OUT/draft_oracle" \
+    --assistant "$TINY/tiny_dflash" >/dev/null
+$PY py/ref_dflash.py --model "$TINY/tiny_text" --assistant "$TINY/tiny_dflash" \
+    --ids "$IDS" --out "$OUT/draft_ref" --pure --fixed-reduce --threads 1 >/dev/null
+if cmp -s "$OUT/draft_oracle/draft/logits.bin" "$OUT/draft_ref/logits.bin"; then
+    pass "draft logits"; else fail "draft logits"; fi
+if cmp -s "$OUT/draft_oracle/draft/hidden.bin" "$OUT/draft_ref/hidden.bin"; then
+    pass "draft hidden"; else fail "draft hidden"; fi
+ta=$($PY -c "import json;print(json.load(open('$OUT/draft_oracle/draft/meta.json'))['draft_tokens'])")
+tb=$($PY -c "import json;print(json.load(open('$OUT/draft_ref/meta.json'))['draft_tokens'])")
+if [[ "$ta" == "$tb" ]]; then pass "draft tokens $ta"; else fail "draft tokens $ta vs $tb"; fi
 
 echo "== determinism: kernels x thread count =="
 ref=""

@@ -308,6 +308,59 @@ cross-source evidence — GGUF `blk.*.attn_norm` == safetensors + 1 exactly, GGU
 
 ---
 
+## 6b. DFlash drafter gates (Phase 5)
+
+`src/dflash.hpp` implements `MuseGlimmerAssistantModel` and one drafting round;
+`py/ref_dflash.py` is the matching HF reference.
+
+### tiny_dflash — bitwise
+
+`tiny/tiny_text` + `tiny/tiny_dflash` (2 drafter layers, `block_size` 4,
+`target_layer_ids` [0, 2]), T=12:
+
+| artefact | differing bytes |
+|---|---:|
+| `draft/logits.bin` (3 × 512, bare head) | **0** |
+| `draft/hidden.bin` (4 × 64, post-norm) | **0** |
+| draft tokens | identical |
+
+### The released 30B + released drafter
+
+`meta-models/Muse-Glimmer-30B` + `meta-models/Muse-Glimmer-30B-assistant`,
+prompt `"<|begin_of_text|>The capital of France is"`, one round:
+
+| quantity | value |
+|---|---|
+| anchor (target's bonus token) | 13796 = `" Paris"` |
+| proposals per round | **15** (block_size 16, anchor row dropped) |
+| draft token agreement | **15/15 identical** |
+| per-position max abs logit delta | **3.70e-13** (mean 5.17e-14) |
+| per-position argmax agreement | **15/15** |
+| per-position top-64 overlap | **100.00%** |
+| drafter post-norm hidden, max abs | 4.35e-14 |
+
+Decoded: `" Paris" → ", and is is of of, to to to to to to to to"` — the block
+degrades with distance from the anchor, which is what a one-pass block-diffusion
+drafter does.
+
+Both the tokens *and* the per-position logits are gated, per docs/plan.md: draft
+tokens are discrete argmax decisions, so a near-tie can legitimately flip
+between two correct implementations, and a token-only gate would eventually pass
+something wrong or fail something right.
+
+### The mask offset that only the cache knows
+
+The drafter's mask is built without `position_ids`; the query index for the
+`abs(q_idx - kv_idx) <= sliding_window` overlay comes from
+`DFlashCache.get_query_offset()`, which adds `previous_accepted_tokens`. A
+first version of `py/ref_dflash.py` called the drafter with `use_cache=False`
+and no cache, which silently placed the block at positions `0 … B-1` instead of
+`n … n+B-1`. Nothing errored; the tiny model simply drafted `[113, 94, 94]`
+instead of `[356, 356, 356]`. This is the kind of failure docs/plan.md warns
+about for DFlash — "plausible-looking but wrong acceptance rates rather than an
+obvious failure" — and it is why the gate compares against the oracle rather
+than against a smoke test.
+
 ## 7. DFlash — the plan's one open item, resolved
 
 docs/plan.md leaves one question genuinely open ("the number of denoising

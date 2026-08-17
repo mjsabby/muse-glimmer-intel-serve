@@ -6,8 +6,9 @@ deterministic float64 CPU implementation defines the model function exactly, a
 bf16/f16 twin defines the deviation band any correct low-precision kernel must
 stay inside, and every GPU kernel is gated against them.
 
-**Status: the f64 text oracle and its bf16/f16 twins are done and gated**
-(Phases 0–3 of the plan). Everything from GGUF ingest onward is not started.
+**Status: the f64 text oracle, its bf16/f16 twins, and the DFlash drafter are
+done and gated** (Phases 0–3 and 5 of the plan). GGUF ingest, the vision tower,
+the SYCL engine and the serving frontend are not started.
 
 ```bash
 ./build.sh --cpu-only                     # g++ only, no oneAPI needed
@@ -31,7 +32,7 @@ along the way are in [VERIFICATION.md](VERIFICATION.md).
 | 2 | f64 text oracle | ✅ |
 | 3 | bf16/f16 twin | ✅ |
 | 4 | GGUF ingest | ⬜ |
-| 5 | DFlash drafter in the oracle | ⬜ (semantics resolved — see below) |
+| 5 | DFlash drafter in the oracle | ✅ |
 | 6 | vision tower | ⬜ |
 | 7–8 | SYCL engine, dual-GPU tensor parallelism | ⬜ needs the B70 box |
 | 9 | serving frontend | ⬜ |
@@ -50,11 +51,20 @@ along the way are in [VERIFICATION.md](VERIFICATION.md).
   and a cloud-vs-hardware split.
 
 The plan listed one genuinely open question — DFlash's denoising iteration count
-and acceptance rule. It is **resolved**: one pass per block, **15** proposed
-tokens per round rather than 16 (the anchor row's logits are dropped), a **bare**
-`lm_head` with no `output_multiplier` and no softcap, and HF's ordinary
-assisted-decoding acceptance rule. See
+and acceptance rule. It is **resolved and implemented**: one pass per block,
+**15** proposed tokens per round rather than 16 (the anchor row's logits are
+dropped), a **bare** `lm_head` with no `output_multiplier` and no softcap, and
+HF's ordinary assisted-decoding acceptance rule. On the released 30B + drafter
+the oracle's block matches the reference token for token with per-position
+logits agreeing to 3.7e-13. See
 [ARCHITECTURE.md](ARCHITECTURE.md#the-drafting-loop--resolved).
+
+```bash
+./build/muse-oracle --model meta-models/Muse-Glimmer-30B \
+    --assistant meta-models/Muse-Glimmer-30B-assistant \
+    --ids tools/prompts/fact.ids --out out/draft --draft-rounds 6
+tools/spec_baseline.sh            # the acceptance-rate regression baseline
+```
 
 ## The model
 

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@
 #include <omp.h>
 #endif
 
+#include "dflash.hpp"
 #include "hf.hpp"
 #include "muse_glimmer.hpp"
 
@@ -86,9 +88,14 @@ namespace
                 "                   [--kernels auto|scalar|avx512]\n"
                 "                        force the scalar execution of the 8-lane fma\n"
                 "                        reduction order; same bits, slower\n"
+                "                   [--assistant <dir|org/repo>]  run one DFlash drafting\n"
+                "                                       round after the target forward\n"
+                "                   [--draft-rounds N]  greedy speculative loop, for the\n"
+                "                                       acceptance-rate baseline\n"
                 "  --model     snapshot directory, or repo id resolved via the local HF cache\n"
                 "  --ids       comma/space separated token ids, or a file containing them\n"
-                "  --out       output dir: logits.bin (f64 [T,V]) + meta.json (+ hidden_XX.bin)\n");
+                "  --out       output dir: logits.bin (f64 [T,V]) + meta.json (+ hidden_XX.bin,\n"
+                "              + draft/{logits.bin,meta.json} with --assistant)\n");
     }
 
 } // namespace
@@ -96,9 +103,10 @@ namespace
 int main(int argc, char **argv)
 {
     std::string model, ids_spec, out_dir, revision = "main";
-    std::string dtype_s = "f64", attn_s = "eager", kernels_s = "auto", trace_dir;
+    std::string dtype_s = "f64", attn_s = "eager", kernels_s = "auto", trace_dir, assistant;
     bool dump_hidden = false, hf_f32_compat = false;
     int threads = 0, topk = 5;
+    int64_t draft_rounds = 0;
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
@@ -123,6 +131,10 @@ int main(int argc, char **argv)
             dump_hidden = true;
         else if (a == "--trace-dir")
             trace_dir = next();
+        else if (a == "--assistant")
+            assistant = next();
+        else if (a == "--draft-rounds")
+            draft_rounds = atoll(next().c_str());
         else if (a == "--hf-f32-compat")
             hf_f32_compat = true;
         else if (a == "--threads")
@@ -214,6 +226,43 @@ int main(int argc, char **argv)
         else if (attn_s != "eager")
             throw std::runtime_error("unknown --attn: " + attn_s + " (want eager|flash)");
 
+        // --assistant taps the target's hidden states at the drafter's
+        // target_layer_ids on the way through
+        std::unique_ptr<hf::ModelFiles> amf;
+        muse::dflash::Config acfg;
+        muse::dflash::Weights aw;
+        std::vector<std::vector<double>> taps;
+        if (!assistant.empty())
+        {
+            std::string asnap = hf::resolve_model(assistant, revision);
+            amf = std::make_unique<hf::ModelFiles>(asnap);
+            acfg = muse::dflash::parse_config(*amf->config);
+            aw = muse::dflash::bind_weights(*amf, acfg);
+            fopt.tap_layers = &acfg.target_layer_ids;
+            fopt.taps = &taps;
+            fprintf(stderr,
+                    "drafter: %s\n  %lld layers, heads %lld/%lld x %lld, block_size %lld "
+                    "(=> %lld proposals/round), mask id %lld, taps at %s\n",
+                    asnap.c_str(), (long long)acfg.num_hidden_layers,
+                    (long long)acfg.num_attention_heads, (long long)acfg.num_key_value_heads,
+                    (long long)acfg.head_dim, (long long)acfg.block_size,
+                    (long long)(acfg.block_size - 1), (long long)acfg.mask_token_id,
+                    [&]
+                    {
+                        static std::string s;
+                        s.clear();
+                        for (size_t i = 0; i < acfg.target_layer_ids.size(); ++i)
+                            s += (i ? "," : "") + std::to_string(acfg.target_layer_ids[i]);
+                        return s.c_str();
+                    }());
+            for (int64_t l : acfg.target_layer_ids)
+                if (l < 0 || l >= cfg.num_hidden_layers)
+                    throw std::runtime_error("target_layer_id " + std::to_string(l) +
+                                             " out of range for a " +
+                                             std::to_string(cfg.num_hidden_layers) +
+                                             "-layer target");
+        }
+
         std::vector<double> logits = muse::forward(cfg, w, ids, fopt);
         auto t2 = std::chrono::steady_clock::now();
 
@@ -234,6 +283,137 @@ int main(int argc, char **argv)
              << "\",\n \"kernels\": \"" << (simd::force_scalar() ? "scalar" : "auto")
              << "\",\n \"n_hidden\": " << (dump_hidden ? hooks.count : 0) << "\n}\n";
         std::ofstream(out_dir + "/meta.json") << meta.str();
+
+        if (!assistant.empty())
+        {
+            auto argmax_row = [&](const std::vector<double> &L, int64_t row)
+            {
+                const double *p = &L[size_t(row * V)];
+                int64_t best = 0;
+                for (int64_t v = 1; v < V; ++v)
+                    if (p[v] > p[best])
+                        best = v;
+                return best;
+            };
+
+            // One drafting round, exactly as DFlashTokenCandidateGenerator does
+            // it on its first call: the whole prompt is the accepted context,
+            // the anchor is the target's own bonus token (greedy argmax at the
+            // last position), and the block sits at positions T .. T+B-1.
+            const int64_t anchor = argmax_row(logits, T - 1);
+
+            muse::dflash::DraftResult dr = muse::dflash::draft(
+                acfg, aw, cfg, w, taps, T, anchor, T, hf_f32_compat, fopt.dtype);
+
+            std::string ddir = out_dir + "/draft";
+            if (system(("mkdir -p '" + ddir + "'").c_str()) != 0)
+                throw std::runtime_error("cannot create " + ddir);
+            write_bin(ddir + "/logits.bin", dr.logits.data(), dr.logits.size());
+            write_bin(ddir + "/hidden.bin", dr.hidden.data(), dr.hidden.size());
+            std::ostringstream dm;
+            dm << "{\n \"kind\": \"cpp_oracle_dflash\",\n \"ids\": [";
+            for (size_t i = 0; i < ids.size(); ++i)
+                dm << (i ? "," : "") << ids[i];
+            dm << "],\n \"T\": " << (acfg.block_size - 1) << ",\n \"V\": " << V
+               << ",\n \"block_size\": " << acfg.block_size << ",\n \"anchor\": " << anchor
+               << ",\n \"context_len\": " << T << ",\n \"draft_tokens\": [";
+            for (size_t i = 0; i < dr.tokens.size(); ++i)
+                dm << (i ? "," : "") << dr.tokens[i];
+            dm << "],\n \"n_hidden\": 0\n}\n";
+            std::ofstream(ddir + "/meta.json") << dm.str();
+
+            printf("anchor %lld, drafted %zu tokens:", (long long)anchor, dr.tokens.size());
+            for (int64_t t : dr.tokens)
+                printf(" %lld", (long long)t);
+            printf("\n");
+
+            // Greedy speculative loop, for the acceptance-rate baseline.
+            //
+            // The acceptance rule is HF's ordinary _assisted_decoding one: the
+            // target's argmax at each verified position is compared with the
+            // candidate, the first mismatch ends the run, and the target's own
+            // argmax at that position is taken as a bonus token — so a round
+            // always yields at least 1 token and at most block_size.
+            //
+            // The oracle has no KV cache (it is a prefill referee), so each
+            // round re-runs the full target forward over the accepted prefix
+            // plus the candidates. That is one target forward per round, the
+            // same count the real engine does; only the cost per forward is
+            // different.
+            if (draft_rounds > 0)
+            {
+                std::vector<int64_t> seq = ids;
+                std::vector<double> L = logits;
+                std::vector<std::vector<double>> tp = taps;
+                int64_t bonus = anchor, n_ctx = T;
+                int64_t total_accepted = 0, total_drafted = 0, tokens_out = 0;
+                std::vector<int64_t> per_round;
+
+                for (int64_t r = 0; r < draft_rounds; ++r)
+                {
+                    muse::dflash::DraftResult d = muse::dflash::draft(
+                        acfg, aw, cfg, w, tp, n_ctx, bonus, n_ctx, hf_f32_compat, fopt.dtype);
+                    seq.push_back(bonus);
+                    ++tokens_out;
+                    const int64_t base = int64_t(seq.size()); // first candidate position
+                    std::vector<int64_t> cand = seq;
+                    cand.insert(cand.end(), d.tokens.begin(), d.tokens.end());
+
+                    L = muse::forward(cfg, w, cand, fopt);
+                    int64_t matches = 0;
+                    while (matches < int64_t(d.tokens.size()) &&
+                           argmax_row(L, base - 1 + matches) == cand[size_t(base + matches)])
+                        ++matches;
+                    total_drafted += int64_t(d.tokens.size());
+                    total_accepted += matches;
+                    per_round.push_back(matches);
+
+                    seq.insert(seq.end(), d.tokens.begin(), d.tokens.begin() + matches);
+                    tokens_out += matches;
+                    bonus = argmax_row(L, base - 1 + matches);
+                    n_ctx = int64_t(seq.size());
+                    // The verification forward covered `cand`, which is at
+                    // least as long as the accepted prefix. Attention is
+                    // causal, so its hidden states at positions 0..n_ctx-1 are
+                    // exactly the accepted prefix's — truncate rather than
+                    // re-running the target.
+                    tp.assign(taps.size(), {});
+                    for (size_t k = 0; k < taps.size(); ++k)
+                        tp[k].assign(taps[k].begin(),
+                                     taps[k].begin() + size_t(n_ctx * cfg.hidden_size));
+                }
+                seq.push_back(bonus);
+
+                const double rate = total_drafted ? double(total_accepted) / double(total_drafted)
+                                                  : 0.0;
+                printf("spec: rounds %lld, drafted %lld, accepted %lld, accept_rate %.4f, "
+                       "tokens/round %.3f\n",
+                       (long long)draft_rounds, (long long)total_drafted,
+                       (long long)total_accepted, rate,
+                       double(tokens_out) / double(draft_rounds));
+                printf("spec: accepted per round:");
+                for (int64_t m : per_round)
+                    printf(" %lld", (long long)m);
+                printf("\nspec: sequence:");
+                for (size_t i = ids.size(); i < seq.size(); ++i)
+                    printf(" %lld", (long long)seq[i]);
+                printf("\n");
+
+                std::ostringstream sm;
+                sm << "{\n \"kind\": \"cpp_oracle_spec\",\n \"rounds\": " << draft_rounds
+                   << ",\n \"block_size\": " << acfg.block_size << ",\n \"drafted\": "
+                   << total_drafted << ",\n \"accepted\": " << total_accepted
+                   << ",\n \"accept_rate\": " << rate << ",\n \"tokens_per_round\": "
+                   << double(tokens_out) / double(draft_rounds) << ",\n \"per_round\": [";
+                for (size_t i = 0; i < per_round.size(); ++i)
+                    sm << (i ? "," : "") << per_round[i];
+                sm << "],\n \"generated\": [";
+                for (size_t i = ids.size(); i < seq.size(); ++i)
+                    sm << (i > ids.size() ? "," : "") << seq[i];
+                sm << "]\n}\n";
+                std::ofstream(out_dir + "/draft/spec.json") << sm.str();
+            }
+        }
 
         // human sanity: top-k of the last position
         const double *last = &logits[size_t((T - 1) * V)];

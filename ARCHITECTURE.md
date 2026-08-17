@@ -365,6 +365,20 @@ Note the rope slice: `q` covers only the 16 block rows while `k` covers
 `cos[..., -q_len:, :]` for the queries and the full table for the keys — the
 block sits at positions `n .. n+15`, immediately after the context.
 
+Two more details the module makes easy to miss:
+
+* the **projected context is not re-normalized per layer**. Each layer computes
+  `k_proj/v_proj` over `concat(ctx, input_layernorm(block))` — the block rows
+  are normed, the context rows are the encoder's output unchanged, all five
+  layers over.
+* every norm in the drafter is a **plain** RMSNorm (weight around 1), including
+  `input_layernorm` and `post_attention_layernorm`, whose names match the
+  target's zero-centered ones. And the drafter's `MuseGlimmerAssistantRMSNorm`
+  casts back to the storage dtype *before* the weight multiply
+  (`self.weight * hidden_states.to(input_dtype)`), whereas the target's
+  `MuseGlimmerRMSNorm` multiplies first and casts once — same value in f64, one
+  extra rounding in a low-precision run.
+
 The cache holds only the context k/v — the 16 block rows are appended and then
 evicted each step (`DFlashCache`). `target_layer_ids` are 0-based layer
 *outputs*; the GGUF spells the same thing 1-based as
@@ -397,6 +411,23 @@ all of which change the engine and none of which are visible in
    (algorithm 1 of the speculative-decoding paper). Distribution-preserving
    serving therefore needs no new acceptance machinery — only block-shaped
    rollback.
+
+5. **The block's queries sit at absolute positions `n … n+B-1` for masking
+   purposes, and that offset comes from the cache, not from `position_ids`.**
+   `MuseGlimmerAssistantModel.forward` builds its mask with
+   `create_bidirectional_sliding_window_mask(config, inputs_embeds=noise_embeds,
+   attention_mask=…, past_key_values=…)` — no `position_ids` — so the query
+   index used by the `abs(q_idx - kv_idx) <= sliding_window` overlay comes from
+   `DFlashCache.get_query_offset()`, which is `super().get_query_offset() +
+   previous_accepted_tokens`. Run the drafter without a `DFlashCache` (or
+   without `set_previous_accepted_tokens(n)`) and the block is masked as if it
+   sat at positions `0 … B-1`: for a short context every key is inside the
+   window either way and nothing looks wrong, but the drafted tokens are
+   different. Measured on the tiny harness: `[113, 94, 94]` without the offset
+   versus `[356, 356, 356]` with it.
+
+   There is no causal constraint anywhere in the drafter — the bidirectional
+   mask allows every `(q, kv)` pair inside the window, block-to-block included.
 
 Context bookkeeping: `context_hidden_states` are the target's hidden states at
 `target_layer_ids` for the **accepted positions only**

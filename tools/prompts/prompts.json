@@ -1,0 +1,18 @@
+{
+ "fact": {
+  "text": "The capital of France is",
+  "n_ids": 6
+ },
+ "code": {
+  "text": "def fibonacci(n):\n    \"\"\"Return the nth Fibonacci number.\"\"\"\n",
+  "n_ids": 13
+ },
+ "list": {
+  "text": "Here are three reasons to use version control:\n1.",
+  "n_ids": 12
+ },
+ "prose": {
+  "text": "The old lighthouse keeper had seen many storms, but never one like",
+  "n_ids": 14
+ }
+}

@@ -94,6 +94,43 @@ simulation of it: a GPU kernel that matches the twin bitwise is correct by
 construction, and one that does not can be diffed against it position by
 position with `py/diff_lp.py`.
 
+## The DFlash drafter
+
+```bash
+./build/muse-oracle --model meta-models/Muse-Glimmer-30B \
+                    --assistant meta-models/Muse-Glimmer-30B-assistant \
+                    --ids 200000,954,7963,323,11698,373 --out out/run
+```
+
+`--assistant` taps the target's hidden states at the drafter's
+`target_layer_ids` on the way through the forward, then runs **one** drafting
+round — the same round `DFlashTokenCandidateGenerator` performs on its first
+call. It writes `out/run/draft/{logits.bin,hidden.bin,meta.json}`:
+`block_size - 1` rows of **bare** `lm_head` logits (no `output_multiplier`, no
+softcap — that is what the reference does), the drafter's post-norm hidden
+states for all `block_size` rows, and the argmax tokens.
+
+Both are dumped on purpose: the tokens are discrete argmax decisions, so a
+near-tie can flip between two correct implementations. A gate that compares only
+tokens will eventually pass something wrong, or fail something right.
+
+`--draft-rounds N` runs the greedy speculative loop for N rounds and reports
+`accept_rate` and tokens/round. The acceptance rule is HF's ordinary
+assisted-decoding one, so a round always yields at least 1 token (the target's
+own bonus) and at most `block_size`. The oracle has no KV cache — it is a
+prefill referee — so every round re-runs the whole target forward; the round
+*count* matches a real engine, the cost per round does not.
+`tools/spec_baseline.sh` sweeps the fixed prompt set in `tools/prompts/` and
+prints the baseline table.
+
+`py/ref_dflash.py` is the matching reference. It has one non-obvious
+requirement: the drafter must be called with a `DFlashCache` on which
+`set_previous_accepted_tokens(n)` has been set, because
+`DFlashCache.get_query_offset()` is what places the block's queries at absolute
+positions `n … n+B-1` for the sliding-window mask. Without it the block is
+masked as if it sat at positions `0 … B-1`; nothing errors, and the drafted
+tokens are simply different.
+
 ## Refereeing against the HF reference
 
 ```bash

@@ -566,7 +566,14 @@ def build_streamed(snap, cfg):
         out = torch.empty(*x.shape[:-1], self.weight.shape[0], dtype=torch.float64)
         for o0 in range(0, self.weight.shape[0], chunk):
             w = self.weight[o0:o0 + chunk].to(torch.float64)
-            out[..., o0:o0 + chunk] = F.linear(x, w)
+            # chunking is over OUTPUT rows, so every output element still
+            # reduces over the full hidden dim and the values are unchanged
+            if OK is not None:  # --fixed-reduce must not be bypassed here
+                out[..., o0:o0 + chunk] = torch.from_numpy(
+                    OK.gemm(t2n(w), t2n(x).reshape(-1, x.shape[-1]))).reshape(
+                        *x.shape[:-1], -1)
+            else:
+                out[..., o0:o0 + chunk] = F.linear(x, w)
         return out
 
     head.forward = head_forward.__get__(head)

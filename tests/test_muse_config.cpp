@@ -2,6 +2,7 @@
 // other Gemma-shaped checkpoint, asserted against synthetic configs.
 #include <string>
 
+#include "dflash.hpp"
 #include "muse_glimmer.hpp"
 #include "test_util.h"
 
@@ -194,5 +195,61 @@ void test_muse_config()
         }
         CHECK(sliding == 39); // 39 sliding + 13 global
         CHECK(rotated == 39); // only the sliding layers rotate
+    }
+
+    // ---- the DFlash drafter config (the released -assistant repo's values)
+    {
+        const std::string js =
+            "{\n"
+            "  \"model_type\": \"muse_glimmer_assistant\",\n"
+            "  \"hidden_size\": 6656,\n"
+            "  \"intermediate_size\": 19968,\n"
+            "  \"num_hidden_layers\": 5,\n"
+            "  \"num_attention_heads\": 32,\n"
+            "  \"num_key_value_heads\": 8,\n"
+            "  \"head_dim\": 128,\n"
+            "  \"rms_norm_eps\": 1e-05,\n"
+            "  \"sliding_window\": 2048,\n"
+            "  \"max_position_embeddings\": 131072,\n"
+            "  \"block_size\": 16,\n"
+            "  \"mask_token_id\": 201818,\n"
+            "  \"target_layer_ids\": [1, 13, 25, 37, 49],\n"
+            "  \"rope_parameters\": {\"rope_type\": \"default\", \"rope_theta\": 500000.0},\n"
+            "  \"layer_types\": [\"sliding_attention\", \"sliding_attention\", "
+            "\"sliding_attention\", \"sliding_attention\", \"sliding_attention\"]\n"
+            "}\n";
+        auto r = minijson::parse(js);
+        muse::dflash::Config d = muse::dflash::parse_config(*r);
+        CHECK(d.num_hidden_layers == 5);
+        CHECK(d.num_attention_heads == 32);
+        CHECK(d.num_key_value_heads == 8); // GQA 4:1, unlike the target's 16:1
+        CHECK(d.kv_groups() == 4);
+        CHECK(d.block_size == 16);
+        // a round proposes block_size - 1 tokens: the anchor row is dropped
+        CHECK(d.block_size - 1 == 15);
+        CHECK(d.mask_token_id == 201818);
+        CHECK(d.target_layer_ids.size() == 5);
+        CHECK(d.target_layer_ids[0] == 1 && d.target_layer_ids[4] == 49);
+        for (int64_t i = 0; i < d.num_hidden_layers; ++i)
+            CHECK(d.layer_is_sliding(i)); // every drafter layer is sliding
+        CHECK_NEAR(d.rope_theta, 500000.0, 0.0);
+
+        // block_size 1 would leave nothing to propose
+        {
+            std::string s = js;
+            size_t p = s.find("\"block_size\": 16");
+            s.replace(p, std::string("\"block_size\": 16").size(), "\"block_size\": 1");
+            bool threw = false;
+            try
+            {
+                auto v = minijson::parse(s);
+                muse::dflash::parse_config(*v);
+            }
+            catch (const std::exception &)
+            {
+                threw = true;
+            }
+            CHECK(threw);
+        }
     }
 }
