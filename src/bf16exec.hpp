@@ -465,8 +465,14 @@ namespace muse
                             const int64_t qpos = pos0 + t, g = hh / groups;
                             const int64_t lo = sliding ? std::max<int64_t>(0, qpos - c.sliding_window + 1) : 0;
                             const uint16_t *q = qb.data() + (t * nq + hh) * D;
+                            // Accumulate straight into the output row: no
+                            // per-(token, head) allocation, and one fewer pass
+                            // over D. At T=2048 this loop runs 2048 times per
+                            // (token, head) and was the reason prefill fell
+                            // from 3.5 to 2.4 TFLOP/s with depth.
+                            float *o = of.data() + (t * nq + hh) * D;
+                            std::memset(o, 0, size_t(D) * sizeof(float));
                             float mx = -INFINITY, sum = 0.f;
-                            std::vector<float> acc(size_t(D), 0.f);
                             for (int64_t j = lo; j <= qpos; ++j)
                             {
                                 const float s =
@@ -476,14 +482,36 @@ namespace muse
                                 const float e = std::exp(s - m2);
                                 sum = sum * corr + e;
                                 const uint16_t *vv = kv.v(li, j) + g * D;
-                                for (int64_t d = 0; d < D; ++d)
-                                    acc[size_t(d)] = acc[size_t(d)] * corr + e * bf16_to_f32(vv[d]);
+                                int64_t d = 0;
+#if defined(__AVX512F__)
+                                const __m512 vc = _mm512_set1_ps(corr);
+                                const __m512 ve = _mm512_set1_ps(e);
+                                for (; d + 16 <= D; d += 16)
+                                {
+                                    // bf16 -> f32 is a 16-bit left shift
+                                    const __m512 vv32 = _mm512_castsi512_ps(_mm512_slli_epi32(
+                                        _mm512_cvtepu16_epi32(
+                                            _mm256_loadu_si256((const __m256i *)(vv + d))),
+                                        16));
+                                    // mul, mul, add — deliberately NOT fmadd.
+                                    // Measured identical envelope either way,
+                                    // so the tie-break is that the scalar tail
+                                    // below cannot fuse: keeping both
+                                    // unfused means a head with D % 16 != 0
+                                    // rounds the same way across the split.
+                                    _mm512_storeu_ps(
+                                        o + d,
+                                        _mm512_add_ps(_mm512_mul_ps(_mm512_loadu_ps(o + d), vc),
+                                                      _mm512_mul_ps(ve, vv32)));
+                                }
+#endif
+                                for (; d < D; ++d)
+                                    o[d] = o[d] * corr + e * bf16_to_f32(vv[d]);
                                 mx = m2;
                             }
-                            float *o = of.data() + (t * nq + hh) * D;
                             const float inv = 1.0f / sum;
                             for (int64_t d = 0; d < D; ++d)
-                                o[d] = acc[size_t(d)] * inv;
+                                o[d] *= inv;
                         }
 
                     // output gate from the PRE-attention normed input
