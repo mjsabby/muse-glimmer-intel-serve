@@ -68,7 +68,7 @@ From the checkpoint `config.json`.
 | intermediate_size | 8960 |
 | hidden_act | `gelu` |
 | num_attention_heads | 16 (head_dim 96) |
-| layer_types | `[window, window, window, full] × 12` + `[window, window]` |
+| layer_types | `[window, window, window, full] × 12` + `[window, full]` — the tower **ends on a full-attention layer**; `MuseGlimmerVisionConfig.__post_init__` is `full if (i+1) % 4 == 0 or i == L-1` |
 | patch_size / patch_temporal / merge_size | 14 / 2 / 2 |
 | pos_emb_height × pos_emb_width | 32 × 32 (1024-entry learned table) |
 | layer_norm_eps | 1e-5 (LayerNorm **with bias**, not RMSNorm) |
@@ -260,14 +260,19 @@ probability after softmax, so the oracle simply excludes them.
 ```
 h      = norm(h)                                  # PLAIN RMSNorm, eps = 1e-5
 logits = h @ lm_head^T                            # [T, 202048]
-logits = logits · output_multiplier                # 0.19611613513818404
-logits = softcap · tanh(logits / softcap)          # softcap = 20.0
+logits = logits * output_multiplier                # 0.19611613513818404
+logits = logits / final_logit_softcapping          # 20.0
+logits = tanh(logits)
+logits = logits * final_logit_softcapping
 ```
 
 The multiplier is applied *before* the cap, so the effective function is
-`20 · tanh(0.196116… · z / 20)`. Both constants are Python floats — the bf16
-twin must take their f32 opmath value, not a rounded one. `logit_scale` and
-`final_logit_softcapping` are both present in the GGUF metadata.
+`20 · tanh(0.196116… · z / 20)`. The four lines above are four separate tensor
+ops in the reference and are written out in that order because each one is a
+separate materialization in the low-precision twin. Both constants are Python
+floats — the bf16 twin must take their f32 opmath value, not a rounded one.
+`logit_scale` and `final_logit_softcapping` are both present in the GGUF
+metadata.
 
 ## Vision ops
 
@@ -281,8 +286,7 @@ Tower (`MuseGlimmerVisionModel`), per image with grid `(t, h, w)` in patches:
 
 ```
 x = patch_embedding(pixels)                      # Linear [1176 → 1536], NO bias
-pos = bilinear_resample(position_embedding_table[32×32], grid)   # grid_sample,
-                                                 # align_corners=False, zeros pad
+pos = bilinear_resample(position_embedding_table[32×32], grid)   # see below
 x = x + pos
 x = ln_pre(x)                                    # LayerNorm, with bias
 x = x[window_index]                              # window reorder, window = 32·14 = 448 px
@@ -308,6 +312,19 @@ y = rmsnorm_weightless(y, eps=rms_norm_eps)      # perception_emb_norm
 `input_ids == image_token_id` (200092) / `video_token_id` (200091). Because
 both the text embedding and `perception_emb_norm` are the *same* weight-less
 RMSNorm, text and vision embeddings arrive on the same scale.
+
+Position-embedding resample detail: the HF reference does **not** call
+`F.grid_sample`. `get_vision_bilinear_indices_and_weights` (defined in the model
+file, not in `vision_utils`, precisely because of this) builds the four corner
+indices and their weights explicitly in **f32** and gathers
+`position_embedding_table(idx) * weight` — documented as "equivalent with
+`F.grid_sample(inputs, align_corners=False, padding='zeros')`", with a code
+comment stating that it deliberately differs from the original reference's
+`grid_sample` numerics ("we compute manually in fp32"). The sampling grid is
+`(arange(h) + 0.5) * (32 / h) - 0.5` per axis, with `floor` (not truncation),
+out-of-range corners **zero-weighted rather than clamped**, and the gathered
+result reordered by the merge permutation. The oracle must reproduce the
+explicit gather, not `grid_sample`.
 
 Vision RoPE detail: `inv_freq` is computed over `spatial_dim = head_dim // 2 =
 48`, i.e. `inv_freq[j] = θ^(-2j/48)`, `j ∈ [0, 24)`, and the per-token
@@ -337,20 +354,59 @@ for layer in 0..4:
     q, k = q_norm(q), k_norm(k)   → rope(θ=500000)   # sliding window 2048
     block attends BI-DIRECTIONALLY within itself, causally to ctx
     ... standard pre-norm SwiGLU block (plain RMSNorm, 2 norms per layer)
-hn     = norm(block)
-logits = lm_head(hn) · output_multiplier → softcap   # target head + target tail math
+hn      = norm(block)
+logits  = lm_head(hn)[1:]                            # BARE head: no output_multiplier,
+                                                     # no softcap, and row 0 dropped
+tokens  = argmax(logits)                             # 15 candidates per round
 ```
+
+Note the rope slice: `q` covers only the 16 block rows while `k` covers
+`ctx ++ block`, so the drafter's `apply_rotary_pos_emb` takes
+`cos[..., -q_len:, :]` for the queries and the full table for the keys — the
+block sits at positions `n .. n+15`, immediately after the context.
 
 The cache holds only the context k/v — the 16 block rows are appended and then
 evicted each step (`DFlashCache`). `target_layer_ids` are 0-based layer
 *outputs*; the GGUF spells the same thing 1-based as
 `dflash.target_layers = [2, 14, 26, 38, 50]`.
 
-**Open item for implementation**: the number of denoising iterations per block
-(one pass vs. an iterative refine loop) and the acceptance rule are defined by
-the generation utility, not by `MuseGlimmerAssistantModel.forward`. That has to
-be read out of the reference generation loop / llama.cpp's `dflash` path before
-the drafter gate is written. Everything above is fixed by the module itself.
+### The drafting loop — resolved
+
+Read out of `generation/candidate_generator.py::DFlashTokenCandidateGenerator`
+and `generation/utils.py::_assisted_decoding` (transformers 5.15.0). Four facts,
+all of which change the engine and none of which are visible in
+`MuseGlimmerAssistantModel.forward`:
+
+1. **One denoising pass per block. There is no iterative refine loop.**
+   `get_candidates` calls the assistant exactly once per round and reads the
+   tokens straight off that pass.
+2. **A round proposes `block_size - 1 = 15` tokens, not 16.** The noise block is
+   `[anchor] + [MASK] × (block_size - 1)` — 16 rows — but the candidate logits
+   are `lm_head(last_hidden_state)[:, 1:]`: row 0 is the anchor's own position
+   and is **dropped**. Sizing a verification pass for 16 new tokens per round is
+   wrong by one.
+3. **The drafter's head is the BARE `lm_head`** — `main_model_output_embeddings`
+   is `target.get_output_embeddings()`, applied with no `output_multiplier` and
+   no softcap. For greedy drafting this is invisible (both are monotone, so the
+   argmax is unchanged), but under sampling, `logit_bias`, or temperature the
+   drafter's distribution is *not* the target's, and a serving implementation
+   that "helpfully" adds the target's tail math will change acceptance rates.
+4. **Acceptance is HF's ordinary assisted-decoding rule**, not something
+   DFlash-specific: greedy compares the target's argmax to the candidates and
+   rolls back to the first mismatch; sampling uses `_speculative_sampling`
+   (algorithm 1 of the speculative-decoding paper). Distribution-preserving
+   serving therefore needs no new acceptance machinery — only block-shaped
+   rollback.
+
+Context bookkeeping: `context_hidden_states` are the target's hidden states at
+`target_layer_ids` for the **accepted positions only**
+(`n_last_matches + 1` rows after the first round, `T - 1` on the prefill round),
+concatenated on the last dim; `cache.crop(-block_size)` evicts the previous
+round's block rows before the next call, so the cache holds context k/v only.
+The anchor token is `input_ids[:, -1:]`, and the drafter embeds it with the
+target's **raw** table (`F.embedding(ids, embed_tokens.weight)`) — no
+`embed_norm`, which is why `MuseGlimmerTextNormedEmbedding` keeps the norm
+outside the table.
 
 ## Serving contract (`chat_template.jinja`, "ATEM")
 
@@ -397,6 +453,19 @@ RMSNorm kinds, the weight-less QK-norm and embed-norm, the RoPE tables (text and
 vision), the eager softmax, and the vision RoPE application. The oracle lifts
 all of them. Equivalence to HF is proven with a precision-only patch of the
 reference; the gap to *stock* unpatched HF-f64 is measured and published.
+
+One torch-CPU quirk is load-bearing for the norms and is easy to get backwards
+(measured on torch 2.13.0+cpu, `py/probe_torch_ops.py`, and recorded in
+VERIFICATION.md): **`torch.rsqrt(x)` and `torch.pow(x, -0.5)` are the correctly
+rounded values in f64 and agree bit-for-bit with C's `1.0 / std::sqrt(x)`,
+while `torch.sqrt` is a ~1-ulp approximation** — so `1.0 / torch.sqrt(x)`
+differs from `torch.rsqrt(x)` on ~1% of elements by up to 2 ulp. The oracle's
+norms therefore compute `1.0 / std::sqrt(ms)`, and a reference written with
+`1 / torch.sqrt(...)` would not referee them. The reference's use of
+`torch.pow(ms, -0.5)` in `MuseGlimmerRMSNorm` and `torch.rsqrt` in
+`MuseGlimmerTextCenteredRMSNorm` is therefore *not* a numerical difference
+between the two norm kinds, as the reference's own comment about matching JAX
+might suggest — the two are bit-identical.
 
 Low-precision twins (`--dtype bf16|f16`) follow the same rules the qwen35 oracle
 documents: `rnd(x)` = RNE(f64→f32) then RNE(f32→bf16/f16); one rounding per

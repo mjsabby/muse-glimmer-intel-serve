@@ -6,17 +6,55 @@ deterministic float64 CPU implementation defines the model function exactly, a
 bf16/f16 twin defines the deviation band any correct low-precision kernel must
 stay inside, and every GPU kernel is gated against them.
 
-**Status: planning.** Nothing is implemented yet. This repository currently
-contains the verified architecture contract, the phased build plan, and the two
-sibling stacks it is derived from.
+**Status: the f64 text oracle and its bf16/f16 twins are done and gated**
+(Phases 0–3 of the plan). Everything from GGUF ingest onward is not started.
+
+```bash
+./build.sh --cpu-only                     # g++ only, no oneAPI needed
+.venv/bin/python py/make_tiny.py --out tiny
+./run_tiny.sh                             # the bitwise + noise-floor + determinism gates
+
+./build/muse-oracle --model meta-models/Muse-Glimmer-30B \
+    --ids 200000,954,7963,323,11698,373 --out out/run --dump-hidden
+```
+
+On the released 30B checkpoint the oracle agrees with a precision-lifted HF
+reference to **1.1e-13** max abs on logits with **exact argmax and exact top-64**
+at every position, and its `--dtype bf16`/`f16` twins are **bitwise** against the
+rounding-instrumented reference. Full numbers, methodology and the traps found
+along the way are in [VERIFICATION.md](VERIFICATION.md).
+
+| phase | | |
+|---|---|---|
+| 0 | repo skeleton, pinned reference env, instrumented HF reference | ✅ |
+| 1 | tiny-model harness (`tiny_text` / `tiny_vision` / `tiny_dflash`) | ✅ text gate green |
+| 2 | f64 text oracle | ✅ |
+| 3 | bf16/f16 twin | ✅ |
+| 4 | GGUF ingest | ⬜ |
+| 5 | DFlash drafter in the oracle | ⬜ (semantics resolved — see below) |
+| 6 | vision tower | ⬜ |
+| 7–8 | SYCL engine, dual-GPU tensor parallelism | ⬜ needs the B70 box |
+| 9 | serving frontend | ⬜ |
+| 10–11 | DFlash serving, benchmarks | ⬜ needs the B70 box |
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — the exact model specification the oracle
   implements: config, tensor inventory, op-by-op semantics for the text
   backbone, vision tower and DFlash drafter, the serving/chat contract, and the
   numerics policy. Derived from the `transformers` reference and verified
   against the shipped safetensors and GGUF bytes.
+- [VERIFICATION.md](VERIFICATION.md) — what each gate compares, the pinned
+  reference environment, and every measured number.
+- [docs/oracle.md](docs/oracle.md) — how to build and run the oracle, and what
+  each flag means.
 - [docs/plan.md](docs/plan.md) — the build plan, phase by phase, with exit gates
   and a cloud-vs-hardware split.
+
+The plan listed one genuinely open question — DFlash's denoising iteration count
+and acceptance rule. It is **resolved**: one pass per block, **15** proposed
+tokens per round rather than 16 (the anchor row's logits are dropped), a **bare**
+`lm_head` with no `output_multiplier` and no softcap, and HF's ordinary
+assisted-decoding acceptance rule. See
+[ARCHITECTURE.md](ARCHITECTURE.md#the-drafting-loop--resolved).
 
 ## The model
 

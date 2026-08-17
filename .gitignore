@@ -8,3 +8,5 @@ __pycache__/
 *.npy
 .venv/
 compile_commands.json
+tiny/
+.venv/
