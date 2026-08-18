@@ -433,42 +433,65 @@ reading it back, i.e. 3× the traffic of just reading bf16:
 
 | drafter tier | VRAM | draft/round | spec tok/s (code) |
 |---|---:|---:|---:|
-| BF16 | 4.89 GiB | 16.1 ms | **122.4** |
-| Q8_0 (dequantize-to-scratch) | 2.79 GiB | 48.0 ms | 89.3 |
-| **Q8_0 (small-M GEMM)** | **2.79 GiB** | **36.0 ms** | **100.3** |
+| BF16 | 4.89 GiB | 16.0 ms | 122.5 |
+| Q8_0, dequantize-to-scratch | 2.79 GiB | 48.0 ms | 89.3 |
+| Q8_0, scalar small-M GEMM | 2.79 GiB | 36.0 ms | 100.3 |
+| **Q8_0, int8 DPAS** | **2.91 GiB** | **15.4 ms** | **123.3** |
 
-`k_gemm_q8_smallm` reads the weight once and reuses each dequantized value
-across all M activation rows, with the activations staged in local memory so
-they are not re-fetched per output row. That took the Q8 drafter's overhead from
-25% of speculative throughput to 18%.
+The quantized drafter is now **faster than BF16 as well as smaller** — the 25%
+penalty is gone. Getting there took three attempts, and the first two are worth
+recording because they were both reasonable and both wrong.
 
-**It does not close the gap, and measurement says it cannot.** At the drafter's
-shape (M=16, 6656→9984), with incompressible weights:
+**Dequantize-to-scratch** (the prefill path) expands the weight to bf16 so the
+matrix engines can run: 3× the traffic, 48 ms.
+
+**A scalar small-M GEMM** reads the weight once and reuses each dequantized
+value across all 16 rows. Better — 36 ms — but it gives up the matrix engines,
+and at M = 16 the arithmetic intensity is 16 FMA per weight element. A scalar
+kernel pays ~35 operations per weight byte, which costs more than halving the
+bytes saves. Measured at the drafter's shape (M=16, 6656→9984):
 
 | | time | effective |
 |---|---:|---|
-| bf16 via oneDNN | **0.231 ms** | 576 GB/s — the streaming ceiling |
-| q8 → bf16 dequant, then the same GEMM | 1.955 ms | traffic-bound, 3× the bytes |
-| q8 small-M, hand-written | 0.792 ms | 90 GB/s — ALU-bound |
+| bf16 via oneDNN | 0.231 ms | 576 GB/s — the streaming ceiling |
+| q8 → bf16 dequant + same GEMM | 1.955 ms | traffic-bound |
+| q8 scalar small-M | 0.792 ms | 90 GB/s — ALU-bound |
+| **q8 int8 DPAS** | **0.154 ms** | **459 GB/s** |
 
-BF16 is *already at the memory ceiling*, so there is nothing to win back there.
-At M = 16 the arithmetic intensity is 16 FMA per weight element, and a scalar
-kernel pays ~35 operations per weight byte — more than halving the bytes saves.
-The bf16 path gets that arithmetic from the **matrix engines**; the Q8 path
-cannot, because oneDNN exposes no grouped-scale int8 entry on this stack.
+**int8 DPAS** is what actually wins, and it works because of a coincidence of
+constants: **Q8_0's block is 32 and the int8 DPAS K is 32**, so there is exactly
+one DPAS per block and the accumulator can be flushed and scaled every block —
+which is precisely what per-block scales require, and precisely what oneDNN's
+int8 path (per-tensor or per-column scales only) cannot express.
 
-This is the mirror image of the decode case, and the reason is the same
-quantity: at M = 1 the intensity is *one* FMA per weight element, nothing can
-use the matrix engines anyway, and Q8's halved bytes win outright (1.04–2.02×,
-measured). At M = 16 they lose.
+Four things it needs:
 
-Closing it properly needs **int8 DPAS** — `joint_matrix` s8×s8→s32 with the K
-loop broken at 32-element boundaries so each block's scale can be applied
-between accumulations (Q8_0's block size and the int8 DPAS K happen to both be
-32, which is what makes it viable). That is llama.cpp's MMQ shape. Not written.
+* **VNNI-packed weights.** `use::b` wants `[k/4][N][4]`; the quants are packed
+  into one contiguous 512-byte tile per (16-output, 32-input) pair at load, and
+  the scales transposed to `[block][out]` so a tile's 16 scales are contiguous.
+* **Quantized activations.** DPAS operand types must match, so s8 × s8. This is
+  a looser contract than the bf16 path — the activations lose precision too —
+  which is why it is gated on proposed *tokens* against the f64 oracle rather
+  than on any bitwise property. It is llama.cpp's MMQ shape.
+* **Hoisted accumulator coordinates.** `get_coord()` gives each work-item the
+  (row, col) of its accumulator elements, which is how the per-column weight
+  scale and per-row activation scale get applied. Fetching them per block rather
+  than once cost **3×** (0.624 → 0.231 ms), and transposing the scale arrays so
+  a block's 16 values are contiguous was most of the rest.
+* **One output tile per sub-group.** Giving a sub-group 2 or 4 tiles to amortize
+  the activation load *lost*, badly — the compiler reports spilling at 4 and 8
+  tiles. Wider work-groups were the win instead: 16 → 256 threads took it 0.180
+  → 0.154 ms.
 
-So `--q8-assistant` is a **memory** decision, not a speed one — and it is what
-lets a drafter run at the full 131 072 context.
+`k_proj`/`v_proj` stay BF16 even in the Q8 drafter tier: they are the only
+drafter GEMMs whose row count is the context length rather than the block, so
+they cannot use this path, and quantizing them would mean carrying a second
+weight layout to save 64 MB.
+
+The gate earned its keep here: a stride mismatch between the activation-scale
+array (padded to the DPAS tile height of 16) and the kernel's reader (using the
+live row count) produced correct tokens on the 30B, whose block *is* 16, and
+wrong ones on the tiny model, whose block is 4.
 
 Against 31.89 GiB physical, so BF16 target **and** BF16 drafter do fit two
 cards — which the build plan predicted would not happen (it budgeted 2.38
@@ -731,6 +754,7 @@ slice is 16 wide. The 30B's slices are 2048 and 9984, both fine.
 | flash tier differs from the exact tier | the tier is actually active |
 | flash tier rerun + 1 card == 2 cards, bitwise | looser numerics, not sloppy ones |
 | drafter proposals == the f64 oracle's | the drafter's four inverted conventions |
+| q8 drafter (int8 DPAS) proposals == the f64 oracle's | quantized activations are still the same function |
 | drafter: 1 card == 2 cards | the drafter shards like the target |
 | spec sequence == the f64 oracle's | the accept rule and the cache rollback |
 | spec loop rerun deterministic | oneDNN's atomic split-K, which a single-forward gate cannot see |

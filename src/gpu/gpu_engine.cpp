@@ -33,6 +33,7 @@
 #include "muse_glimmer.hpp"
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 
 #if ORACLE_GPU_DNNL
 #include <oneapi/dnnl/dnnl.hpp>
@@ -94,9 +95,14 @@ namespace muse::gpu
         // interleaved layout would break both accesses.
         struct QW
         {
-            const uint16_t *w = nullptr;  // bf16 weights, or null in the Q8 tier
-            const int8_t *qs = nullptr;   // int8 quants [out, in]
-            const uint16_t *d = nullptr;  // f16 scales  [out, in/32]
+            const uint16_t *w = nullptr; // bf16 weights, or null in the Q8 tier
+            const int8_t *qs = nullptr;  // int8 quants
+            const uint16_t *d = nullptr; // f16 scales
+            // VNNI-packed for the int8 matrix engines: quants as one contiguous
+            // 512-byte [k/4][16][4] tile per (16-output, 32-input) pair, and
+            // scales transposed to [block][out] so a tile's 16 scales are
+            // contiguous. Set only for the drafter, whose GEMMs are 16 rows.
+            bool vnni = false;
             bool q8() const { return qs != nullptr; }
         };
 
@@ -162,6 +168,8 @@ namespace muse::gpu
             // local copy.
             float *peer = nullptr;
             uint16_t *deq = nullptr; // Q8 prefill: one weight expanded to bf16
+            int8_t *aq = nullptr;    // int8 DPAS: quantized activations
+            float *ad = nullptr;     // int8 DPAS: activation scales [block][rows]
             float *pm = nullptr, *pl = nullptr, *pa = nullptr; // split-K decode partials
             // --flash-prefill tier scratch (allocated only for that tier)
             float *fs = nullptr;    // S tile [heads, FBQ, FBK] f32
@@ -881,6 +889,142 @@ namespace muse::gpu
                             if (lane == 0 && int64_t(r) < M)
                                 Y[int64_t(r) * out + o] = sres;
                         }
+                    });
+            });
+        }
+
+        // ------------------------------------------- Q8_0 on the matrix engines
+        //
+        // Q8_0's block is 32 and the int8 DPAS K is 32, so there is exactly one
+        // DPAS per block and the accumulator is flushed and scaled every block
+        // -- which is what per-block scales require, and why oneDNN (whose int8
+        // path takes only per-tensor or per-column scales) cannot express this.
+        //
+        // This needs QUANTIZED ACTIVATIONS: DPAS operand types must match, so
+        // s8 x s8. That is llama.cpp's MMQ shape and a looser contract than
+        // dequantize-to-bf16 -- the activations lose precision too. It is
+        // therefore gated on the envelope, and only the drafter uses it.
+        //
+        // Measured at the drafter's shape (M=16, 6656->9984): 0.154 ms against
+        // bf16-on-DPAS 0.231 and dequantize-to-bf16 1.955.
+        constexpr int TM = 8, TN = 16, TK = 32;
+
+        // bf16 activations -> int8 per (row, 32-block). Scales come out
+        // transposed to [block][rows] so a block's row scales are contiguous.
+        void k_quant_act(sycl::queue &q, const uint16_t *X, int8_t *xq, float *xd, int64_t rows,
+                         int64_t in)
+        {
+            const int64_t nblk = in / TK;
+            q.parallel_for(sycl::range<2>(size_t(rows), size_t(nblk)), [=](sycl::id<2> id) {
+                const int64_t r = int64_t(id[0]), b = int64_t(id[1]);
+                const uint16_t *xr = X + r * in + b * TK;
+                float amax = 0.f;
+                for (int k = 0; k < TK; ++k)
+                    amax = sycl::max(amax, sycl::fabs(bf2f(xr[k])));
+                const float d = amax / 127.f, idv = d != 0.f ? 1.f / d : 0.f;
+                xd[b * rows + r] = d;
+                int8_t *o = xq + r * in + b * TK;
+                for (int k = 0; k < TK; ++k)
+                    o[k] = int8_t(sycl::rint(bf2f(xr[k]) * idv));
+            });
+        }
+
+        // Y[M, out] = X[M, in] . dequant(W)[out, in]^T, M <= 16, on int8 DPAS.
+        // `M` is the live row count; `MPAD` is the row count the activations
+        // were quantized at (always the DPAS tile height, 16). They differ
+        // whenever the drafter's block is smaller than 16, and the scale array
+        // is strided by MPAD -- reading it with M instead silently produced
+        // wrong tokens on a block-4 model while looking correct on a block-16
+        // one.
+        void k_gemm_q8_dpas(sycl::queue &q, const int8_t *Wp, const uint16_t *Wd,
+                            const int8_t *xq, const float *xd, float *Y, int64_t M,
+                            int64_t MPAD, int64_t in, int64_t out)
+        {
+            namespace m = sycl::ext::oneapi::experimental::matrix;
+            constexpr int SGW = 16, WGSZ = 128, SGPW = WGSZ / SGW;
+            const int64_t nblk = in / TK, ntile = out / TN;
+            const int64_t wgs = (ntile + SGPW - 1) / SGPW;
+            q.submit([&](sycl::handler &h) {
+                h.parallel_for(
+                    sycl::nd_range<1>(size_t(wgs) * WGSZ, WGSZ),
+                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SGW)]] {
+                        auto sg = it.get_sub_group();
+                        const int64_t gsg =
+                            int64_t(it.get_group(0)) * SGPW + int64_t(sg.get_group_id()[0]);
+                        // clamp rather than return: joint_matrix in divergent
+                        // control flow is not safe, so every sub-group runs and
+                        // only the store is guarded
+                        const bool live = gsg < ntile;
+                        const int64_t t = live ? gsg : 0;
+
+                        // the accumulator's element coordinates never change;
+                        // fetching them per block cost 3x
+                        int crow[8], ccol[8];
+                        {
+                            m::joint_matrix<sycl::sub_group, int32_t, m::use::accumulator, TM,
+                                            TN> mz;
+                            m::joint_matrix_fill(sg, mz, 0);
+                            auto wz = sycl::ext::oneapi::detail::get_wi_data(sg, mz);
+                            for (int i = 0; i < wz.length(); ++i)
+                            {
+                                auto [r, c] = wz[i].get_coord();
+                                crow[i] = int(r);
+                                ccol[i] = int(c);
+                            }
+                        }
+                        float facc[2][8];
+#pragma unroll
+                        for (int u = 0; u < 2; ++u)
+#pragma unroll
+                            for (int i = 0; i < 8; ++i)
+                                facc[u][i] = 0.f;
+
+                        for (int64_t b = 0; b < nblk; ++b)
+                        {
+                            m::joint_matrix<sycl::sub_group, int8_t, m::use::b, TK, TN,
+                                            m::layout::ext_intel_packed> mb;
+                            m::joint_matrix_load(
+                                sg, mb,
+                                sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                         sycl::access::decorated::no>(
+                                    Wp + (t * nblk + b) * TK * TN),
+                                TN * 4);
+                            const sycl::half *wsc =
+                                reinterpret_cast<const sycl::half *>(Wd) + b * out + t * TN;
+                            const float *xsc = xd + b * MPAD;
+#pragma unroll
+                            for (int u = 0; u < 2; ++u)
+                            {
+                                m::joint_matrix<sycl::sub_group, int8_t, m::use::a, TM, TK,
+                                                m::layout::row_major> ma;
+                                m::joint_matrix<sycl::sub_group, int32_t, m::use::accumulator, TM,
+                                                TN> mc;
+                                m::joint_matrix_fill(sg, mc, 0);
+                                m::joint_matrix_load(
+                                    sg, ma,
+                                    sycl::address_space_cast<
+                                        sycl::access::address_space::global_space,
+                                        sycl::access::decorated::no>(xq + (u * TM) * in + b * TK),
+                                    in);
+                                m::joint_matrix_mad(sg, mc, ma, mb, mc);
+                                auto wi = sycl::ext::oneapi::detail::get_wi_data(sg, mc);
+#pragma unroll
+                                for (int i = 0; i < 8; ++i)
+                                    facc[u][i] += float(int32_t(wi[i])) * float(wsc[ccol[i]]) *
+                                                  xsc[u * TM + crow[i]];
+                            }
+                        }
+                        if (!live)
+                            return;
+#pragma unroll
+                        for (int u = 0; u < 2; ++u)
+#pragma unroll
+                            for (int i = 0; i < 8; ++i)
+                            {
+                                const int64_t r = u * TM + crow[i];
+                                if (r < M)
+                                    Y[r * out + t * TN + ccol[i]] = facc[u][i];
+                            }
                     });
             });
         }
@@ -1919,10 +2063,57 @@ namespace muse::gpu
             // Upload one [out, in] matrix in whatever tier is active. Q8_0 is
             // quantized here, from the same BF16 checkpoint the bf16 tier
             // binds, with llama.cpp's quantize_row_q8_0_ref semantics.
+            // VNNI-packed Q8_0, for the int8 DPAS path. Quants become one
+            // contiguous 512-byte [k/4][16][4] tile per (16-output, 32-input)
+            // pair, and scales are transposed to [block][out]. Both layouts are
+            // what joint_matrix_load and the per-block scaling want; producing
+            // them at load costs nothing at run time.
+            QW up_w_vnni(int sh, const uint16_t *src, int64_t out, int64_t in)
+            {
+                if (in % TK || out % TN)
+                    die("int8 DPAS Q8 needs in % 32 == 0 and out % 16 == 0 (got " +
+                        std::to_string(out) + "x" + std::to_string(in) + ")");
+                const int64_t nblk = in / TK, ntile = out / TN;
+                qbuf_.resize(static_cast<size_t>(out * in));
+                dbuf8_.resize(static_cast<size_t>(nblk * out));
+#pragma omp parallel for schedule(static)
+                for (int64_t o = 0; o < out; ++o)
+                    for (int64_t b = 0; b < nblk; ++b)
+                    {
+                        const uint16_t *row = src + o * in + b * TK;
+                        float amax = 0.f;
+                        for (int k = 0; k < TK; ++k)
+                            amax = std::max(amax, std::fabs(muse::bf16::bf16_to_f32(row[k])));
+                        const float d = amax / 127.f;
+                        const float id = d != 0.f ? 1.f / d : 0.f;
+                        dbuf8_[size_t(b * out + o)] = f32_to_f16(d);
+                        const int64_t t = o / TN, n = o % TN;
+                        int8_t *dst = qbuf_.data() + (t * nblk + b) * TK * TN;
+                        for (int k = 0; k < TK; ++k)
+                            dst[(k / 4) * TN * 4 + n * 4 + (k % 4)] =
+                                int8_t(std::lround(muse::bf16::bf16_to_f32(row[k]) * id));
+                    }
+                int8_t *dq = dalloc<int8_t>(sh, size_t(out * in));
+                uint16_t *dd = dalloc<uint16_t>(sh, size_t(nblk * out));
+                shards_[size_t(sh)].q.memcpy(dq, qbuf_.data(), qbuf_.size()).wait();
+                shards_[size_t(sh)].q.memcpy(dd, dbuf8_.data(), dbuf8_.size() * 2).wait();
+                wbytes_ += int64_t(out * in) + int64_t(nblk * out) * 2;
+                return QW{nullptr, dq, dd, true};
+            }
+
+            QW up_cols_w_vnni(int sh, const uint16_t *src, int64_t rows, int64_t cols,
+                              int64_t c0, int64_t cn)
+            {
+                stage_.resize(static_cast<size_t>(rows * cn));
+                for (int64_t r = 0; r < rows; ++r)
+                    std::memcpy(stage_.data() + r * cn, src + r * cols + c0, size_t(cn) * 2);
+                return up_w_vnni(sh, stage_.data(), rows, cn);
+            }
+
             QW up_w(int sh, const uint16_t *src, int64_t out, int64_t in)
             {
                 if (!q8_)
-                    return QW{up(sh, src, size_t(out * in)), nullptr, nullptr};
+                    return QW{up(sh, src, size_t(out * in)), nullptr, nullptr, false};
                 if (in % QK8)
                     die("Q8_0 needs the input dim divisible by 32 (got " +
                         std::to_string(in) + ")");
@@ -1951,7 +2142,7 @@ namespace muse::gpu
                 shards_[size_t(sh)].q.memcpy(dq, qbuf_.data(), qbuf_.size()).wait();
                 shards_[size_t(sh)].q.memcpy(dd, dbuf8_.data(), dbuf8_.size() * 2).wait();
                 wbytes_ += int64_t(out * in) + int64_t(out * nblk) * 2;
-                return QW{nullptr, dq, dd};
+                return QW{nullptr, dq, dd, false};
             }
 
             QW up_cols_w(int sh, const uint16_t *src, int64_t rows, int64_t cols, int64_t c0,
@@ -2095,6 +2286,13 @@ namespace muse::gpu
                             cap = std::max(cap, std::max({Is * H, H * Is, QDs * H, H * QDs}));
                         deq_cap_ = cap;
                         d.deq = dalloc<uint16_t>(i, size_t(deq_cap_));
+                    }
+                    if (q8_asst_)
+                    {
+                        // 16 rows of quantized activations, widest drafter input
+                        const int64_t wid = std::max({H, I / ns, QD / ns});
+                        d.aq = dalloc<int8_t>(i, size_t(16 * wid));
+                        d.ad = dalloc<float>(i, size_t((wid / 32 + 1) * 16));
                     }
                     d.xfer = dalloc<float>(i, size_t(B * H));
                     d.pm = dalloc<float>(i, size_t(nq_ * fd_splits_));
@@ -2496,6 +2694,14 @@ namespace muse::gpu
                     return;
                 }
                 Dev &d = shards_[size_t(sh)];
+                if (w.vnni)
+                {
+                    if (rows > 2 * TM)
+                        die("VNNI Q8 weights are for the <=16-row path only");
+                    k_quant_act(d.q, X, d.aq, d.ad, 2 * TM, in);
+                    k_gemm_q8_dpas(d.q, w.qs, w.d, d.aq, d.ad, Y, rows, 2 * TM, in, out);
+                    return;
+                }
                 if (rows <= q8_smallm_)
                 {
                     // reads the weight once instead of expanding it
@@ -3076,13 +3282,32 @@ namespace muse::gpu
                         g.post_attn_ln[k] = up(d, bf(*t.post_attn_ln), size_t(H));
                         g.q_norm[k] = up(d, bf(*t.q_norm), size_t(D));
                         g.k_norm[k] = up(d, bf(*t.k_norm), size_t(D));
+                        // k/v stay BF16 even in the Q8 drafter tier: they are
+                        // the only drafter GEMMs whose row count is the context
+                        // length rather than the block, so they cannot use the
+                        // int8 DPAS path, and quantizing them would mean
+                        // carrying a second weight layout for 64 MB of saving.
+                        const bool sv = q8_;
+                        q8_ = false;
                         g.k[k] = up_w(d, bf(*t.k_proj), KD, H);
                         g.v[k] = up_w(d, bf(*t.v_proj), KD, H);
-                        g.q[k] = up_w(d, bf(*t.q_proj) + sh * QDs * H, QDs, H);
-                        g.mlp_gate[k] = up_w(d, bf(*t.mlp_gate) + sh * Is * H, Is, H);
-                        g.mlp_up[k] = up_w(d, bf(*t.mlp_up) + sh * Is * H, Is, H);
-                        g.o[k] = up_cols_w(d, bf(*t.o_proj), H, QD, sh * QDs, QDs);
-                        g.mlp_down[k] = up_cols_w(d, bf(*t.mlp_down), H, I, sh * Is, Is);
+                        q8_ = sv;
+                        if (q8_)
+                        {
+                            g.q[k] = up_w_vnni(d, bf(*t.q_proj) + sh * QDs * H, QDs, H);
+                            g.mlp_gate[k] = up_w_vnni(d, bf(*t.mlp_gate) + sh * Is * H, Is, H);
+                            g.mlp_up[k] = up_w_vnni(d, bf(*t.mlp_up) + sh * Is * H, Is, H);
+                            g.o[k] = up_cols_w_vnni(d, bf(*t.o_proj), H, QD, sh * QDs, QDs);
+                            g.mlp_down[k] = up_cols_w_vnni(d, bf(*t.mlp_down), H, I, sh * Is, Is);
+                        }
+                        else
+                        {
+                            g.q[k] = up_w(d, bf(*t.q_proj) + sh * QDs * H, QDs, H);
+                            g.mlp_gate[k] = up_w(d, bf(*t.mlp_gate) + sh * Is * H, Is, H);
+                            g.mlp_up[k] = up_w(d, bf(*t.mlp_up) + sh * Is * H, Is, H);
+                            g.o[k] = up_cols_w(d, bf(*t.o_proj), H, QD, sh * QDs, QDs);
+                            g.mlp_down[k] = up_cols_w(d, bf(*t.mlp_down), H, I, sh * Is, Is);
+                        }
                     }
                 }
                 stage_.clear();

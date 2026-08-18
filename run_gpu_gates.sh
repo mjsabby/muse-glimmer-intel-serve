@@ -195,6 +195,19 @@ if [[ -n "$DREF" && "$DREF" == "$DG1" ]]; then
 else
     fail "drafter differs: oracle '$DREF' vs gpu '$DG1'"
 fi
+# The Q8 drafter runs on int8 DPAS with QUANTIZED ACTIVATIONS -- a looser
+# contract than the bf16 path, so this checks the proposed TOKENS against the
+# f64 oracle rather than any bitwise property. (--shards 1: at 2 shards the
+# tiny model's o_proj column slice is 16 wide, below the 32-element block.)
+DQ8=$($GPU --model "$MODEL" --ids "$IDS" --out "$OUT/dq8" --max-seq 256 --shards 1 --gpus 1 \
+    --chunk 16 --assistant "$TINY/tiny_dflash" --q8-assistant 2>/dev/null \
+    | grep -o 'drafted.*' || true)
+if [[ -n "$DREF" && "$DREF" == "$DQ8" ]]; then
+    pass "q8 drafter (int8 DPAS) == f64 oracle"
+else
+    fail "q8 drafter differs: oracle '$DREF' vs q8 '$DQ8'"
+fi
+
 if [[ "${ngpu:-0}" -ge 2 ]]; then
     DG2=$($GPU --model "$MODEL" --ids "$IDS" --out "$OUT/dg2" --max-seq 256 --shards 2 --gpus 2 \
         --chunk 16 --assistant "$TINY/tiny_dflash" 2>/dev/null | grep -o 'drafted.*' || true)
