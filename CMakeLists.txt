@@ -92,7 +92,7 @@ if(MUSE_GPU)
   endif()
 
   add_library(muse_gpu_backend STATIC
-    src/gpu/sycl_backend.cpp
+    src/gpu/gpu_engine.cpp
   )
   target_include_directories(muse_gpu_backend PUBLIC src)
   target_compile_options(muse_gpu_backend PRIVATE ${GPU_SYCL_COMPILE})
@@ -109,8 +109,12 @@ if(MUSE_GPU)
   target_link_libraries(muse_gpu_backend PUBLIC muse_core)
   target_link_options(muse_gpu_backend INTERFACE ${GPU_SYCL_COMPILE} ${GPU_AOT_LINK})
 
+  # icpx defaults HOST code to -fp-model=fast, which reassociates the f32 sums
+  # the CLI and the loader evaluate; the g++ referee does not, so pin it.
   add_executable(muse-gpu src/gpu/gpu_main.cpp)
+  target_compile_options(muse-gpu PRIVATE -fp-model=precise)
   target_link_libraries(muse-gpu PRIVATE muse_gpu_backend)
+  target_link_options(muse-gpu PRIVATE ${GPU_SYCL_COMPILE} ${GPU_AOT_LINK})
 
   set_target_properties(muse_gpu_backend muse_core
                         PROPERTIES POSITION_INDEPENDENT_CODE ON)

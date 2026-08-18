@@ -484,8 +484,8 @@ model tier, GPU count, quantization, and depth.
 | 4 GGUF ingest | ✅ | | not started |
 | 5 DFlash oracle | ✅ | | **done** |
 | 6 Vision oracle | ✅ | | tower + projector **done**; pixel ingestion and video not started |
-| 7 SYCL single-GPU | design only | ✅ | not started |
-| 8 Dual-GPU TP | design only | ✅ | not started |
+| 7 SYCL single-GPU | design only | ✅ | **done** (text; see [gpu.md](gpu.md). BF16 30B needs both cards, so it runs layer-split; no Q8 tier yet, no vision/DFlash on GPU) |
+| 8 Dual-GPU TP | design only | ✅ | not started — weights are split by *layer*, which fits the model but leaves one card idle while the other streams; TP is worth ~2x decode |
 | 9 Serving frontend | ✅ except live gates | ✅ for `live_api_tests.py` | not started |
 | 10 DFlash serving | design only | ✅ | not started |
 | 11 Benchmarks | | ✅ | not started |

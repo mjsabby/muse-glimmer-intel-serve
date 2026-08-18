@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring> // strlen/memcmp: libstdc++ leaks these transitively, icpx does not
 #include <map>
 #include <memory>
 #include <stdexcept>
