@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "muse_glimmer.hpp"
+#include "tinyblas_bf16.hpp"
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -111,6 +112,20 @@ namespace muse
         inline void gemm(const uint16_t *W, const uint16_t *X, float *Y, int64_t T, int64_t in,
                          int64_t out)
         {
+#if defined(__AVX512BF16__)
+            // llamafile's tinyBLAS where it applies (see src/tinyblas_bf16.hpp
+            // for why it is vendored and what it costs to not use it); the
+            // hand-written tile below is the fallback for shapes it declines —
+            // k not a multiple of 32, or out not a multiple of 4.
+#ifdef _OPENMP
+            const int nth = omp_get_max_threads();
+#else
+            const int nth = 1;
+#endif
+            if (!getenv("MUSE_NO_TINYBLAS") &&
+                tinyblas::gemm_bf16(W, X, Y, T, in, out, nth))
+                return;
+#endif
 #if defined(__AVX512BF16__)
             // Register tile RM=4 weight rows x RN=6 tokens — the shape
             // llama.cpp's tinyBLAS uses (llamafile/sgemm.cpp mnpack<4,6,..>),
