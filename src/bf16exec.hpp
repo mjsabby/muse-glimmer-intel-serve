@@ -23,6 +23,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -111,8 +112,17 @@ namespace muse
                          int64_t out)
         {
 #if defined(__AVX512BF16__)
-            constexpr int64_t RB = 4; // weight rows per tile
-            constexpr int64_t TB = 4; // tokens per tile
+            // Register tile RM=4 weight rows x RN=6 tokens — the shape
+            // llama.cpp's tinyBLAS uses (llamafile/sgemm.cpp mnpack<4,6,..>),
+            // and the best of everything measured end-to-end on the real model
+            // with a warm page cache, best of 3:
+            //   4x4 54.43   4x5 54.47   4x6 56.25   6x4 53.97   8x4 47.63
+            // Two-level (output x token) blocking after tinyBLAS's BM/BN was
+            // also tried and measured 55.09 — no better, because at these
+            // shapes the activation matrix is already L3-resident and the
+            // re-read traffic the blocking removes was never the constraint.
+            constexpr int64_t RB = 4;
+            constexpr int64_t TB = 6;
             const int64_t n32 = in & ~int64_t(31);
 #pragma omp parallel for schedule(static)
             for (int64_t o0 = 0; o0 < out; o0 += RB)
@@ -156,6 +166,47 @@ namespace muse
                     Y[t * out + o] = dot_bf16(W + o * in, X + t * in, in);
 #endif
         }
+
+        // ---------------------------------------------------------- profiling
+        //
+        // MUSE_BF16_PROFILE=1 accumulates wall time per phase. Phases are
+        // sequential within a layer, so plain (non-atomic) accumulation outside
+        // the parallel regions is exact. Off by default and free when off.
+        struct Profile
+        {
+            double qkv = 0, attn = 0, oproj = 0, mlp = 0, norm = 0, head = 0;
+            double mlp_gemm = 0, mlp_act = 0, mlp_norm = 0, resid = 0, gate_elem = 0;
+            bool on = false;
+            std::chrono::steady_clock::time_point t0;
+            void tic()
+            {
+                if (on)
+                    t0 = std::chrono::steady_clock::now();
+            }
+            void toc(double &slot)
+            {
+                if (on)
+                    slot += std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+            }
+            void report(FILE *f) const
+            {
+                if (!on)
+                    return;
+                const double tot = qkv + attn + oproj + mlp + norm + head;
+                fprintf(f, "profile (s): qkv %.2f  attn %.2f  o_proj %.2f  mlp %.2f  "
+                           "norm %.2f  head %.2f  | total %.2f\n",
+                        qkv, attn, oproj, mlp, norm, head, tot);
+                fprintf(f, "         (%%): qkv %.1f  attn %.1f  o_proj %.1f  mlp %.1f  "
+                           "norm %.1f  head %.1f\n",
+                        100 * qkv / tot, 100 * attn / tot, 100 * oproj / tot,
+                        100 * mlp / tot, 100 * norm / tot, 100 * head / tot);
+                fprintf(f, "  breakdown: mlp_gemm %.2f  mlp_act %.2f  mlp_norm %.2f  "
+                           "resid %.2f  gate_elem %.2f\n",
+                        mlp_gemm, mlp_act, mlp_norm, resid, gate_elem);
+            }
+        };
 
         // --------------------------------------------------------- weight view
         //
@@ -281,6 +332,7 @@ namespace muse
             WeightView w;
             KVCache kv;
             muse::RopeTable rope;
+            Profile prof;
 
             // scratch, sized for the widest token block
             int64_t block = 0;
@@ -292,6 +344,8 @@ namespace muse
             {
                 cfg = &c;
                 w = bind(weights);
+                if (const char *e = getenv("MUSE_BF16_PROFILE"); e && *e && *e != '0')
+                    prof.on = true;
                 block = max_block;
                 kv.init(c, max_seq, block);
                 // The bf16 twin builds cos/sin through the stock f32 chain and
@@ -406,13 +460,17 @@ namespace muse
                     const bool sliding = c.layer_is_sliding(li);
                     const bool use_rope = c.layer_has_rope(li);
 
+                    prof.tic();
                     norm_rows(muse::NormKind::Centered, h.data(), l.input_ln, c.rms_norm_eps,
                               xb.data(), n, H);
+                    prof.toc(prof.norm);
 
+                    prof.tic();
                     gemm(l.q, xb.data(), qf.data(), n, H, QD);
                     gemm(l.k, xb.data(), kf.data(), n, H, KD);
                     gemm(l.v, xb.data(), vf.data(), n, H, KD);
                     gemm(l.gate, xb.data(), gf.data(), n, H, QD);
+                    prof.toc(prof.qkv);
 
                     // weight-less QK-norm over head_dim, then qk_scale_factor on q only
                     norm_rows(muse::NormKind::Weightless, qf.data(), nullptr, c.rms_norm_eps,
@@ -458,6 +516,7 @@ namespace muse
 
                     // attention: flash semantics — S and P never materialize at
                     // bf16, matching `--attn flash`
+                    prof.tic();
 #pragma omp parallel for schedule(static) collapse(2)
                     for (int64_t t = 0; t < n; ++t)
                         for (int64_t hh = 0; hh < nq; ++hh)
@@ -514,7 +573,10 @@ namespace muse
                                 o[d] *= inv;
                         }
 
+                    prof.toc(prof.attn);
+
                     // output gate from the PRE-attention normed input
+                    prof.tic();
 #pragma omp parallel for schedule(static)
                     for (int64_t i = 0; i < n * QD; ++i)
                     {
@@ -531,30 +593,48 @@ namespace muse
                     for (int64_t i = 0; i < n * H; ++i)
                         h[size_t(i)] =
                             bf16_to_f32(f32_to_bf16(h[size_t(i)] + bf16_to_f32(xb[size_t(i)])));
+                    prof.toc(prof.oproj);
 
                     // SwiGLU
+                    prof.tic();
+                    Profile sub;
+                    sub.on = prof.on;
+                    sub.tic();
                     norm_rows(muse::NormKind::Centered, h.data(), l.pre_ff_ln, c.rms_norm_eps,
                               xb.data(), n, H);
+                    sub.toc(prof.mlp_norm);
+                    sub.tic();
                     gemm(l.mlp_gate, xb.data(), g1.data(), n, H, I);
                     gemm(l.mlp_up, xb.data(), u1.data(), n, H, I);
+                    sub.toc(prof.mlp_gemm);
+                    sub.tic();
 #pragma omp parallel for schedule(static)
                     for (int64_t i = 0; i < n * I; ++i)
                         g1b[size_t(i)] = f32_to_bf16(
                             bf16_to_f32(f32_to_bf16(
                                 silu_f(bf16_to_f32(f32_to_bf16(g1[size_t(i)]))))) *
                             bf16_to_f32(f32_to_bf16(u1[size_t(i)])));
+                    sub.toc(prof.mlp_act);
+                    sub.tic();
                     gemm(l.mlp_down, g1b.data(), xf.data(), n, I, H);
+                    sub.toc(prof.mlp_gemm);
+                    sub.tic();
                     norm_rows(muse::NormKind::Centered, xf.data(), l.post_ff_ln,
                               c.post_norm_eps, xb.data(), n, H);
+                    sub.toc(prof.mlp_norm);
+                    sub.tic();
                     for (int64_t i = 0; i < n * H; ++i)
                         h[size_t(i)] =
                             bf16_to_f32(f32_to_bf16(h[size_t(i)] + bf16_to_f32(xb[size_t(i)])));
+                    sub.toc(prof.resid);
+                    prof.toc(prof.mlp);
                 }
                 kv.len = pos0 + n;
 
                 if (!out_logits_last)
                     return;
                 // final plain norm + lm_head, last row only (the serving shape)
+                prof.tic();
                 norm_rows(muse::NormKind::Plain, h.data() + (n - 1) * H, w.final_norm,
                           c.rms_norm_eps, xb.data(), 1, H);
                 gemm(w.lm_head, xb.data(), out_logits_last, 1, H, c.vocab_size);
@@ -573,6 +653,7 @@ namespace muse
                     }
                     out_logits_last[i] = z;
                 }
+                prof.toc(prof.head);
             }
 
             // Prefill `ids` in chunks of `block`, returning the last position's

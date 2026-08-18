@@ -391,6 +391,7 @@ int main(int argc, char **argv)
                 d1 = std::chrono::steady_clock::now();
             }
 
+            eng.prof.report(stderr);
             auto secs = [](auto a, auto b)
             { return std::chrono::duration<double>(b - a).count(); };
             const double ps = secs(p0, p1), ds = secs(d0, d1);
