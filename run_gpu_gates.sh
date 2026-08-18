@@ -8,7 +8,8 @@
 #   4. decode == prefill  decoding N tokens must match prefilling the same seq
 #   5. determinism      reruns bit-identical
 #   6. flash tier      --flash-prefill is envelope-gated, never bitwise
-#   7. tensor parallel  --shards N fixes the arithmetic, --gpus M only places it,
+#   7. DFlash          drafted tokens == the f64 oracle's
+#   8. tensor parallel  --shards N fixes the arithmetic, --gpus M only places it,
 #                       so 1 card and 2 cards must agree bitwise (Phase 8 exit gate)
 #
 # Usage: ./run_gpu_gates.sh [tiny-dir]
@@ -173,6 +174,29 @@ if [[ "${ngpu:-0}" -ge 2 ]]; then
     $GPU --model "$MODEL" --ids "$IDS" --out "$OUT/fl3" --max-seq 256 --shards 2 --gpus 2 \
         --chunk 16 --flash-prefill >/dev/null 2>&1
     same "flash tier: 1 card == 2 cards" "$OUT/fl" "$OUT/fl3"
+fi
+
+echo "== DFlash drafter =="
+# The drafter is a different model with different conventions -- PLAIN norms
+# everywhere (including the ones whose names match the target's zero-centered
+# sandwich norms), a norm that rounds BEFORE the weight multiply, bidirectional
+# sliding-window attention, and a BARE lm_head. Each of those is a way to be
+# quietly wrong, so the gate compares proposed TOKENS against the f64 oracle,
+# which is the referee for all of them at once.
+DREF=$($CPU --model "$MODEL" --ids "$IDS" --out "$OUT/dref" --assistant "$TINY/tiny_dflash" \
+    2>/dev/null | grep -o 'drafted.*' || true)
+DG1=$($GPU --model "$MODEL" --ids "$IDS" --out "$OUT/dg1" --max-seq 256 --shards 2 --gpus 1 \
+    --chunk 16 --assistant "$TINY/tiny_dflash" 2>/dev/null | grep -o 'drafted.*' || true)
+if [[ -n "$DREF" && "$DREF" == "$DG1" ]]; then
+    pass "drafter == f64 oracle ($DREF)"
+else
+    fail "drafter differs: oracle '$DREF' vs gpu '$DG1'"
+fi
+if [[ "${ngpu:-0}" -ge 2 ]]; then
+    DG2=$($GPU --model "$MODEL" --ids "$IDS" --out "$OUT/dg2" --max-seq 256 --shards 2 --gpus 2 \
+        --chunk 16 --assistant "$TINY/tiny_dflash" 2>/dev/null | grep -o 'drafted.*' || true)
+    [[ "$DG1" == "$DG2" ]] && pass "drafter: 1 card == 2 cards" \
+                          || fail "drafter differs across cards: '$DG1' vs '$DG2'"
 fi
 
 exit $rc

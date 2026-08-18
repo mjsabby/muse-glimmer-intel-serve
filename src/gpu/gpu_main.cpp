@@ -6,6 +6,7 @@
 #include "gpu/gpu_engine.h"
 
 #include "hf.hpp"
+#include "dflash.hpp"
 #include "muse_glimmer.hpp"
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -58,6 +60,7 @@ namespace
                      "  --no-dnnl          hand-written GEMV everywhere (diagnostic)\n"
                      "  --flash-prefill    matrix-engine prefill attention (faster, and a\n"
                      "                     LOOSER numerical contract - envelope-gated)\n"
+                     "  --assistant DIR    DFlash drafter; runs one drafting round after prefill\n"
                      "  --list-devices     enumerate the visible GPUs and exit\n"
                      "  --revision REV     HF revision when --model is a repo id\n");
     }
@@ -65,7 +68,7 @@ namespace
 
 int main(int argc, char **argv)
 {
-    std::string model, ids_spec, out_dir = "out/gpu", revision = "main";
+    std::string model, ids_spec, out_dir = "out/gpu", revision = "main", assistant;
     int64_t chunk = 512, max_seq = 0, decode_n = 0;
     int gpus = 2, shards = 0, topk = 5;
     bool no_dnnl = false, flash_prefill = false;
@@ -105,6 +108,8 @@ int main(int argc, char **argv)
             no_dnnl = true;
         else if (a == "--flash-prefill")
             flash_prefill = true;
+        else if (a == "--assistant")
+            assistant = next();
         else if (a == "--list-devices")
         {
             auto ds = muse::gpu::enumerate_devices();
@@ -145,8 +150,27 @@ int main(int argc, char **argv)
             max_seq = T + decode_n + 64;
         chunk = std::min(chunk, std::max<int64_t>(1, T));
 
+        // --assistant taps the target's hidden states at the drafter's
+        // target_layer_ids on the way through, so the drafter has to be parsed
+        // BEFORE the engine is built.
+        std::unique_ptr<hf::ModelFiles> amf;
+        muse::dflash::Config acfg;
+        muse::dflash::Weights aw;
+        if (!assistant.empty())
+        {
+            amf = std::make_unique<hf::ModelFiles>(hf::resolve_model(assistant, revision));
+            acfg = muse::dflash::parse_config(*amf->config);
+            aw = muse::dflash::bind_weights(*amf, acfg);
+            for (int64_t l : acfg.target_layer_ids)
+                if (l < 0 || l >= cfg.num_hidden_layers)
+                    throw std::runtime_error("target_layer_id " + std::to_string(l) +
+                                             " out of range");
+        }
+
         muse::gpu::EngineOptions opt;
         opt.gpus = gpus;
+        if (!assistant.empty())
+            opt.tap_layers = acfg.target_layer_ids;
         opt.shards = shards;
         opt.block = chunk;
         opt.max_seq = max_seq;
@@ -155,9 +179,26 @@ int main(int argc, char **argv)
         opt.verbose = true;
 
         auto eng = muse::gpu::Engine::create(cfg, w, opt);
+        if (!assistant.empty())
+            eng->bind_drafter(acfg, aw);
 
         std::vector<float> lg(size_t(cfg.vocab_size), 0.f);
         eng->prefill(ids, lg.data());
+
+        muse::gpu::DraftResult dr;
+        if (!assistant.empty())
+        {
+            // the anchor is the target's own next token; the block sits at
+            // absolute position T
+            const int64_t anchor =
+                int64_t(std::max_element(lg.begin(), lg.end()) - lg.begin());
+            dr = eng->draft(T, anchor, T);
+            std::printf("anchor %lld, drafted %zu tokens:", (long long)anchor,
+                        dr.tokens.size());
+            for (int64_t t : dr.tokens)
+                std::printf(" %lld", (long long)t);
+            std::printf("\n");
+        }
 
         std::vector<int64_t> seq = ids;
         for (int64_t i = 0; i < decode_n; ++i)
@@ -194,7 +235,10 @@ int main(int argc, char **argv)
         bm << "],\n \"generated\": [";
         for (size_t i = ids.size(); i < seq.size(); ++i)
             bm << (i > ids.size() ? "," : "") << seq[i];
-        bm << "],\n \"n_hidden\": 0\n}\n";
+        bm << "],\n \"draft_tokens\": [";
+        for (size_t i = 0; i < dr.tokens.size(); ++i)
+            bm << (i ? "," : "") << dr.tokens[i];
+        bm << "],\n \"draft_anchor\": " << dr.anchor << ",\n \"n_hidden\": 0\n}\n";
         std::ofstream(out_dir + "/meta.json") << bm.str();
 
         if (decode_n > 0)

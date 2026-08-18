@@ -487,7 +487,7 @@ model tier, GPU count, quantization, and depth.
 | 7 SYCL single-GPU | design only | ✅ | **done** (text; see [gpu.md](gpu.md), incl. the opt-in `--flash-prefill` matrix-engine attention tier. No Q8 tier yet, no vision/DFlash on GPU) |
 | 8 Dual-GPU TP | design only | ✅ | **done** (text; head/FFN/vocab split, KV replicated — see [gpu.md](gpu.md)). 14.81 tok/s decode, 1030 tok/s prefill, full 131 072 context fits |
 | 9 Serving frontend | ✅ except live gates | ✅ for `live_api_tests.py` | not started |
-| 10 DFlash serving | design only | ✅ | not started |
+| 10 DFlash serving | design only | ✅ | drafter runs on GPU and matches the f64 oracle (15/15 tokens on the 30B); the serving loop around it is not started |
 | 11 Benchmarks | | ✅ | not started |
 
 Phases 0–6 and most of 9 are pure CPU work and are the natural first session.

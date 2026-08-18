@@ -342,6 +342,52 @@ costs about one extra bf16 ulp.
 Decode is untouched: it has one query and nothing to batch, so it keeps the
 exact kernel and the exact contract.
 
+## DFlash drafter
+
+`--assistant DIR` binds the block-diffusion drafter onto the same shards as the
+target and runs one drafting round after prefill: `block_size - 1` = **15
+proposals** from a block of an anchor plus 15 MASK tokens.
+
+Verified against the **f64 oracle**, not just the twin — on the tiny model and
+on the real 30B, all 15 proposed tokens identical, on one card and on two.
+
+The drafter is a different model with conventions that are each a way to be
+quietly wrong, so they get their own code rather than flags on the target's:
+
+* its RMSNorm rounds **before** the weight multiply (`w · bf16(x·rs)`, against
+  the target's `bf16(x·rs·w)`), and every one of its norms is **plain** —
+  including the ones whose names match the target's zero-centered sandwich
+  norms;
+* attention is **bidirectional** (no causal mask at all, only
+  `|q_pos − kv_pos| ≤ sliding_window`) with an ordinary materialized
+  max/exp/sum rather than an online update;
+* the block's tokens are embedded with the target's **raw** table, and the head
+  is the target's **bare** `lm_head` — no output multiplier, no softcap;
+* q/k norms carry weights, unlike the target's weight-less pair.
+
+The target's hidden states at `target_layer_ids` are captured on the way
+through the forward pass (after each layer's final residual) rather than
+recomputed. `h` is replicated across shards, so every shard captures its own
+tap and the taps need no exchange.
+
+`encoder.fc` is `[H, taps·H]`. Concatenating the taps into an `[n, taps·H]`
+buffer is the obvious reading of the reference and it grows with the prompt, so
+instead the fc is kept as `taps` separate `[H, H]` blocks and accumulated —
+each block column-sharded on its input, one all-reduce at the end.
+
+### Memory
+
+| | per card |
+|---|---:|
+| target, BF16, TP | 27.36 GiB |
+| + drafter, BF16, sharded | **29.80 GiB** |
+
+Against 31.89 GiB physical, so BF16 target **and** BF16 drafter do fit two
+cards — which the build plan predicted would not happen (it budgeted 2.38
+GiB/card for the drafter and expected the margin to run out). Sharding the
+drafter the same way as the target is what buys it. It is still tight, and a
+quantized drafter remains the comfortable configuration.
+
 ## Gates (`run_gpu_gates.sh`)
 
 | gate | what it protects |
@@ -356,6 +402,8 @@ exact kernel and the exact contract.
 | flash tier inside the twin's envelope | the looser tier is still the same function |
 | flash tier differs from the exact tier | the tier is actually active |
 | flash tier rerun + 1 card == 2 cards, bitwise | looser numerics, not sloppy ones |
+| drafter proposals == the f64 oracle's | the drafter's four inverted conventions |
+| drafter: 1 card == 2 cards | the drafter shards like the target |
 
 `MUSE_GPU_TRACE=<dir>` dumps the residual stream per layer (row-major `[n, H]`),
 which is how the oneDNN bug was localized to the head. `MUSE_GPU_PROFILE=1`

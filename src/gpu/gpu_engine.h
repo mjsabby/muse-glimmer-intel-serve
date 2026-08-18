@@ -21,6 +21,11 @@ namespace muse
 {
     struct Config;
     struct Weights;
+    namespace dflash
+    {
+        struct Config;
+        struct Weights;
+    }
 }
 
 namespace muse::gpu
@@ -65,6 +70,18 @@ namespace muse::gpu
         // faster and a DIFFERENT numerical contract from the twin — it is
         // gated on the logit envelope, never bitwise. Decode is unaffected.
         bool flash_prefill = false;
+        // Target hidden-state layers the DFlash drafter reads (its
+        // `target_layer_ids`). Must be set before create(): the taps are
+        // captured on the way through the forward pass, not recomputed.
+        std::vector<int64_t> tap_layers;
+    };
+
+    // One DFlash drafting round: `block_size - 1` proposals anchored on the
+    // target's bonus token.
+    struct DraftResult
+    {
+        std::vector<int64_t> tokens;
+        int64_t anchor = -1;
     };
 
     // Enumerate the Level-Zero GPUs the process can see. Never throws; an
@@ -93,6 +110,17 @@ namespace muse::gpu
         // Logical tokens currently in the KV cache.
         virtual int64_t cache_len() const = 0;
         virtual void reset_cache() = 0;
+
+        // Binds the drafter onto the same shards as the target. The target's
+        // embedding and lm_head are reused (the drafter embeds with the RAW
+        // table and heads with the BARE lm_head), so only the drafter's own
+        // tensors are uploaded.
+        virtual void bind_drafter(const dflash::Config &dc, const dflash::Weights &dw) = 0;
+
+        // One drafting round against the taps captured by the last forward
+        // pass. `n` context positions, anchored on `anchor` at absolute
+        // position `pos0`.
+        virtual DraftResult draft(int64_t n, int64_t anchor, int64_t pos0) = 0;
 
         virtual const Timings &timings() const = 0;
         virtual void report_profile(std::FILE *f) const = 0;
