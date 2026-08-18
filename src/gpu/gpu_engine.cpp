@@ -171,7 +171,7 @@ namespace muse::gpu
             // DFlash: target hidden states at the drafter's target_layer_ids,
             // one [H, block] buffer per tap. h is replicated across shards, so
             // every shard captures its own and no exchange is needed.
-            std::vector<float *> taps;
+            std::vector<uint16_t *> taps;
         };
 
         // One layer's weights, split across the tensor-parallel shards. Every
@@ -204,9 +204,9 @@ namespace muse::gpu
         struct DLayer
         {
             std::vector<uint16_t *> input_ln, post_attn_ln, q_norm, k_norm; // replicated
-            std::vector<uint16_t *> k, v;                                   // replicated
-            std::vector<uint16_t *> q, mlp_gate, mlp_up;                    // row-sharded
-            std::vector<uint16_t *> o, mlp_down;                            // col-sharded
+            std::vector<QW> k, v;                                           // replicated
+            std::vector<QW> q, mlp_gate, mlp_up;                            // row-sharded
+            std::vector<QW> o, mlp_down;                                    // col-sharded
         };
 
         // One vision-tower layer. LayerNorms carry a bias as well as a weight
@@ -1289,6 +1289,25 @@ namespace muse::gpu
         // a 2D copy of the strided region degenerates at decode into `dim`
         // separate 4-byte transfers (n = 1), which measured slower than every
         // GEMM in the model put together.
+        // Capture a [dim, n] block of the dim-major residual stream into rows
+        // [off, off+n) of a ROW-major [cap, dim] bf16 buffer -- the DFlash taps.
+        //
+        // bf16 and row-major, both deliberately. `h` only ever holds
+        // bf16-representable values (every residual rounds), so the narrowing
+        // is exact; and row-major makes the context projection a plain
+        // bf16 x bf16 GEMM. Storing them as f32 with a transposed stride made
+        // it an f32 x bf16 matmul, which oneDNN can only serve from a
+        // reference kernel: 435 ms per drafting round against a 0.4 ms
+        // bandwidth budget, 98% of the drafter's cost.
+        void k_pack2d_at(sycl::queue &q, const float *src, uint16_t *dst, int64_t dim, int64_t n,
+                         int64_t ld, int64_t off)
+        {
+            q.parallel_for(sycl::range<2>(size_t(dim), size_t(n)), [=](sycl::id<2> id) {
+                const int64_t i = int64_t(id[0]), t = int64_t(id[1]);
+                dst[(off + t) * dim + i] = f2bf(src[i * ld + t]);
+            });
+        }
+
         void k_pack2d(sycl::queue &q, const float *src, float *dst, int64_t dim, int64_t n,
                       int64_t ld)
         {
@@ -1437,7 +1456,12 @@ namespace muse::gpu
                         std::to_string(c.intermediate_size) + " intermediate and " +
                         std::to_string(c.vocab_size) + " vocab all divisible");
 
-                block_ = opt.block;
+                // Scratch is sized by the block, and speculative verification
+                // forwards a WHOLE drafter block at once -- which can be wider
+                // than the prefill chunk (a 6-token prompt clamps the chunk to
+                // 6, while the drafter's block is 16). Sizing to the max keeps
+                // one set of buffers for both.
+                block_ = std::max<int64_t>(opt.block, opt.spec_block);
                 max_seq_ = opt.max_seq;
                 // Tile geometry for the prefill attention. BQ queries share one
                 // staged key tile; BK is whatever keeps both tiles inside 32 KiB
@@ -1454,9 +1478,11 @@ namespace muse::gpu
 
                 flash_prefill_ = opt.flash_prefill;
                 q8_ = opt.q8;
+                q8_asst_ = opt.q8_assistant;
                 if (const char *e = getenv("MUSE_GPU_Q8_BLOCKDOT"); e && *e && *e != '0')
                     q8_blockdot_ = true;
                 tap_layers_ = opt.tap_layers;
+                spec_block_ = std::max<int64_t>(1, opt.spec_block);
                 fbq_ = std::min<int64_t>(512, std::max<int64_t>(1, block_));
                 fbk_ = 512;
                 if (flash_prefill_)
@@ -1576,6 +1602,9 @@ namespace muse::gpu
                     std::fprintf(f, "  prefill   %8.3f s  %8ld tok  %9.2f tok/s\n",
                                  tim_.prefill_s, long(tim_.prefill_tokens),
                                  double(tim_.prefill_tokens) / tim_.prefill_s);
+                if (dt_ctx_ + dt_layers_ + dt_head_ > 0)
+                    std::fprintf(f, "  drafter   ctx %.3f s  layers %.3f s  head %.3f s\n",
+                                 dt_ctx_, dt_layers_, dt_head_);
                 if (tim_.decode_tokens)
                     std::fprintf(f, "  decode    %8.3f s  %8ld tok  %9.2f tok/s\n", tim_.decode_s,
                                  long(tim_.decode_tokens),
@@ -1812,12 +1841,12 @@ namespace muse::gpu
                     d.g1 = dalloc<float>(i, size_t(B * Is));
                     d.u1 = dalloc<float>(i, size_t(B * Is));
                     d.g1b = dalloc<uint16_t>(i, size_t(B * Is));
-                    d.logits = dalloc<float>(i, size_t(Vs));
+                    d.logits = dalloc<float>(i, size_t(Vs * spec_block_));
                     d.ids = dalloc<int32_t>(i, size_t(B));
                     // widest GEMV input: H for q/k/v/gate/mlp/head, QDs for
                     // o_proj, Is for mlp_down
                     d.pack = dalloc<uint16_t>(i, size_t(std::max({H, QDs, Is, KD})));
-                    if (q8_)
+                    if (q8_ || q8_asst_)
                     {
                         // widest sharded weight, expanded to bf16 for prefill
                         deq_cap_ = std::max({Is * H, H * Is, QDs * H, H * QDs, Vs * H});
@@ -1826,7 +1855,9 @@ namespace muse::gpu
                     d.xfer = dalloc<float>(i, size_t(B * H));
                     d.taps.assign(tap_layers_.size(), nullptr);
                     for (size_t k = 0; k < tap_layers_.size(); ++k)
-                        d.taps[k] = dalloc<float>(i, size_t(B * H));
+                        // the drafter reads the taps for the WHOLE context, so
+                        // they are sized to max_seq and filled as blocks go by
+                        d.taps[k] = dalloc<uint16_t>(i, size_t(max_seq_ * H));
                     d.peer = dalloc<float>(i, size_t(ns * B * H));
                     if (flash_prefill_)
                     {
@@ -2256,6 +2287,111 @@ namespace muse::gpu
                 }
             }
 
+            // Round a variable row count up to a power-of-two bucket.
+            //
+            // oneDNN JITs a primitive per shape, and the drafter's context
+            // length grows by a few tokens every speculative round -- so every
+            // round was a fresh JIT, which cost more than the entire model
+            // forward it was serving (539-990 ms per round against a ~68 ms
+            // target forward). Bucketing collapses that to ~log2(max_seq)
+            // distinct shapes, all cached after the first use.
+            //
+            // The extra rows are computed and thrown away. That is free of
+            // consequence: every output row of a GEMM is independent, the KV
+            // rows past the live length are never read back, and the context
+            // rows past `n` are never copied forward.
+            static int64_t row_bucket(int64_t n, int64_t cap)
+            {
+                int64_t b = 64;
+                while (b < n)
+                    b <<= 1;
+                return std::min(b, cap);
+            }
+
+            // Greedy speculative decoding.
+            //
+            // Per round: one drafter forward proposes block_size-1 tokens, then
+            // ONE target forward over [bonus ++ candidates] verifies them all
+            // at once. The acceptance rule is HF's ordinary assisted-decoding
+            // one -- compare the target's argmax at each verified position with
+            // the candidate, stop at the first mismatch, and take the target's
+            // own argmax there as the next bonus token. So a round always
+            // yields at least one token, and at most block_size.
+            //
+            // Unlike the oracle's loop, which re-runs the whole target forward
+            // over the full candidate sequence each round, this keeps the KV
+            // cache and forwards only the new rows. Rolling back after a
+            // partial accept is just `len_`: the rejected positions get
+            // overwritten by the next round's block.
+            SpecResult spec_decode(const std::vector<int64_t> &prompt, int64_t anchor,
+                                   int64_t rounds) override
+            {
+                if (dlayers_.empty())
+                    die("spec_decode() before bind_drafter()");
+                const int64_t V = cfg_->vocab_size, B = dcfg_.block_size;
+                SpecResult out;
+                std::vector<int64_t> seq = prompt;
+                std::vector<float> lg(static_cast<size_t>(B * V));
+                int64_t bonus = anchor;
+
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int64_t r = 0; r < rounds; ++r)
+                {
+                    const int64_t n_ctx = int64_t(seq.size());
+                    const auto td0 = std::chrono::steady_clock::now();
+                    DraftResult d = draft(n_ctx, bonus, n_ctx);
+                    for (auto &sh : shards_)
+                        sh.q.wait();
+                    const auto td1 = std::chrono::steady_clock::now();
+                    out.draft_s += std::chrono::duration<double>(td1 - td0).count();
+
+                    // the block the target verifies: the bonus token, then the
+                    // drafter's proposals
+                    std::vector<int64_t> blk;
+                    blk.push_back(bonus);
+                    blk.insert(blk.end(), d.tokens.begin(), d.tokens.end());
+
+                    len_ = n_ctx; // roll the cache back to the accepted prefix
+                    const auto tv0 = std::chrono::steady_clock::now();
+                    forward_block(blk.data(), n_ctx, int64_t(blk.size()), nullptr, lg.data());
+                    out.verify_s +=
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - tv0)
+                            .count();
+
+                    auto argmax_row = [&](int64_t row) {
+                        const float *p = &lg[size_t(row * V)];
+                        int64_t best = 0;
+                        for (int64_t v = 1; v < V; ++v)
+                            if (p[v] > p[best])
+                                best = v;
+                        return best;
+                    };
+                    // row i of the block predicts the token at position i+1, so
+                    // candidate j is checked against row j's argmax
+                    int64_t m = 0;
+                    while (m < int64_t(d.tokens.size()) && argmax_row(m) == d.tokens[size_t(m)])
+                        ++m;
+
+                    seq.push_back(bonus);
+                    out.tokens.push_back(bonus);
+                    for (int64_t i = 0; i < m; ++i)
+                    {
+                        seq.push_back(d.tokens[size_t(i)]);
+                        out.tokens.push_back(d.tokens[size_t(i)]);
+                    }
+                    bonus = argmax_row(m);
+                    len_ = int64_t(seq.size());
+                    out.drafted += int64_t(d.tokens.size());
+                    out.accepted += m;
+                    out.per_round.push_back(int(m));
+                    ++out.rounds;
+                }
+                out.tokens.push_back(bonus);
+                out.seconds =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                return out;
+            }
+
             // ============================================================ vision
             //
             // The tower is 50 layers of ViT at hidden 1536 and runs once per
@@ -2616,6 +2752,18 @@ namespace muse::gpu
             void bind_drafter(const dflash::Config &dc, const dflash::Weights &dw) override
             {
                 dcfg_ = dc;
+                // the drafter's tier is independent of the target's
+                const bool save = q8_;
+                q8_ = q8_asst_;
+                struct Restore
+                {
+                    bool *p, v;
+                    ~Restore() { *p = v; }
+                } restore{&q8_, save};
+                if (dc.block_size > spec_block_)
+                    die("EngineOptions::spec_block (" + std::to_string(spec_block_) +
+                        ") is smaller than the drafter's block_size (" +
+                        std::to_string(dc.block_size) + ")");
                 const int64_t ns = nshard_, H = dc.hidden_size, I = dc.intermediate_size;
                 const int64_t QD = dc.q_dim(), KD = dc.kv_dim(), D = dc.head_dim;
                 const int64_t taps = int64_t(dc.target_layer_ids.size());
@@ -2652,9 +2800,11 @@ namespace muse::gpu
                 {
                     const auto &t = dw.layers[size_t(li)];
                     DLayer &g = dlayers_[size_t(li)];
-                    for (auto *arr : {&g.input_ln, &g.post_attn_ln, &g.q_norm, &g.k_norm, &g.k,
-                                      &g.v, &g.q, &g.mlp_gate, &g.mlp_up, &g.o, &g.mlp_down})
+                    for (auto *arr : {&g.input_ln, &g.post_attn_ln, &g.q_norm, &g.k_norm})
                         arr->assign(size_t(ns), nullptr);
+                    for (auto *arr : {&g.k, &g.v, &g.q, &g.mlp_gate, &g.mlp_up, &g.o,
+                                      &g.mlp_down})
+                        arr->assign(size_t(ns), QW{});
                     for (int64_t sh = 0; sh < ns; ++sh)
                     {
                         const int d = int(sh);
@@ -2663,13 +2813,13 @@ namespace muse::gpu
                         g.post_attn_ln[k] = up(d, bf(*t.post_attn_ln), size_t(H));
                         g.q_norm[k] = up(d, bf(*t.q_norm), size_t(D));
                         g.k_norm[k] = up(d, bf(*t.k_norm), size_t(D));
-                        g.k[k] = up(d, bf(*t.k_proj), size_t(KD * H));
-                        g.v[k] = up(d, bf(*t.v_proj), size_t(KD * H));
-                        g.q[k] = up(d, bf(*t.q_proj) + sh * QDs * H, size_t(QDs * H));
-                        g.mlp_gate[k] = up(d, bf(*t.mlp_gate) + sh * Is * H, size_t(Is * H));
-                        g.mlp_up[k] = up(d, bf(*t.mlp_up) + sh * Is * H, size_t(Is * H));
-                        g.o[k] = up_cols(d, bf(*t.o_proj), H, QD, sh * QDs, QDs);
-                        g.mlp_down[k] = up_cols(d, bf(*t.mlp_down), H, I, sh * Is, Is);
+                        g.k[k] = up_w(d, bf(*t.k_proj), KD, H);
+                        g.v[k] = up_w(d, bf(*t.v_proj), KD, H);
+                        g.q[k] = up_w(d, bf(*t.q_proj) + sh * QDs * H, QDs, H);
+                        g.mlp_gate[k] = up_w(d, bf(*t.mlp_gate) + sh * Is * H, Is, H);
+                        g.mlp_up[k] = up_w(d, bf(*t.mlp_up) + sh * Is * H, Is, H);
+                        g.o[k] = up_cols_w(d, bf(*t.o_proj), H, QD, sh * QDs, QDs);
+                        g.mlp_down[k] = up_cols_w(d, bf(*t.mlp_down), H, I, sh * Is, Is);
                     }
                 }
                 stage_.clear();
@@ -2742,7 +2892,12 @@ namespace muse::gpu
                 const float scaling = float(1.0 / std::sqrt(double(D)));
                 if (dlayers_.empty())
                     die("draft() before bind_drafter()");
+                // bucketed row counts, so oneDNN sees a handful of shapes
+                // instead of one per round
+                const int64_t nb = row_bucket(n, max_seq_);
+                const int64_t Sb = row_bucket(S, max_seq_ + B);
 
+                dtA_ = std::chrono::steady_clock::now();
                 // ---- context: ctx[n,H] = sum_k tap_k[n,H] . Wk^T, each shard
                 //      owning a slice of the input, then one all-reduce.
                 for (int64_t sh = 0; sh < ns; ++sh)
@@ -2750,11 +2905,16 @@ namespace muse::gpu
                     Dev &d = shards_[size_t(sh)];
                     DBuf &b = dbuf_[size_t(sh)];
                     for (int64_t k = 0; k < taps; ++k)
-                        bmm(int(sh), d.taps[size_t(k)] + sh * Hs * n, dnnl::memory::data_type::f32,
-                            {1, n, Hs}, {n * Hs, 1, n}, enc_[size_t(sh)][size_t(k)],
+                        // taps are [max_seq, H] row-major bf16; this shard owns
+                        // the column range [sh*Hs, (sh+1)*Hs) of them
+                        bmm(int(sh), d.taps[size_t(k)] + sh * Hs, dnnl::memory::data_type::bf16,
+                            {1, nb, Hs}, {nb * H, H, 1}, enc_[size_t(sh)][size_t(k)],
                             dnnl::memory::data_type::bf16, {1, Hs, H}, {Hs * H, 1, Hs}, b.ctx,
-                            {1, n, H}, {n * H, H, 1}, k > 0);
+                            {1, nb, H}, {nb * H, H, 1}, k > 0);
                 }
+                for (auto &sh_ : shards_) sh_.q.wait();
+                dt_ctx_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - dtA_).count();
+                dtA_ = std::chrono::steady_clock::now();
                 all_reduce_buf(n * H, [&](int sh) { return dbuf_[size_t(sh)].ctx; });
                 for (int64_t sh = 0; sh < ns; ++sh)
                 {
@@ -2789,8 +2949,8 @@ namespace muse::gpu
                         k_round(d.q, b.xn, b.kvin + n * H, B * H);
                         k_round(d.q, b.xn, b.ctxb, B * H); // q input
                         gemm_rm(int(sh), l.q[size_t(sh)], b.ctxb, b.Q, B, H, QDs);
-                        gemm_rm(int(sh), l.k[size_t(sh)], b.kvin, b.K, S, H, KD);
-                        gemm_rm(int(sh), l.v[size_t(sh)], b.kvin, b.V, S, H, KD);
+                        gemm_rm(int(sh), l.k[size_t(sh)], b.kvin, b.K, Sb, H, KD);
+                        gemm_rm(int(sh), l.v[size_t(sh)], b.kvin, b.V, Sb, H, KD);
                         k_dnorm(d.q, b.Q, l.q_norm[size_t(sh)], b.Q, B * nqs, D, D, D,
                                 dc.rms_norm_eps);
                         k_dnorm(d.q, b.K, l.k_norm[size_t(sh)], b.K, S * nkv, D, D, D,
@@ -2824,6 +2984,9 @@ namespace muse::gpu
                                  dbuf_[size_t(sh)].mix, B * H);
                 }
 
+                for (auto &sh_ : shards_) sh_.q.wait();
+                dt_layers_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - dtA_).count();
+                dtA_ = std::chrono::steady_clock::now();
                 // final norm, then the target's BARE lm_head over rows 1..B-1
                 std::vector<float> lg(static_cast<size_t>((B - 1) * V));
                 for (int64_t sh = 0; sh < ns; ++sh)
@@ -2845,6 +3008,7 @@ namespace muse::gpu
                         std::memcpy(&lg[size_t(r * V + sh * Vs)], &part[size_t(r * Vs)],
                                     size_t(Vs) * 4);
                 }
+                dt_head_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - dtA_).count();
                 DraftResult out;
                 out.anchor = anchor;
                 out.tokens.resize(size_t(B - 1));
@@ -2867,8 +3031,12 @@ namespace muse::gpu
             // indexing a 1-element vector at `pos0` reads out of bounds and
             // feeds a garbage id into the embedding gather (which hangs the
             // card rather than failing).
+            // `out_logits_all`, when set, gets logits for EVERY row rather than
+            // just the last. Speculative verification needs them: one forward
+            // over the 16 candidate rows has to say what the target would have
+            // produced at each of those positions.
             void forward_block(const int64_t *block_ids, int64_t pos0, int64_t n,
-                               float *out_logits_last)
+                               float *out_logits_last, float *out_logits_all = nullptr)
             {
                 const Config &c = *cfg_;
                 const int64_t H = c.hidden_size, I = c.intermediate_size, D = c.head_dim;
@@ -3049,7 +3217,7 @@ namespace muse::gpu
                             for (int64_t sh = 0; sh < ns; ++sh)
                             {
                                 Dev &d = shards_[size_t(sh)];
-                                k_pack2d(d.q, d.h, d.taps[k], H, n, B);
+                                k_pack2d_at(d.q, d.h, d.taps[k], H, n, B, pos0);
                             }
                     if (trace_dir_)
                     {
@@ -3060,10 +3228,42 @@ namespace muse::gpu
                 }
                 len_ = pos0 + n;
 
-                if (!out_logits_last)
+                if (!out_logits_last && !out_logits_all)
                 {
                     for (int64_t sh = 0; sh < ns; ++sh)
                         shards_[size_t(sh)].q.wait();
+                    return;
+                }
+
+                if (out_logits_all)
+                {
+                    // head over all n rows; d.logits is sized Vs * spec_block
+                    if (n > spec_block_)
+                        die("all-row head asked for " + std::to_string(n) +
+                            " rows, scratch holds " + std::to_string(spec_block_));
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        k_rmsnorm_auto(d.q, d.h, final_norm_[size_t(sh)], d.xb, n, 1, H, B,
+                                       c.rms_norm_eps, NK::Plain);
+                        gemm(int(sh), lm_head_[size_t(sh)], d.xb, d.logits, n, H, Vs, B, n);
+                        k_softcap(d.q, d.logits, Vs * n, float(c.output_multiplier),
+                                  float(c.final_logit_softcapping));
+                    }
+                    std::vector<float> part(static_cast<size_t>(Vs * n));
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        shards_[size_t(sh)]
+                            .q.memcpy(part.data(), shards_[size_t(sh)].logits, part.size() * 4)
+                            .wait();
+                        for (int64_t o = 0; o < Vs; ++o)
+                            for (int64_t t = 0; t < n; ++t)
+                                out_logits_all[size_t(t * V + sh * Vs + o)] =
+                                    part[size_t(o * n + t)];
+                    }
+                    if (out_logits_last)
+                        std::memcpy(out_logits_last, out_logits_all + size_t((n - 1) * V),
+                                    size_t(V) * 4);
                     return;
                 }
 
@@ -3315,6 +3515,7 @@ namespace muse::gpu
             bool decode_gemv_ = false;
             bool p2p_ = true;
             int64_t attn_bq_ = 8, attn_bk_ = 64;
+            int64_t spec_block_ = 1; // widest all-row head (the drafter's block_size)
             bool tiled_attn_ = true;
             bool flash_prefill_ = false;
             // ---- DFlash drafter state (empty until bind_drafter) ----
@@ -3324,10 +3525,12 @@ namespace muse::gpu
             std::vector<uint16_t *> enc_norm_, dfinal_norm_;
             std::vector<float *> drope_cos_, drope_sin_;
             std::vector<int64_t> tap_layers_;
-            bool q8_ = false, q8_blockdot_ = false;
+            bool q8_ = false, q8_asst_ = false, q8_blockdot_ = false;
             int64_t deq_cap_ = 0;
             std::vector<int8_t> qbuf_;
             std::vector<uint16_t> dbuf8_;
+            mutable double dt_ctx_ = 0, dt_layers_ = 0, dt_head_ = 0;
+            mutable std::chrono::steady_clock::time_point dtA_;
             int sealed_ = 0; // 0 off, 1 log, 2 refuse
             int64_t tbytes_ = 0; // target weight bytes, so the drafter's can be reported apart
             struct DBuf

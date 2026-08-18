@@ -10,7 +10,8 @@
 #   6. flash tier      --flash-prefill is envelope-gated, never bitwise
 #   7. DFlash          drafted tokens == the f64 oracle's
 #   8. vision         tower features within the bf16 twin's own deviation
-#   9. Q8_0 tier      argmax/top-k vs the f64 oracle (a separate accuracy tier)
+#   9. spec decode    the loop's sequence == the f64 oracle's
+#  10. Q8_0 tier      argmax/top-k vs the f64 oracle (a separate accuracy tier)
 #  10. tensor parallel  --shards N fixes the arithmetic, --gpus M only places it,
 #                       so 1 card and 2 cards must agree bitwise (Phase 8 exit gate)
 #
@@ -238,6 +239,23 @@ print("  %s image+text logits (argmax %d vs %d, top-%d %.0f%%)" %
        100 * ov))
 sys.exit(0 if (ok and ok2) else 1)
 PY
+
+echo "== speculative decoding =="
+# The whole loop -- drafter, one-forward verification, HF's acceptance rule,
+# and the cache rollback after a partial accept -- against the f64 oracle's
+# own spec loop. The oracle re-runs the full forward each round; this one keeps
+# the KV cache and forwards only the new rows, so agreeing on the SEQUENCE is
+# the real check that the rollback is right.
+SREF=$($CPU --model "$MODEL" --ids "$IDS" --out "$OUT/spc" --assistant "$TINY/tiny_dflash" \
+    --draft-rounds 4 2>/dev/null | grep '^spec: sequence:' | sed 's/.*sequence://')
+SGPU=$($GPU --model "$MODEL" --ids "$IDS" --out "$OUT/spg" --max-seq 256 --shards 1 --gpus 1 \
+    --chunk 16 --assistant "$TINY/tiny_dflash" --draft-rounds 4 2>/dev/null \
+    | grep '^spec sequence:' | sed 's/.*sequence://')
+if [[ -n "$SREF" && "$SREF" == "$SGPU" ]]; then
+    pass "spec sequence == f64 oracle's ($SREF )"
+else
+    fail "spec sequence differs: oracle '$SREF' vs gpu '$SGPU'"
+fi
 
 echo "== Q8_0 weight tier =="
 # A SEPARATE ACCURACY TIER, not the bf16 band: 8-bit weights are ~3x wider than

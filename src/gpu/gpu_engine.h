@@ -81,10 +81,25 @@ namespace muse::gpu
         // Halves weight VRAM. A SEPARATE ACCURACY TIER, not the bf16 band --
         // gated against the f64 oracle, never against the twin bitwise.
         bool q8 = false;
+        // Q8_0 for the DFlash drafter, independently of the target: the build
+        // plan's recommended shape is a BF16 target with a quantized drafter.
+        bool q8_assistant = false;
         // Target hidden-state layers the DFlash drafter reads (its
         // `target_layer_ids`). Must be set before create(): the taps are
         // captured on the way through the forward pass, not recomputed.
         std::vector<int64_t> tap_layers;
+        // The drafter's block_size, needed before create(): it sizes the
+        // all-row logits buffer that speculative verification writes into.
+        int64_t spec_block = 1;
+    };
+
+    // Result of a speculative run.
+    struct SpecResult
+    {
+        std::vector<int64_t> tokens; // everything generated
+        int64_t rounds = 0, drafted = 0, accepted = 0;
+        double seconds = 0, draft_s = 0, verify_s = 0;
+        std::vector<int> per_round;
     };
 
     // One DFlash drafting round: `block_size - 1` proposals anchored on the
@@ -132,6 +147,12 @@ namespace muse::gpu
         // pass. `n` context positions, anchored on `anchor` at absolute
         // position `pos0`.
         virtual DraftResult draft(int64_t n, int64_t anchor, int64_t pos0) = 0;
+
+        // Greedy speculative decoding: draft a block, verify it with ONE target
+        // forward over the candidates, accept the matching prefix. `rounds`
+        // rounds against a cache already holding `prompt`.
+        virtual SpecResult spec_decode(const std::vector<int64_t> &prompt, int64_t anchor,
+                                       int64_t rounds) = 0;
 
         // Vision tower. `max_patches` sizes the scratch once, so an image
         // larger than it is a startup-shaped error rather than a mid-request

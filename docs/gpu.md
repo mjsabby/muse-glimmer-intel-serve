@@ -375,12 +375,71 @@ buffer is the obvious reading of the reference and it grows with the prompt, so
 instead the fc is kept as `taps` separate `[H, H]` blocks and accumulated —
 each block column-sharded on its input, one all-reduce at the end.
 
+### Speculative decoding (`--draft-rounds N`)
+
+Per round: one drafter forward proposes 15 tokens, then **one** target forward
+over `[bonus ++ candidates]` verifies them all at once. Acceptance is HF's
+ordinary assisted-decoding rule. Unlike the oracle's loop, which re-runs the
+whole target forward over the full candidate sequence each round, this keeps
+the KV cache and forwards only the new rows — rolling back after a partial
+accept is just `len_`, since the rejected positions get overwritten next round.
+Gated on producing the **same sequence** as the oracle's loop, which is what
+actually checks the rollback.
+
+30B, BF16, two cards, 20 rounds:
+
+| prompt | tokens/round | tok/s | vs plain decode (14.76) |
+|---|---:|---:|---:|
+| fact | 2.85 | 33.4 | 2.3× |
+| **code** | **11.0** | **119.9** | **8.1×** |
+| prose | 2.15 | 25.2 | 1.7× |
+
+Acceptance is what decides it, and it is extremely prompt-dependent: code
+drafts 11 of 15 tokens per round, prose barely 2.
+
+Cost per round is **draft 16 ms, verify 75 ms** — the 5-layer drafter costing
+~20% of the 52-layer target, which is the right proportion. Getting there took
+one fix worth recording: the taps were first stored **f32**, making the context
+projection an `f32 × bf16` matmul, which oneDNN can only serve from a reference
+kernel. That single GEMM was **435 ms per round — 98% of the drafter's cost, and
+1000× its bandwidth budget**. The target's hidden states only ever hold
+bf16-representable values (every residual rounds), so storing the taps as bf16
+row-major is exact and makes it an ordinary DPAS GEMM: 8.696 s → 0.026 s over 20
+rounds, and speculative decoding went from *slower* than plain decode to 8×
+faster.
+
+A second, smaller one: oneDNN JITs per shape, and the drafter's context length
+grows every round, so every round was a fresh JIT. Row counts are now rounded up
+to power-of-two buckets (`row_bucket`), which collapses that to ~log₂(max_seq)
+shapes. The extra rows are computed and discarded — free of consequence, since
+GEMM rows are independent, KV rows past the live length are never read, and
+context rows past `n` are never copied forward.
+
 ### Memory
 
 | | per card |
 |---|---:|
 | target, BF16, TP | 27.36 GiB |
 | + drafter, BF16, sharded | **29.80 GiB** |
+| + drafter, Q8_0 (`--q8-assistant`) | **28.75 GiB** |
+
+`--q8-assistant` quantizes the drafter independently of the target — the build
+plan's recommended shape. Its dimensions all divide by 32, so it quantizes
+cleanly: 4.89 → **2.79 GiB**, with *identical* drafted tokens and an identical
+acceptance pattern on the test prompts. It costs throughput, though, because
+the drafter's GEMMs are only 16 rows wide and go through the same
+dequantize-to-scratch path prefill uses — reading the weight, writing bf16, and
+reading it back, i.e. 3× the traffic of just reading bf16:
+
+| drafter tier | VRAM | draft/round | spec tok/s (code) |
+|---|---:|---:|---:|
+| BF16 | 4.89 GiB | 16.4 ms | **119.9** |
+| Q8_0 | **2.79 GiB** | 48.0 ms | 89.3 |
+
+A dedicated small-M Q8 GEMM (one sub-group per output row, accumulating all 16
+activation rows from a single pass over the weight) would read 1.06 bytes per
+weight instead of expanding it, and should make the Q8 drafter *faster* than
+BF16 rather than slower. Not written.
 
 Against 31.89 GiB physical, so BF16 target **and** BF16 drafter do fit two
 cards — which the build plan predicted would not happen (it budgeted 2.38
@@ -573,6 +632,7 @@ slice is 16 wide. The 30B's slices are 2048 and 9984, both fine.
 | flash tier rerun + 1 card == 2 cards, bitwise | looser numerics, not sloppy ones |
 | drafter proposals == the f64 oracle's | the drafter's four inverted conventions |
 | drafter: 1 card == 2 cards | the drafter shards like the target |
+| spec sequence == the f64 oracle's | the accept rule and the cache rollback |
 | vision features within the twin's own deviation of the oracle | the tower, judged against bf16 rather than against zero |
 | q8 argmax + top-k vs the f64 oracle | a separate accuracy tier, gated on its own terms |
 | q8 chunk-invariant + rerun bitwise | decode and prefill agree inside the tier |

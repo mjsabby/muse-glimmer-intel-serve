@@ -62,11 +62,13 @@ namespace
                      "  --flash-prefill    matrix-engine prefill attention (faster, and a\n"
                      "                     LOOSER numerical contract - envelope-gated)\n"
                      "  --assistant DIR    DFlash drafter; runs one drafting round after prefill\n"
+                     "  --draft-rounds N   greedy speculative decoding for N rounds\n"
                      "  --pixels FILE      f64 [N, patch_dim] pixel values (with --grid)\n"
                      "  --grid t,h,w[;..]  patch grid per image\n"
                      "  --vision gpu|cpu   where to run the tower. cpu keeps ~1.9 GiB/card of\n"
                      "                     tower weights out of VRAM (it is bitwise-gated there)\n"
                      "  --seal N           0 off, 1 log, 2 refuse post-load allocations\n"
+                     "  --q8-assistant     Q8_0 for the drafter only (BF16 target + Q8 drafter)\n"
                      "  --q8               Q8_0 weight tier: half the weight VRAM, a separate\n"
                      "                     accuracy tier (gated vs the oracle, not the twin)\n"
                      "  --list-devices     enumerate the visible GPUs and exit\n"
@@ -79,9 +81,10 @@ int main(int argc, char **argv)
     std::string model, ids_spec, out_dir = "out/gpu", revision = "main", assistant, pixels_path, grid_spec;
     int64_t chunk = 512, max_seq = 0, decode_n = 0;
     int gpus = 2, shards = 0, topk = 5;
+    int64_t draft_rounds = 0;
     bool no_dnnl = false, flash_prefill = false;
     std::string vision_on = "gpu";
-    bool q8 = false;
+    bool q8 = false, q8_assistant = false;
     int seal = 2;
 
     for (int i = 1; i < argc; ++i)
@@ -131,6 +134,10 @@ int main(int argc, char **argv)
             seal = std::stoi(next());
         else if (a == "--q8")
             q8 = true;
+        else if (a == "--q8-assistant")
+            q8_assistant = true;
+        else if (a == "--draft-rounds")
+            draft_rounds = std::stoll(next());
         else if (a == "--list-devices")
         {
             auto ds = muse::gpu::enumerate_devices();
@@ -191,13 +198,17 @@ int main(int argc, char **argv)
         muse::gpu::EngineOptions opt;
         opt.gpus = gpus;
         if (!assistant.empty())
+        {
             opt.tap_layers = acfg.target_layer_ids;
+            opt.spec_block = acfg.block_size;
+        }
         opt.shards = shards;
         opt.block = chunk;
         opt.max_seq = max_seq;
         opt.no_dnnl = no_dnnl;
         opt.flash_prefill = flash_prefill;
         opt.q8 = q8;
+        opt.q8_assistant = q8_assistant;
         opt.verbose = true;
 
         auto eng = muse::gpu::Engine::create(cfg, w, opt);
@@ -293,8 +304,34 @@ int main(int argc, char **argv)
         std::vector<float> lg(size_t(cfg.vocab_size), 0.f);
         eng->prefill(ids, lg.data());
 
+        muse::gpu::SpecResult sp;
+        if (!assistant.empty() && draft_rounds > 0)
+        {
+            const int64_t anchor =
+                int64_t(std::max_element(lg.begin(), lg.end()) - lg.begin());
+            sp = eng->spec_decode(ids, anchor, draft_rounds);
+            const double rate = sp.drafted ? double(sp.accepted) / double(sp.drafted) : 0.0;
+            std::fprintf(stderr,
+                         "spec: %lld rounds, drafted %lld, accepted %lld, accept_rate %.4f\n"
+                         "  %zu tokens in %.3f s = %.2f tok/s (%.3f tokens/round)\n"
+                         "  per round: draft %.1f ms, verify %.1f ms\n",
+                         (long long)sp.rounds, (long long)sp.drafted, (long long)sp.accepted,
+                         rate, sp.tokens.size(), sp.seconds,
+                         double(sp.tokens.size()) / sp.seconds,
+                         double(sp.tokens.size()) / double(sp.rounds),
+                         1e3 * sp.draft_s / double(sp.rounds),
+                         1e3 * sp.verify_s / double(sp.rounds));
+            std::printf("spec accepted per round:");
+            for (int m : sp.per_round)
+                std::printf(" %d", m);
+            std::printf("\nspec sequence:");
+            for (int64_t t : sp.tokens)
+                std::printf(" %lld", (long long)t);
+            std::printf("\n");
+        }
+
         muse::gpu::DraftResult dr;
-        if (!assistant.empty())
+        if (!assistant.empty() && draft_rounds == 0)
         {
             // the anchor is the target's own next token; the block sits at
             // absolute position T
