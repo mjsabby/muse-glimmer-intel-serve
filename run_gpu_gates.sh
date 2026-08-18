@@ -240,6 +240,19 @@ print("  %s image+text logits (argmax %d vs %d, top-%d %.0f%%)" %
 sys.exit(0 if (ok and ok2) else 1)
 PY
 
+echo "== --flash-decode (split-K decode attention, LOOSER contract) =="
+# Same class as --flash-prefill: splitting the key range across work-groups
+# reorders the softmax rescalings, so it is envelope-gated, not bitwise. What
+# must hold is that it is a different SCHEDULE of the same function.
+$GPU --model "$MODEL" --ids "$IDS" --out "$OUT/fd" --max-seq 256 --shards 2 --gpus 1 \
+    --chunk 16 --decode 8 --flash-decode >/dev/null 2>&1
+$GPU --model "$MODEL" --ids "$IDS" --out "$OUT/fdx" --max-seq 256 --shards 2 --gpus 1 \
+    --chunk 16 --decode 8 >/dev/null 2>&1
+envelope "flash-decode inside the envelope of the exact path" "$OUT/fd" "$OUT/fdx" 0.5 || rc=1
+$GPU --model "$MODEL" --ids "$IDS" --out "$OUT/fd2" --max-seq 256 --shards 2 --gpus 1 \
+    --chunk 16 --decode 8 --flash-decode >/dev/null 2>&1
+same "flash-decode rerun bit-identical" "$OUT/fd" "$OUT/fd2"
+
 echo "== speculative decoding =="
 # The whole loop -- drafter, one-forward verification, HF's acceptance rule,
 # and the cache rollback after a partial accept -- against the f64 oracle's

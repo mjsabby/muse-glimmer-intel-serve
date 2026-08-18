@@ -76,6 +76,10 @@ namespace muse::gpu
         // faster and a DIFFERENT numerical contract from the twin — it is
         // gated on the logit envelope, never bitwise. Decode is unaffected.
         bool flash_prefill = false;
+        // Split-K decode attention. Needed past ~2K context, where the exact
+        // kernel's single-query parallelism (nqs sub-groups) leaves the card
+        // idle. Looser contract, same as flash_prefill.
+        bool flash_decode = false;
         // Q8_0 weight tier for the text model: quantized at load from the same
         // BF16 checkpoint with llama.cpp's quantize_row_q8_0_ref semantics.
         // Halves weight VRAM. A SEPARATE ACCURACY TIER, not the bf16 band --

@@ -538,6 +538,60 @@ assumed:
 * **oneDNN Q8 matmul.** See the Q8 section — grouped scales are unsupported in
   this build.
 
+## How much context fits
+
+Measured end to end — prefilled and decoded, not just allocated. `--flash-decode`
+is required past ~2K (see below); `--ids-file` reads long prompts, which exceed
+the argv limit.
+
+| configuration | max context | prefill | decode @ full |
+|---|---:|---:|---:|
+| BF16 | **131 072** (the model's max) | 1143 tok/s | 5.67 tok/s |
+| Q8_0 | **131 072** | 946 tok/s | 5.70 tok/s |
+| BF16 + BF16 drafter | ~8 192 | — | — |
+| Q8_0 + Q8_0 drafter | ~65 536 | — | — |
+
+So **the 30B runs its full 131 072-token window on two cards, on either tier** —
+114.7 s to prefill 131 072 tokens. The KV cache is only 3.56 GiB there, because
+39 of 52 layers are sliding and hold `window + chunk` rows regardless of context;
+only the 13 global layers grow, at 1 KiB per layer per token.
+
+**The drafter is what caps context, and it is the taps, not the weights.** DFlash
+reads the target's hidden states at 5 layers for the whole context, so the tap
+buffer is `5 × max_seq × H × 2` bytes per shard — 545 MB at 8 K, 4.4 GB at 64 K.
+The drafter's own attention is sliding-window 2048, so it never looks further
+back than that; holding the taps in a ring of `window + block` rows instead of
+`max_seq` would make its context cost constant and lift this ceiling entirely.
+Not done.
+
+## Decode falls off with context unless you split the keys
+
+At decode there is ONE query, so the exact attention kernel launches `nqs`
+sub-groups — 16 of ~256 Xe-cores — and each walks the whole key range serially.
+Cost is linear in context and the card is idle. Measured as **72-82% of decode
+time** past 2 K.
+
+`--flash-decode` splits the key range across work-groups, each producing a
+partial `(max, sumexp, accumulator)`, then merges them. Parallelism goes from 16
+to 16 × splits:
+
+| context | exact | `--flash-decode` |
+|---|---:|---:|
+| 2 048 | 4.48 tok/s | **10.27** |
+| 8 192 | 2.89 | **10.19** |
+| 16 384 | 1.95 | **10.05** |
+| 32 768 | — | 9.05 |
+| 131 072 | — | 5.67 |
+
+Decode goes from degrading linearly to **flat out to 16 K**. It is the same
+class of contract as `--flash-prefill` — reordering the softmax rescalings is a
+different schedule of the same function — so it is envelope-gated, not bitwise,
+and therefore opt-in. It produced identical tokens to the exact path on the test
+prompts.
+
+The split count is chosen from the context length alone, never from a runtime
+measurement, so a rerun cannot pick differently.
+
 ## Are the matrix engines actually used?
 
 Yes. oneDNN reports `jit:gemm:any` for the prefill shapes, which names the
@@ -633,6 +687,7 @@ slice is 16 wide. The 30B's slices are 2048 and 9984, both fine.
 | drafter proposals == the f64 oracle's | the drafter's four inverted conventions |
 | drafter: 1 card == 2 cards | the drafter shards like the target |
 | spec sequence == the f64 oracle's | the accept rule and the cache rollback |
+| flash-decode inside the exact path's envelope + rerun bitwise | split-K is a schedule, not a different function |
 | vision features within the twin's own deviation of the oracle | the tower, judged against bf16 rather than against zero |
 | q8 argmax + top-k vs the f64 oracle | a separate accuracy tier, gated on its own terms |
 | q8 chunk-invariant + rerun bitwise | decode and prefill agree inside the tier |

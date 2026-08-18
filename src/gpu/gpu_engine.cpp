@@ -162,6 +162,7 @@ namespace muse::gpu
             // local copy.
             float *peer = nullptr;
             uint16_t *deq = nullptr; // Q8 prefill: one weight expanded to bf16
+            float *pm = nullptr, *pl = nullptr, *pa = nullptr; // split-K decode partials
             // --flash-prefill tier scratch (allocated only for that tier)
             float *fs = nullptr;    // S tile [heads, FBQ, FBK] f32
             uint16_t *fp = nullptr; // P tile [heads, FBQ, FBK] bf16
@@ -1213,6 +1214,119 @@ namespace muse::gpu
             q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> i) { p[i] = v; });
         }
 
+        // ------------------------------------------------- flash decode (split-K)
+        //
+        // At decode there is ONE query, so the exact kernel launches nqs
+        // sub-groups -- 16 of ~256 Xe-cores -- and each walks the whole key
+        // range serially. Cost is linear in context and the card is idle:
+        // measured 72-82% of decode time past 2K context, and decode falling
+        // from 14.8 tok/s at 128 tokens to 1.9 at 16K.
+        //
+        // Split-K fixes the parallelism: each work-group takes a slice of the
+        // keys and produces a partial (max, sumexp, accumulator); a second pass
+        // merges the slices. That is a DIFFERENT summation schedule from the
+        // sequential recurrence -- the rescalings happen in a different order --
+        // so like --flash-prefill it is a looser contract, gated on the
+        // envelope rather than bitwise. Hence opt-in.
+        void k_attn_decode_split(sycl::queue &q, const uint16_t *qb, const uint16_t *kc,
+                                 const uint16_t *vc, float *pm, float *pl, float *pa,
+                                 int64_t nq, int64_t D, int64_t KD, int64_t ld, int64_t pos0,
+                                 int64_t groups, int64_t cap, int64_t window, float scaling,
+                                 int64_t head0, int64_t nsplit)
+        {
+            q.submit([&](sycl::handler &h) {
+                h.parallel_for(
+                    sycl::nd_range<1>(size_t(nq * nsplit) * SG, SG),
+                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                        const int64_t gid = int64_t(it.get_group(0));
+                        const int64_t sp = gid % nsplit, hh = gid / nsplit;
+                        auto sg = it.get_sub_group();
+                        const int lane = int(sg.get_local_id()[0]);
+
+                        const int64_t qpos = pos0, g = (head0 + hh) / groups;
+                        const int64_t lo = window > 0 ? sycl::max<int64_t>(0, qpos - window + 1) : 0;
+                        const int64_t total = qpos - lo + 1;
+                        const int64_t per = (total + nsplit - 1) / nsplit;
+                        const int64_t j0 = lo + sp * per;
+                        const int64_t j1 = sycl::min<int64_t>(qpos, j0 + per - 1);
+
+                        constexpr int MAXACC = 16;
+                        float acc[MAXACC], qv[MAXACC];
+                        int na = 0;
+                        for (int64_t i = lane; i < D; i += SG, ++na)
+                        {
+                            acc[na] = 0.f;
+                            qv[na] = bf2f(qb[(hh * D + i) * ld]);
+                        }
+                        float mx = -INFINITY, sum = 0.f;
+                        for (int64_t j = j0; j <= j1; ++j)
+                        {
+                            const int64_t slot = j % cap;
+                            const uint16_t *kp = kc + slot * KD + g * D;
+                            float part = 0.f;
+                            for (int a = 0, i = lane; a < na; ++a, i += SG)
+                                part += qv[a] * bf2f(kp[i]);
+                            const float sc =
+                                sycl::reduce_over_group(sg, part, sycl::plus<float>()) * scaling;
+                            const float m2 = sycl::max(mx, sc);
+                            const float corr = sycl::exp(mx - m2);
+                            const float e = sycl::exp(sc - m2);
+                            sum = sum * corr + e;
+                            const uint16_t *vp = vc + slot * KD + g * D;
+                            for (int a = 0, i = lane; a < na; ++a, i += SG)
+                                acc[a] = acc[a] * corr + e * bf2f(vp[i]);
+                            mx = m2;
+                        }
+                        const int64_t base = (hh * nsplit + sp);
+                        if (lane == 0)
+                        {
+                            pm[base] = (j0 > j1) ? -INFINITY : mx;
+                            pl[base] = (j0 > j1) ? 0.f : sum;
+                        }
+                        for (int a = 0, i = lane; a < na; ++a, i += SG)
+                            pa[base * D + i] = acc[a];
+                    });
+            });
+        }
+
+        // merge the slices in split order and normalize
+        void k_attn_decode_combine(sycl::queue &q, const float *pm, const float *pl,
+                                   const float *pa, float *out, int64_t nq, int64_t D,
+                                   int64_t ld, int64_t nsplit)
+        {
+            q.submit([&](sycl::handler &h) {
+                h.parallel_for(
+                    sycl::nd_range<1>(size_t(nq) * SG, SG),
+                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                        const int64_t hh = int64_t(it.get_group(0));
+                        auto sg = it.get_sub_group();
+                        const int lane = int(sg.get_local_id()[0]);
+                        constexpr int MAXACC = 16;
+                        float acc[MAXACC];
+                        int na = 0;
+                        for (int64_t i = lane; i < D; i += SG, ++na)
+                            acc[na] = 0.f;
+                        float mx = -INFINITY, sum = 0.f;
+                        for (int64_t sp = 0; sp < nsplit; ++sp)
+                        {
+                            const int64_t base = hh * nsplit + sp;
+                            const float m2 = sycl::max(mx, pm[base]);
+                            if (m2 == -INFINITY)
+                                continue;
+                            const float c0 = sycl::exp(mx - m2);
+                            const float c1 = sycl::exp(pm[base] - m2);
+                            sum = sum * c0 + pl[base] * c1;
+                            for (int a = 0, i = lane; a < na; ++a, i += SG)
+                                acc[a] = acc[a] * c0 + pa[base * D + i] * c1;
+                            mx = m2;
+                        }
+                        const float inv = 1.0f / sum;
+                        for (int a = 0, i = lane; a < na; ++a, i += SG)
+                            out[(hh * D + i) * ld] = acc[a] * inv;
+                    });
+            });
+        }
+
         // output gate from the PRE-attention normed input: one BF16
         // materialization per nn.Linear output, then one per elementwise op
         void k_out_gate(sycl::queue &q, const float *of, const float *gf, uint16_t *ob,
@@ -1477,6 +1591,8 @@ namespace muse::gpu
                     tiled_attn_ = false;
 
                 flash_prefill_ = opt.flash_prefill;
+                flash_decode_ = opt.flash_decode;
+                nq_ = c.num_attention_heads / nshard_;
                 q8_ = opt.q8;
                 q8_asst_ = opt.q8_assistant;
                 if (const char *e = getenv("MUSE_GPU_Q8_BLOCKDOT"); e && *e && *e != '0')
@@ -1581,6 +1697,9 @@ namespace muse::gpu
 
             void decode_step(int64_t id, float *logits_last) override
             {
+                if (prof_on_ && tim_.decode_tokens == 0)
+                    for (int i = 0; i < S_NSTAGE; ++i)
+                        stage_s_[i] = 0; // report decode alone, not prefill+decode
                 auto t0 = std::chrono::steady_clock::now();
                 forward_block(&id, len_, 1, logits_last);
                 tim_.decode_s +=
@@ -1853,6 +1972,9 @@ namespace muse::gpu
                         d.deq = dalloc<uint16_t>(i, size_t(deq_cap_));
                     }
                     d.xfer = dalloc<float>(i, size_t(B * H));
+                    d.pm = dalloc<float>(i, size_t(nq_ * fd_splits_));
+                    d.pl = dalloc<float>(i, size_t(nq_ * fd_splits_));
+                    d.pa = dalloc<float>(i, size_t(nq_ * fd_splits_ * c.head_dim));
                     d.taps.assign(tap_layers_.size(), nullptr);
                     for (size_t k = 0; k < tap_layers_.size(); ++k)
                         // the drafter reads the taps for the WHOLE context, so
@@ -3156,6 +3278,22 @@ namespace muse::gpu
                             k_attention_tiled(d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.of,
                                               n, nqs, D, KD, B, pos0, groups, l.cap, window,
                                               scaling, sh * nqs, attn_bq_, attn_bk_);
+                        else if (n == 1 && flash_decode_ && pos0 + 1 > fd_min_ctx_)
+                        {
+                            // split by shape only (context length), never by a
+                            // runtime measurement, so a rerun cannot pick
+                            // differently
+                            const int64_t total =
+                                window > 0 ? std::min<int64_t>(pos0 + 1, window) : pos0 + 1;
+                            const int64_t nsp =
+                                std::min<int64_t>(fd_splits_, (total + 511) / 512);
+                            k_attn_decode_split(d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)],
+                                                d.pm, d.pl, d.pa, nqs, D, KD, B, pos0, groups,
+                                                l.cap, window, scaling, sh * nqs,
+                                                std::max<int64_t>(1, nsp));
+                            k_attn_decode_combine(d.q, d.pm, d.pl, d.pa, d.of, nqs, D, B,
+                                                  std::max<int64_t>(1, nsp));
+                        }
                         else
                             k_attention(d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.of, n,
                                         nqs, D, KD, B, pos0, groups, l.cap, window, scaling,
@@ -3517,6 +3655,8 @@ namespace muse::gpu
             int64_t attn_bq_ = 8, attn_bk_ = 64;
             int64_t spec_block_ = 1; // widest all-row head (the drafter's block_size)
             bool tiled_attn_ = true;
+            bool flash_decode_ = false;
+            int64_t fd_splits_ = 32, fd_min_ctx_ = 1024, nq_ = 1;
             bool flash_prefill_ = false;
             // ---- DFlash drafter state (empty until bind_drafter) ----
             dflash::Config dcfg_;

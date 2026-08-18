@@ -51,6 +51,7 @@ namespace
     {
         std::fprintf(stderr,
                      "usage: muse-gpu --model DIR --ids A,B,C [options]\n"
+                     "  --ids-file FILE    read the id list from a file (long prompts)\n"
                      "  --out DIR          artifact directory (default out/gpu)\n"
                      "  --gpus N           physical cards to use (default 2)\n"
                      "  --shards N         tensor-parallel shards (default: one per card)\n"
@@ -59,6 +60,7 @@ namespace
                      "  --decode N         greedy-decode N tokens after prefill\n"
                      "  --top K            print the last position's top-K\n"
                      "  --no-dnnl          hand-written GEMV everywhere (diagnostic)\n"
+                     "  --flash-decode     split-K decode attention: needed past ~2K context\n"
                      "  --flash-prefill    matrix-engine prefill attention (faster, and a\n"
                      "                     LOOSER numerical contract - envelope-gated)\n"
                      "  --assistant DIR    DFlash drafter; runs one drafting round after prefill\n"
@@ -82,7 +84,7 @@ int main(int argc, char **argv)
     int64_t chunk = 512, max_seq = 0, decode_n = 0;
     int gpus = 2, shards = 0, topk = 5;
     int64_t draft_rounds = 0;
-    bool no_dnnl = false, flash_prefill = false;
+    bool no_dnnl = false, flash_prefill = false, flash_decode = false;
     std::string vision_on = "gpu";
     bool q8 = false, q8_assistant = false;
     int seal = 2;
@@ -102,6 +104,16 @@ int main(int argc, char **argv)
             model = next();
         else if (a == "--ids")
             ids_spec = next();
+        else if (a == "--ids-file")
+        {
+            // long-context prompts exceed the argv limit
+            std::ifstream f(next());
+            if (!f)
+                throw std::runtime_error("cannot read --ids-file");
+            std::ostringstream ss;
+            ss << f.rdbuf();
+            ids_spec = ss.str();
+        }
         else if (a == "--out")
             out_dir = next();
         else if (a == "--revision")
@@ -122,6 +134,8 @@ int main(int argc, char **argv)
             no_dnnl = true;
         else if (a == "--flash-prefill")
             flash_prefill = true;
+        else if (a == "--flash-decode")
+            flash_decode = true;
         else if (a == "--assistant")
             assistant = next();
         else if (a == "--pixels")
@@ -207,6 +221,7 @@ int main(int argc, char **argv)
         opt.max_seq = max_seq;
         opt.no_dnnl = no_dnnl;
         opt.flash_prefill = flash_prefill;
+        opt.flash_decode = flash_decode;
         opt.q8 = q8;
         opt.q8_assistant = q8_assistant;
         opt.verbose = true;
