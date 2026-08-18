@@ -548,21 +548,38 @@ the argv limit.
 |---|---:|---:|---:|
 | BF16 | **131 072** (the model's max) | 1143 tok/s | 5.67 tok/s |
 | Q8_0 | **131 072** | 946 tok/s | 5.70 tok/s |
-| BF16 + BF16 drafter | ~8 192 | — | — |
-| Q8_0 + Q8_0 drafter | ~65 536 | — | — |
+| BF16 + BF16 drafter | ~16 384 | — | — |
+| BF16 + Q8_0 drafter | ~65 536 | — | — |
+| Q8_0 + Q8_0 drafter | **131 072** | — | — |
 
 So **the 30B runs its full 131 072-token window on two cards, on either tier** —
 114.7 s to prefill 131 072 tokens. The KV cache is only 3.56 GiB there, because
 39 of 52 layers are sliding and hold `window + chunk` rows regardless of context;
 only the 13 global layers grow, at 1 KiB per layer per token.
 
-**The drafter is what caps context, and it is the taps, not the weights.** DFlash
-reads the target's hidden states at 5 layers for the whole context, so the tap
-buffer is `5 × max_seq × H × 2` bytes per shard — 545 MB at 8 K, 4.4 GB at 64 K.
-The drafter's own attention is sliding-window 2048, so it never looks further
-back than that; holding the taps in a ring of `window + block` rows instead of
-`max_seq` would make its context cost constant and lift this ceiling entirely.
-Not done.
+**The drafter used to cap context, and it was the taps rather than its weights.**
+DFlash reads the target's hidden states at 5 layers, and holding them for the
+whole context costs `5 × max_seq × H × 2` bytes per shard — 4.4 GB at 64 K.
+
+But the drafter's own attention is sliding-window 2048 and its block sits at
+`pos0 == n`, so any context position older than `n − window` is masked out and
+contributes **exactly zero**. Truncating to that window is therefore
+arithmetically identical to the reference, not an approximation — and it lets
+the taps live in a `window + chunk` ring exactly like the KV cache, at a
+**constant 272 MB per shard** regardless of context.
+
+Two consequences of the truncation, both load-bearing: a key ROW is no longer
+its absolute position, so the drafter's rope and its attention mask both take a
+`kbase = n − W` offset. And the window is gathered out of the ring into a
+contiguous buffer before the context GEMM — reading the ring directly would
+split every round's range at the wrap point into runs whose lengths change every
+round, and oneDNN JITs per shape, so that just trades the memory back for JIT
+churn.
+
+That moved the ceiling from ~8 K to 16 K; sizing the Q8 dequant scratch by which
+tier is *actually* quantized (a Q8 drafter never expands the vocab head — that
+is the target's) took BF16+Q8 to 64 K, and Q8+Q8 now reaches the **full 131 072
+window with a drafter attached**.
 
 ## Decode falls off with context unless you split the keys
 
@@ -687,6 +704,7 @@ slice is 16 wide. The 30B's slices are 2048 and 9984, both fine.
 | drafter proposals == the f64 oracle's | the drafter's four inverted conventions |
 | drafter: 1 card == 2 cards | the drafter shards like the target |
 | spec sequence == the f64 oracle's | the accept rule and the cache rollback |
+| spec loop rerun deterministic | oneDNN's atomic split-K, which a single-forward gate cannot see |
 | flash-decode inside the exact path's envelope + rerun bitwise | split-K is a schedule, not a different function |
 | vision features within the twin's own deviation of the oracle | the tower, judged against bf16 rather than against zero |
 | q8 argmax + top-k vs the f64 oracle | a separate accuracy tier, gated on its own terms |

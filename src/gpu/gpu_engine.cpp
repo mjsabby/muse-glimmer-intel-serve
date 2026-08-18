@@ -1046,7 +1046,7 @@ namespace muse::gpu
         void k_dattn(sycl::queue &q, const float *Q, const float *K, const float *V, float *O,
                      float *sc, int64_t B, int64_t S, int64_t nqs, int64_t nkv, int64_t D,
                      int64_t pos0, int64_t window, float scaling, int64_t head0,
-                     int64_t groups)
+                     int64_t groups, int64_t kbase)
         {
             const int64_t NKV = nkv;
             const int64_t nq = nqs;
@@ -1060,11 +1060,14 @@ namespace muse::gpu
                         auto sg = it.get_sub_group();
                         const int lane = int(sg.get_local_id()[0]);
                         const int64_t g = (head0 + hh) / groups, qpos = pos0 + i;
+                        // The context is truncated to the drafter's window, so
+                        // a key ROW is no longer its absolute position: row j
+                        // sits at kbase + j.
                         int64_t lo = 0, hi = S - 1;
                         if (window > 0)
                         {
-                            lo = sycl::max<int64_t>(0, qpos - window);
-                            hi = sycl::min<int64_t>(S - 1, qpos + window);
+                            lo = sycl::max<int64_t>(0, qpos - window - kbase);
+                            hi = sycl::min<int64_t>(S - 1, qpos + window - kbase);
                         }
                         const float *qv = Q + (i * nq + hh) * D;
                         float *row = sc + gid * S;
@@ -1414,11 +1417,28 @@ namespace muse::gpu
         // reference kernel: 435 ms per drafting round against a 0.4 ms
         // bandwidth budget, 98% of the drafter's cost.
         void k_pack2d_at(sycl::queue &q, const float *src, uint16_t *dst, int64_t dim, int64_t n,
-                         int64_t ld, int64_t off)
+                         int64_t ld, int64_t off, int64_t cap)
         {
             q.parallel_for(sycl::range<2>(size_t(dim), size_t(n)), [=](sycl::id<2> id) {
                 const int64_t i = int64_t(id[0]), t = int64_t(id[1]);
-                dst[(off + t) * dim + i] = f2bf(src[i * ld + t]);
+                dst[((off + t) % cap) * dim + i] = f2bf(src[i * ld + t]);
+            });
+        }
+
+        // Gather this shard's column slice of `W` tap rows out of the ring,
+        // into a contiguous [W, Hs] buffer.
+        //
+        // The gather is what keeps the context projection a single clean GEMM.
+        // Reading the ring directly would mean splitting every round's range at
+        // the wrap point into runs whose lengths change every round -- and
+        // oneDNN JITs per shape, so that trades the memory back for JIT churn.
+        // Copying 27 MB once per tap is cheaper than either.
+        void k_gather_ring(sycl::queue &q, const uint16_t *src, uint16_t *dst, int64_t W,
+                           int64_t Hs, int64_t H, int64_t col0, int64_t cap, int64_t base)
+        {
+            q.parallel_for(sycl::range<2>(size_t(W), size_t(Hs)), [=](sycl::id<2> id) {
+                const int64_t t = int64_t(id[0]), i = int64_t(id[1]);
+                dst[t * Hs + i] = src[((base + t) % cap) * H + col0 + i];
             });
         }
 
@@ -1598,6 +1618,15 @@ namespace muse::gpu
                 if (const char *e = getenv("MUSE_GPU_Q8_BLOCKDOT"); e && *e && *e != '0')
                     q8_blockdot_ = true;
                 tap_layers_ = opt.tap_layers;
+                // The drafter's attention is sliding-window, so it never reads
+                // taps further back than `tap_window`. Holding them in a
+                // window+chunk ring -- exactly what the KV cache already does --
+                // makes the drafter's context cost CONSTANT instead of
+                // 5*max_seq*H*2 bytes per shard, which was what capped context
+                // at ~8K with a BF16 drafter.
+                tap_cap_ = opt.tap_window > 0
+                               ? std::min(opt.tap_window + block_, opt.max_seq)
+                               : opt.max_seq;
                 spec_block_ = std::max<int64_t>(1, opt.spec_block);
                 fbq_ = std::min<int64_t>(512, std::max<int64_t>(1, block_));
                 fbk_ = 512;
@@ -1967,8 +1996,19 @@ namespace muse::gpu
                     d.pack = dalloc<uint16_t>(i, size_t(std::max({H, QDs, Is, KD})));
                     if (q8_ || q8_asst_)
                     {
-                        // widest sharded weight, expanded to bf16 for prefill
-                        deq_cap_ = std::max({Is * H, H * Is, QDs * H, H * QDs, Vs * H});
+                        // Widest sharded weight that will actually be expanded,
+                        // which depends on WHICH tier is quantized. The vocab
+                        // head is far the largest (Vs*H = 1.34 GB of scratch),
+                        // and a Q8 drafter never expands it -- it heads through
+                        // the TARGET's lm_head, which is bf16 unless the target
+                        // is quantized too. Sizing for it unconditionally cost
+                        // 1.2 GB per card for nothing.
+                        int64_t cap = 0;
+                        if (q8_)
+                            cap = std::max({Is * H, H * Is, QDs * H, H * QDs, Vs * H});
+                        if (q8_asst_)
+                            cap = std::max(cap, std::max({Is * H, H * Is, QDs * H, H * QDs}));
+                        deq_cap_ = cap;
                         d.deq = dalloc<uint16_t>(i, size_t(deq_cap_));
                     }
                     d.xfer = dalloc<float>(i, size_t(B * H));
@@ -1979,7 +2019,7 @@ namespace muse::gpu
                     for (size_t k = 0; k < tap_layers_.size(); ++k)
                         // the drafter reads the taps for the WHOLE context, so
                         // they are sized to max_seq and filled as blocks go by
-                        d.taps[k] = dalloc<uint16_t>(i, size_t(max_seq_ * H));
+                        d.taps[k] = dalloc<uint16_t>(i, size_t(tap_cap_ * H));
                     d.peer = dalloc<float>(i, size_t(ns * B * H));
                     if (flash_prefill_)
                     {
@@ -2110,7 +2150,16 @@ namespace muse::gpu
             make_prim(Dev &d, const std::array<int64_t, 5> &key, const dnnl::memory::desc &a_md,
                       const dnnl::memory::desc &b_md, const dnnl::memory::desc &c_md)
             {
-                dnnl::matmul::primitive_desc pd(d.eng, a_md, b_md, c_md);
+                // Without this oneDNN is free to use atomic split-K reductions,
+                // whose summation order varies between runs. The target's
+                // shapes happened not to, but the drafter's did: speculative
+                // decoding diverged run to run (accepted-per-round differing
+                // from round 10 on) with everything else identical. Determinism
+                // is a stated contract here, so it is set on every primitive
+                // rather than relied upon per shape.
+                dnnl::primitive_attr attr;
+                attr.set_deterministic(true);
+                dnnl::matmul::primitive_desc pd(d.eng, a_md, b_md, c_md, attr);
                 Dev::Prim p{dnnl::matmul(pd), dnnl::memory(a_md, d.eng, nullptr),
                             dnnl::memory(b_md, d.eng, nullptr),
                             dnnl::memory(c_md, d.eng, nullptr), {}};
@@ -2256,6 +2305,7 @@ namespace muse::gpu
                 if (it == bprims_[size_t(sh)].end())
                 {
                     dnnl::primitive_attr attr;
+                    attr.set_deterministic(true); // see make_prim
                     if (accumulate)
                     {
                         // C = C + A*B, so the second GEMM folds each key tile
@@ -2960,7 +3010,7 @@ namespace muse::gpu
                     c32[i] = float(rt.cos[i]);
                     s32[i] = float(rt.sin[i]);
                 }
-                const int64_t B = dc.block_size, S = max_seq_ + B;
+                const int64_t B = dc.block_size, S = tap_cap_ + B;
                 drope_cos_.assign(size_t(ns), nullptr);
                 drope_sin_.assign(size_t(ns), nullptr);
                 dbuf_.assign(size_t(ns), {});
@@ -2974,8 +3024,9 @@ namespace muse::gpu
                     shards_[size_t(sh)].q.memcpy(drope_sin_[size_t(sh)], s32.data(),
                                                  s32.size() * 4);
                     DBuf &b = dbuf_[size_t(sh)];
-                    b.ctx = dalloc<float>(d, size_t(max_seq_ * H));
-                    b.ctxb = dalloc<uint16_t>(d, size_t(max_seq_ * H));
+                    b.ctx = dalloc<float>(d, size_t((tap_cap_ + B) * H));
+                    b.ctxb = dalloc<uint16_t>(d, size_t((tap_cap_ + B) * H));
+                    b.tapbuf = dalloc<uint16_t>(d, size_t((tap_cap_ + B) * (H / ns)));
                     b.h = dalloc<float>(d, size_t(B * H));
                     b.xn = dalloc<float>(d, size_t(B * H));
                     b.kvin = dalloc<uint16_t>(d, size_t(S * H));
@@ -3008,41 +3059,55 @@ namespace muse::gpu
                 const int64_t ns = nshard_, H = dc.hidden_size, I = dc.intermediate_size;
                 const int64_t D = dc.head_dim, nq = dc.num_attention_heads;
                 const int64_t nkv = dc.num_key_value_heads, KD = dc.kv_dim();
-                const int64_t B = dc.block_size, S = n + B, V = tc.vocab_size;
+                const int64_t B = dc.block_size, V = tc.vocab_size;
                 const int64_t QDs = dc.q_dim() / ns, Is = I / ns, Hs = H / ns, Vs = V / ns;
                 const int64_t nqs = nq / ns, taps = int64_t(dc.target_layer_ids.size());
                 const float scaling = float(1.0 / std::sqrt(double(D)));
                 if (dlayers_.empty())
                     die("draft() before bind_drafter()");
-                // bucketed row counts, so oneDNN sees a handful of shapes
-                // instead of one per round
-                const int64_t nb = row_bucket(n, max_seq_);
-                const int64_t Sb = row_bucket(S, max_seq_ + B);
+
 
                 dtA_ = std::chrono::steady_clock::now();
-                // ---- context: ctx[n,H] = sum_k tap_k[n,H] . Wk^T, each shard
+                // Only the last `window` context positions can be attended:
+                // the mask is |q_pos - kv_pos| <= sliding_window and the block
+                // sits at pos0 == n, so anything older than n - window
+                // contributes exactly zero. Truncating to that is
+                // arithmetically identical to the reference, and it is what
+                // lets the taps live in a fixed ring.
+                const int64_t W =
+                    dc.sliding_window > 0 ? std::min<int64_t>(n, dc.sliding_window) : n;
+                const int64_t kbase = n - W;
+                const int64_t S = W + B;
+                const int64_t Wb = std::min(row_bucket(W, tap_cap_), tap_cap_);
+                const int64_t Sb = std::min(row_bucket(S, tap_cap_ + B), tap_cap_ + B);
+
+                // ---- context: ctx[W,H] = sum_k tap_k[W,H] . Wk^T, each shard
                 //      owning a slice of the input, then one all-reduce.
                 for (int64_t sh = 0; sh < ns; ++sh)
                 {
                     Dev &d = shards_[size_t(sh)];
                     DBuf &b = dbuf_[size_t(sh)];
                     for (int64_t k = 0; k < taps; ++k)
-                        // taps are [max_seq, H] row-major bf16; this shard owns
-                        // the column range [sh*Hs, (sh+1)*Hs) of them
-                        bmm(int(sh), d.taps[size_t(k)] + sh * Hs, dnnl::memory::data_type::bf16,
-                            {1, nb, Hs}, {nb * H, H, 1}, enc_[size_t(sh)][size_t(k)],
+                    {
+                        // gather this shard's column slice of the window out of
+                        // the tap ring, then one clean GEMM over it
+                        k_gather_ring(d.q, d.taps[size_t(k)], b.tapbuf, Wb, Hs, H, sh * Hs,
+                                      tap_cap_, kbase);
+                        bmm(int(sh), b.tapbuf, dnnl::memory::data_type::bf16, {1, Wb, Hs},
+                            {Wb * Hs, Hs, 1}, enc_[size_t(sh)][size_t(k)],
                             dnnl::memory::data_type::bf16, {1, Hs, H}, {Hs * H, 1, Hs}, b.ctx,
-                            {1, nb, H}, {nb * H, H, 1}, k > 0);
+                            {1, Wb, H}, {Wb * H, H, 1}, k > 0);
+                    }
                 }
                 for (auto &sh_ : shards_) sh_.q.wait();
                 dt_ctx_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - dtA_).count();
                 dtA_ = std::chrono::steady_clock::now();
-                all_reduce_buf(n * H, [&](int sh) { return dbuf_[size_t(sh)].ctx; });
+                all_reduce_buf(W * H, [&](int sh) { return dbuf_[size_t(sh)].ctx; });
                 for (int64_t sh = 0; sh < ns; ++sh)
                 {
                     Dev &d = shards_[size_t(sh)];
                     DBuf &b = dbuf_[size_t(sh)];
-                    k_dnorm(d.q, b.ctx, enc_norm_[size_t(sh)], b.ctx, n, H, H, H,
+                    k_dnorm(d.q, b.ctx, enc_norm_[size_t(sh)], b.ctx, W, H, H, H,
                             dc.rms_norm_eps);
                     // the block: [anchor, MASK x (B-1)], embedded with the
                     // target's RAW table (not the normed-embedding forward)
@@ -3067,8 +3132,8 @@ namespace muse::gpu
                         // k/v see [projected context ++ normed block]; q sees
                         // the block only, and the context does NOT go through
                         // input_layernorm
-                        k_round(d.q, b.ctx, b.kvin, n * H);
-                        k_round(d.q, b.xn, b.kvin + n * H, B * H);
+                        k_round(d.q, b.ctx, b.kvin, W * H);
+                        k_round(d.q, b.xn, b.kvin + W * H, B * H);
                         k_round(d.q, b.xn, b.ctxb, B * H); // q input
                         gemm_rm(int(sh), l.q[size_t(sh)], b.ctxb, b.Q, B, H, QDs);
                         gemm_rm(int(sh), l.k[size_t(sh)], b.kvin, b.K, Sb, H, KD);
@@ -3079,10 +3144,11 @@ namespace muse::gpu
                                 dc.rms_norm_eps);
                         k_drope(d.q, b.Q, B, nqs, D, drope_cos_[size_t(sh)],
                                 drope_sin_[size_t(sh)], pos0);
+                        // key row j is at absolute position kbase + j
                         k_drope(d.q, b.K, S, nkv, D, drope_cos_[size_t(sh)],
-                                drope_sin_[size_t(sh)], 0);
+                                drope_sin_[size_t(sh)], kbase);
                         k_dattn(d.q, b.Q, b.K, b.V, b.O, b.sc, B, S, nqs, nkv, D, pos0, window,
-                                scaling, sh * nqs, nq / nkv);
+                                scaling, sh * nqs, nq / nkv, kbase);
                         k_round(d.q, b.O, b.Ob, B * QDs);
                         gemm_rm(int(sh), l.o[size_t(sh)], b.Ob, b.mix, B, QDs, H);
                     }
@@ -3355,7 +3421,7 @@ namespace muse::gpu
                             for (int64_t sh = 0; sh < ns; ++sh)
                             {
                                 Dev &d = shards_[size_t(sh)];
-                                k_pack2d_at(d.q, d.h, d.taps[k], H, n, B, pos0);
+                                k_pack2d_at(d.q, d.h, d.taps[k], H, n, B, pos0, tap_cap_);
                             }
                     if (trace_dir_)
                     {
@@ -3657,6 +3723,7 @@ namespace muse::gpu
             bool tiled_attn_ = true;
             bool flash_decode_ = false;
             int64_t fd_splits_ = 32, fd_min_ctx_ = 1024, nq_ = 1;
+            int64_t tap_cap_ = 0;
             bool flash_prefill_ = false;
             // ---- DFlash drafter state (empty until bind_drafter) ----
             dflash::Config dcfg_;
@@ -3679,7 +3746,7 @@ namespace muse::gpu
                 float *V = nullptr, *O = nullptr, *mix = nullptr, *G = nullptr, *U = nullptr;
                 float *sc = nullptr, *logits = nullptr;
                 uint16_t *ctxb = nullptr, *kvin = nullptr, *Qb = nullptr, *Ob = nullptr,
-                         *Gb = nullptr;
+                         *Gb = nullptr, *tapbuf = nullptr;
             };
             std::vector<DBuf> dbuf_;
             // ---- vision tower state (empty until bind_vision) ----

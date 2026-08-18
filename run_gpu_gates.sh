@@ -269,6 +269,18 @@ if [[ -n "$SREF" && "$SREF" == "$SGPU" ]]; then
 else
     fail "spec sequence differs: oracle '$SREF' vs gpu '$SGPU'"
 fi
+# Determinism of the LOOP, not just of a forward. oneDNN will use atomic
+# split-K reductions unless told not to, and the drafter's shapes did: the
+# accepted-per-round pattern differed between runs with everything else
+# identical, which a single-forward determinism gate cannot see.
+SG2=$($GPU --model "$MODEL" --ids "$IDS" --out "$OUT/spg2" --max-seq 256 --shards 1 --gpus 1 \
+    --chunk 16 --assistant "$TINY/tiny_dflash" --draft-rounds 4 2>/dev/null \
+    | grep '^spec accepted' )
+SG3=$($GPU --model "$MODEL" --ids "$IDS" --out "$OUT/spg3" --max-seq 256 --shards 1 --gpus 1 \
+    --chunk 16 --assistant "$TINY/tiny_dflash" --draft-rounds 4 2>/dev/null \
+    | grep '^spec accepted' )
+[[ -n "$SG2" && "$SG2" == "$SG3" ]] && pass "spec loop rerun deterministic" \
+                                    || fail "spec loop is not deterministic"
 
 echo "== Q8_0 weight tier =="
 # A SEPARATE ACCURACY TIER, not the bf16 band: 8-bit weights are ~3x wider than

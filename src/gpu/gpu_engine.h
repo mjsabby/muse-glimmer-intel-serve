@@ -95,6 +95,9 @@ namespace muse::gpu
         // The drafter's block_size, needed before create(): it sizes the
         // all-row logits buffer that speculative verification writes into.
         int64_t spec_block = 1;
+        // The drafter sliding_window, so the tap ring can be sized before
+        // create(). 0 means no drafter.
+        int64_t tap_window = 0;
     };
 
     // Result of a speculative run.

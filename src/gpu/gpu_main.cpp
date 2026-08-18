@@ -215,6 +215,7 @@ int main(int argc, char **argv)
         {
             opt.tap_layers = acfg.target_layer_ids;
             opt.spec_block = acfg.block_size;
+            opt.tap_window = acfg.sliding_window;
         }
         opt.shards = shards;
         opt.block = chunk;
