@@ -70,6 +70,11 @@ namespace
                      "  --vision gpu|cpu   where to run the tower. cpu keeps ~1.9 GiB/card of\n"
                      "                     tower weights out of VRAM (it is bitwise-gated there)\n"
                      "  --seal N           0 off, 1 log, 2 refuse post-load allocations\n"
+                     "  --no-prewarm       skip the startup prewarm (diagnosis only: it is\n"
+                     "                     what makes --seal a guarantee rather than a hope)\n"
+                     "  --seal-probe       after prewarm+seal, sweep prompt lengths and decode\n"
+                     "                     depths in ONE process and report free-VRAM drift.\n"
+                     "                     Exits non-zero if the footprint moved at all\n"
                      "  --q8-assistant     Q8_0 for the drafter only (BF16 target + Q8 drafter)\n"
                      "  --q8               Q8_0 weight tier: half the weight VRAM, a separate\n"
                      "                     accuracy tier (gated vs the oracle, not the twin)\n"
@@ -88,6 +93,7 @@ int main(int argc, char **argv)
     std::string vision_on = "gpu";
     bool q8 = false, q8_assistant = false;
     int seal = 2;
+    bool prewarm = true, seal_probe = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -146,6 +152,10 @@ int main(int argc, char **argv)
             vision_on = next();
         else if (a == "--seal")
             seal = std::stoi(next());
+        else if (a == "--no-prewarm")
+            prewarm = false;
+        else if (a == "--seal-probe")
+            seal_probe = true;
         else if (a == "--q8")
             q8 = true;
         else if (a == "--q8-assistant")
@@ -190,7 +200,11 @@ int main(int argc, char **argv)
         const int64_t T = int64_t(ids.size());
         if (max_seq <= 0)
             max_seq = T + decode_n + 64;
-        chunk = std::min(chunk, std::max<int64_t>(1, T));
+        // NOTE: the chunk is NOT clamped to this prompt's length. It sizes
+        // the activation scratch and it is what prewarm warms, so clamping it
+        // to whatever the first request happens to be would make the startup
+        // guarantee describe a different engine from the one that then serves.
+        chunk = std::max<int64_t>(1, chunk);
 
         // --assistant taps the target's hidden states at the drafter's
         // target_layer_ids on the way through, so the drafter has to be parsed
@@ -314,10 +328,103 @@ int main(int argc, char **argv)
             eng->set_vision_embeds(feats, at);
         }
 
-        // everything that will ever be allocated has been by now
+        // Drive every shape a request can produce while we are still
+        // starting up, so the libraries' lazy allocations happen HERE, and
+        // then refuse the rest. After this line a memory failure is a startup
+        // failure, which is the only kind that is anyone's to act on.
+        if (prewarm)
+            eng->prewarm();
         eng->seal_allocs(seal);
 
         std::vector<float> lg(size_t(cfg.vocab_size), 0.f);
+
+        // ---- the seal probe: does the sealed engine's footprint actually
+        //      hold across the shapes a served workload produces?
+        //
+        // prewarm() claims it warmed every shape; --seal 2 turns a violation
+        // into an abort. Neither statement is worth much untested, and the
+        // test has to happen INSIDE one process — a fresh process reloads 55
+        // GiB and re-warms everything, which is precisely what it would need
+        // to not do to prove anything.
+        if (seal_probe)
+        {
+            // Lengths chosen to straddle every width bucket boundary, since
+            // that is what forward_block rounds on: one below, one on, one
+            // above, plus the degenerate single token.
+            std::vector<int64_t> lens = {1, 2, 3, 7, 63, 64, 65, 127, 128, 129, 255, 257, 511, 512, 513};
+            int64_t worst = 0;
+            // Two passes. The first one absorbs a fixed, one-time lump the
+            // Level-Zero runtime takes on its own account the first time this
+            // mix of kernels runs (measured at 320 KiB here, and identical
+            // whether the prompt is 3 tokens or 129, which is what says it is
+            // not per-shape growth). The second pass is the claim being
+            // gated: a served engine's footprint does not move.
+            std::vector<int64_t> before, mid;
+            int64_t first_touch = 0;
+            for (int pass = 0; pass < 2; ++pass)
+            {
+            if (pass == 0)
+                before = eng->free_mem();
+            else
+                mid = eng->free_mem();
+            for (int64_t L : lens)
+            {
+                if (L > max_seq - 4)
+                    continue;
+                std::vector<int64_t> p(static_cast<size_t>(L));
+                for (int64_t i = 0; i < L; ++i)
+                    p[size_t(i)] = ids[size_t(i % ids.size())];
+                eng->reset_cache();
+                eng->prefill(p, lg.data());
+                for (int k = 0; k < 3; ++k)
+                    eng->decode_step(int64_t(std::max_element(lg.begin(), lg.end()) - lg.begin()),
+                                     lg.data());
+                if (!assistant.empty())
+                    eng->draft(eng->cache_len(),
+                               int64_t(std::max_element(lg.begin(), lg.end()) - lg.begin()),
+                               eng->cache_len());
+                if (getenv("MUSE_SEAL_PROBE_TRACE"))
+                {
+                    const auto f = eng->free_mem();
+                    std::fprintf(stderr, "[seal-probe] pass %d len %5lld: %lld\n", pass,
+                                 (long long)L, (long long)((pass ? mid[0] : before[0]) - f[0]));
+                }
+            }
+            }
+            const auto after = eng->free_mem();
+            for (size_t i = 0; i < after.size() && i < mid.size(); ++i)
+            {
+                const int64_t d = mid[i] - after[i];
+                std::fprintf(stderr, "[seal-probe] card %zu: %lld bytes drift (steady state), "
+                                     "%lld first-touch\n",
+                             i, (long long)d, (long long)(before[i] - mid[i]));
+                worst = std::max(worst, d < 0 ? -d : d);
+                first_touch = std::max(first_touch, before[i] - mid[i]);
+            }
+            eng->reset_cache();
+            // A fixed one-time lump is the runtime's; anything at the scale of
+            // a shape-dependent workspace is ours and is a bug.
+            if (first_touch > 4 * 1024 * 1024)
+            {
+                std::fprintf(stderr, "[seal-probe] FAIL: %lld bytes of first-touch growth is "
+                                     "too large to be the runtime's own\n",
+                             (long long)first_touch);
+                return 3;
+            }
+            if (before.empty() || before[0] == 0)
+                std::fprintf(stderr,
+                             "[seal-probe] free memory unavailable; set ZES_ENABLE_SYSMAN=1 "
+                             "for the drift half of this check\n");
+            else if (worst != 0)
+            {
+                std::fprintf(stderr, "[seal-probe] FAIL: footprint moved by %lld bytes\n",
+                             (long long)worst);
+                return 3;
+            }
+            std::fprintf(stderr, "[seal-probe] %zu prompt lengths, %s\n", lens.size(),
+                         "no post-seal allocation and no VRAM drift");
+        }
+
         eng->prefill(ids, lg.data());
 
         muse::gpu::SpecResult sp;
@@ -372,6 +479,16 @@ int main(int argc, char **argv)
 
         std::fprintf(stderr, "exec gpu:\n");
         eng->report_profile(stderr);
+        // Post-run free VRAM, so a run can be compared against the
+        // post-prewarm line above: any drift is a library allocating behind
+        // the seal, which is the one failure mode the seal cannot see.
+        {
+            const auto fm = eng->free_mem();
+            for (size_t i = 0; i < fm.size(); ++i)
+                if (fm[i] > 0)
+                    std::fprintf(stderr, "  card %zu free %.3f GiB (after the run)\n", i,
+                                 double(fm[i]) / 1073741824.0);
+        }
 
         std::filesystem::create_directories(out_dir);
         std::vector<double> lgd(size_t(cfg.vocab_size));

@@ -47,6 +47,7 @@
 #include <cstring>
 #include <map>
 #include <unordered_map>
+#include <execinfo.h> // backtrace() for the post-load allocation seal
 #include <stdexcept>
 
 namespace muse::gpu
@@ -1859,6 +1860,19 @@ namespace muse::gpu
                 spec_block_ = std::max<int64_t>(1, opt.spec_block);
                 fbq_ = std::min<int64_t>(512, std::max<int64_t>(1, block_));
                 fbk_ = 512;
+                if (flash_prefill_ && block_ > fbq_)
+                {
+                    // Round the chunk to a whole number of query tiles. A
+                    // ragged last tile at an offset no full-width block ever
+                    // visits would be a shape prewarm cannot know to warm,
+                    // which is the one thing this tier must not have.
+                    const int64_t was = block_;
+                    block_ = ((block_ + fbq_ - 1) / fbq_) * fbq_;
+                    if (was != block_ && opt.verbose)
+                        std::fprintf(stderr, "[gpu] --flash-prefill: chunk %lld -> %lld "
+                                             "(a whole number of %lld-row query tiles)\n",
+                                     (long long)was, (long long)block_, (long long)fbq_);
+                }
                 if (flash_prefill_)
                 {
                     const int64_t nqs = c.num_attention_heads / nshard_;
@@ -1967,6 +1981,170 @@ namespace muse::gpu
 
             int64_t cache_len() const override { return len_; }
             void reset_cache() override { len_ = 0; }
+
+            // ------------------------------------------------------- prewarm
+            //
+            // Everything this engine allocates, it allocates at load: the
+            // weights, the KV rings, and one fixed-size scratch set per shard.
+            // What is NOT allocated at load is everything the *libraries*
+            // create lazily — an oneDNN primitive per distinct matmul shape,
+            // its kernel binary, its workspace — and those are invisible to
+            // dalloc()'s seal because they come out of oneDNN's own allocator.
+            //
+            // So the seal alone is not the guarantee; the seal plus this is.
+            // prewarm() drives every shape a served request can produce, at
+            // the deepest position the engine was built for, and it does it
+            // while the process is still starting up. A configuration that
+            // cannot serve fails here.
+            //
+            // Cost is one full-depth forward per width bucket plus a decode;
+            // at 131072 context that is a few seconds, paid once.
+            void prewarm() override
+            {
+                const Config &c = *cfg_;
+                const int64_t V = c.vocab_size, KD = c.kv_dim();
+                const int64_t saved_len = len_;
+
+                // The forwards below attend over KV rows nothing has written.
+                // Uninitialized VRAM is not guaranteed finite, and a NaN
+                // propagating out of the first softmax would make every
+                // downstream timing and any post-prewarm probe meaningless.
+                for (const auto &l : layers_)
+                    for (int i = 0; i < nshard_; ++i)
+                    {
+                        shards_[size_t(i)].q.memset(l.kc[size_t(i)], 0,
+                                                    size_t(l.cap * KD) * 2);
+                        shards_[size_t(i)].q.memset(l.vc[size_t(i)], 0,
+                                                    size_t(l.cap * KD) * 2);
+                    }
+                for (auto &d : shards_)
+                    d.q.wait();
+
+                std::vector<float> sink(size_t(V) * size_t(std::max<int64_t>(1, spec_block_)));
+                const auto t0 = std::chrono::steady_clock::now();
+
+                // Every prefill width a tail chunk can land in. forward_block
+                // rounds its GEMMs up to these, so this list is exhaustive
+                // rather than representative.
+                std::vector<int64_t> widths;
+                for (int64_t b = 64; b < block_; b <<= 1)
+                    widths.push_back(b);
+                widths.push_back(block_);
+
+                for (int64_t w : widths)
+                {
+                    std::vector<int64_t> ids(size_t(w), 0);
+                    // Deepest position first: the attention tiers size their
+                    // per-tile matmuls from the context length, so the widest
+                    // key tile only appears at depth.
+                    const int64_t pos = std::max<int64_t>(0, max_seq_ - w);
+                    len_ = pos;
+                    forward_block(ids.data(), pos, w, sink.data());
+                }
+                // ...and the shallow end: at pos0 == 0 the key runs are
+                // shorter than a full tile, which is a different primitive
+                // from every one warmed above. This is the first chunk of
+                // every request.
+                {
+                    std::vector<int64_t> ids(size_t(block_), 0);
+                    len_ = 0;
+                    forward_block(ids.data(), 0, block_, sink.data());
+                }
+
+                // Decode: n == 1 collapses the leading dimension to 1 and
+                // takes the GEMV tier and the split-K attention, so it shares
+                // no shape at all with the above.
+                {
+                    int64_t one = 0;
+                    len_ = std::max<int64_t>(0, max_seq_ - 1);
+                    forward_block(&one, len_, 1, sink.data());
+                }
+
+                if (!dlayers_.empty())
+                {
+                    // The drafter buckets its own context width; warm each
+                    // bucket, plus the verification pass over a full block.
+                    const int64_t cap = tap_cap_;
+                    for (int64_t w = 64; w <= cap; w <<= 1)
+                        draft(std::min(w, cap), 0, std::min(w, cap));
+                    if (cap > 0 && (cap & (cap - 1)) != 0)
+                        draft(cap, 0, cap); // non-power-of-two ring capacity
+                    std::vector<int64_t> blk(size_t(spec_block_), 0);
+                    len_ = std::max<int64_t>(0, max_seq_ - spec_block_);
+                    forward_block(blk.data(), len_, spec_block_, nullptr, sink.data());
+                }
+
+                if (vmaxn_ > 0)
+                {
+                    // A square-ish grid at the bound patch count: the tower's
+                    // window segmentation and its merge shapes both scale with
+                    // it, and the projector's is the widest matmul in the
+                    // tower.
+                    const int64_t mu = vcfg_.merge_size;
+                    int64_t h = std::max<int64_t>(mu, int64_t(std::sqrt(double(vmaxn_))));
+                    h -= h % mu;
+                    int64_t w = (h > 0) ? (vmaxn_ / h) : mu;
+                    w -= w % mu;
+                    if (h > 0 && w > 0)
+                    {
+                        std::vector<double> px(size_t(h * w) *
+                                               size_t(vcfg_.patch_dim()), 0.0);
+                        vision_features(px.data(), {{1, h, w}});
+                    }
+                }
+
+                len_ = saved_len;
+                reset_cache();
+                for (const auto &l : layers_)
+                    for (int i = 0; i < nshard_; ++i)
+                    {
+                        shards_[size_t(i)].q.memset(l.kc[size_t(i)], 0,
+                                                    size_t(l.cap * KD) * 2);
+                        shards_[size_t(i)].q.memset(l.vc[size_t(i)], 0,
+                                                    size_t(l.cap * KD) * 2);
+                    }
+                for (auto &d : shards_)
+                    d.q.wait();
+                // prewarm's own forwards are not the user's tokens
+                tim_ = Timings{tim_.upload_s, 0, 0, 0, 0};
+                if (opt_.verbose)
+                {
+                    std::fprintf(stderr, "[gpu] prewarm %.2f s (widths",
+                                 std::chrono::duration<double>(
+                                     std::chrono::steady_clock::now() - t0).count());
+                    for (int64_t w : widths)
+                        std::fprintf(stderr, " %lld", (long long)w);
+                    std::fprintf(stderr, " + decode, depth %lld)\n", (long long)max_seq_);
+                    const auto fm = free_mem();
+                    for (size_t i = 0; i < fm.size(); ++i)
+                        if (fm[i] > 0)
+                            std::fprintf(stderr, "[gpu] card %zu: %.2f GiB free after prewarm\n",
+                                         i, double(fm[i]) / 1073741824.0);
+                        else
+                            std::fprintf(stderr, "[gpu] card %zu: free memory unavailable "
+                                                 "(set ZES_ENABLE_SYSMAN=1)\n", i);
+                }
+            }
+
+            std::vector<int64_t> free_mem() const override
+            {
+                std::vector<int64_t> out(size_t(ngpu_), 0);
+                for (int g = 0; g < ngpu_; ++g)
+                {
+                    try
+                    {
+                        out[size_t(g)] = int64_t(
+                            used_[size_t(g)]
+                                .get_info<sycl::ext::intel::info::device::free_memory>());
+                    }
+                    catch (...)
+                    {
+                        // no SYSMAN in the environment; 0 means "unknown", and
+                        // callers print that rather than a fabricated number
+                    }
+                }
+                return out;
+            }
             const Timings &timings() const override { return tim_; }
 
             void report_profile(std::FILE *f) const override
@@ -2014,6 +2192,7 @@ namespace muse::gpu
             void seal_allocs(int mode) override
             {
                 sealed_ = mode;
+                post_seal_bytes_ = 0;
                 if (opt_.verbose && mode)
                     std::fprintf(stderr, "[gpu] allocations sealed (mode %d) at %.2f GiB\n", mode,
                                  double(wbytes_ + kvbytes_) / 1073741824.0);
@@ -2024,12 +2203,34 @@ namespace muse::gpu
                 auto &d = shards_[size_t(dev)];
                 if (sealed_)
                 {
+                    post_seal_bytes_ += int64_t(count * sizeof(T));
                     const std::string msg =
                         "allocation of " + std::to_string(count * sizeof(T) / 1048576) +
                         " MiB on shard " + std::to_string(dev) + " AFTER the load seal";
+                    // A byte count alone does not tell you which surface grew,
+                    // and by the time it is reported the call stack is gone.
+                    // Printing it here is the difference between "something
+                    // allocates" and a one-line fix.
+                    void *bt[16];
+                    const int nbt = backtrace(bt, 16);
+                    char **sym = backtrace_symbols(bt, nbt);
                     if (sealed_ >= 2)
+                    {
+                        if (sym)
+                        {
+                            for (int i = 1; i < nbt; ++i)
+                                std::fprintf(stderr, "[seal]     %s\n", sym[i]);
+                            free(sym);
+                        }
                         die(msg + " (mode 2: refusing — this would be a mid-request OOM)");
+                    }
                     std::fprintf(stderr, "[seal] %s\n", msg.c_str());
+                    if (sym)
+                    {
+                        for (int i = 1; i < nbt && i < 6; ++i)
+                            std::fprintf(stderr, "[seal]     %s\n", sym[i]);
+                        free(sym);
+                    }
                 }
                 T *p = sycl::malloc_device<T>(count, d.q);
                 if (!p)
@@ -2185,6 +2386,14 @@ namespace muse::gpu
                     GpuLayer &g = layers_[size_t(li)];
                     g.cap = c.layer_is_sliding(li) ? std::min(c.sliding_window + block_, max_seq_)
                                                    : max_seq_;
+                    // --flash-prefill reads keys a whole FBK tile at a time
+                    // from an FBK-aligned slot; that is only in bounds, and
+                    // only free of the ring's wrap point, if the ring holds a
+                    // whole number of tiles. Costs at most FBK-1 rows per
+                    // layer (~27 MiB across the 30B's 52 layers) and buys a
+                    // fixed matmul shape for the whole tier.
+                    if (flash_prefill_)
+                        g.cap = ((g.cap + fbk_ - 1) / fbk_) * fbk_;
                     for (auto *arr : {&g.input_ln, &g.post_attn_ln, &g.pre_ff_ln, &g.post_ff_ln,
                                       &g.kc, &g.vc})
                         arr->assign(size_t(ns), nullptr);
@@ -2313,6 +2522,15 @@ namespace muse::gpu
                         d.fm = dalloc<float>(i, size_t(nqs * fbq_));
                         d.fl = dalloc<float>(i, size_t(nqs * fbq_));
                     }
+                    // The GEMM width is bucketed up (see forward_block's NG),
+                    // so a block narrower than its bucket feeds the pad
+                    // columns of these three to the matrix engines. Their
+                    // outputs are never read, but uninitialized VRAM is not
+                    // guaranteed to hold finite bf16, and there is no reason
+                    // to hand the hardware a page of NaNs on the first block.
+                    d.q.memset(d.xb, 0, size_t(B * H) * 2);
+                    d.q.memset(d.ob, 0, size_t(B * QDs) * 2);
+                    d.q.memset(d.g1b, 0, size_t(B * Is) * 2);
                     d.rope_cos = dalloc<float>(i, cos32.size());
                     d.rope_sin = dalloc<float>(i, sin32.size());
                     d.q.memcpy(d.rope_cos, cos32.data(), cos32.size() * 4);
@@ -2641,6 +2859,16 @@ namespace muse::gpu
                 for (int64_t t0 = 0; t0 < n; t0 += FBQ)
                 {
                     const int64_t rows = std::min(FBQ, n - t0);
+                    // Query rows are rounded up to a bucket and key runs are
+                    // always a full aligned tile, so this tier asks oneDNN for
+                    // a SMALL FIXED SET of matmul shapes instead of one per
+                    // (prompt length, position) pair. Both paddings are
+                    // arithmetically inert — a padded query row carries its own
+                    // independent softmax and is never read back, and a padded
+                    // key is masked to -inf, so its P entry is exactly 0 and
+                    // its V row contributes nothing — and both are what let
+                    // prewarm() claim to have warmed this tier.
+                    const int64_t rowsb = std::min(row_bucket(rows, FBQ), ld - t0);
                     const int64_t qhi = pos0 + t0 + rows - 1;
                     const int64_t klo =
                         window > 0 ? std::max<int64_t>(0, pos0 + t0 - window + 1) : 0;
@@ -2649,30 +2877,28 @@ namespace muse::gpu
                     k_fill(d.q, d.fl, nqs * FBQ, 0.f);
                     k_fill(d.q, d.foacc, nqs * FBQ * D, 0.f);
 
-                    int64_t j = klo;
-                    while (j <= qhi)
+                    // Aligned tiles: `cap` is rounded to a multiple of FBK at
+                    // allocation, so an aligned slot plus FBK never crosses the
+                    // ring's wrap point and the GEMM's strides stay honest.
+                    for (int64_t j = klo - (klo % FBK); j <= qhi; j += FBK)
                     {
-                        // A run must not cross the ring's wrap point, or the
-                        // keys stop being contiguous and the GEMM's strides lie.
                         const int64_t slot = j % cap;
-                        const int64_t mk =
-                            std::min({FBK, qhi - j + 1, cap - slot});
 
-                        // S[h, rows, mk] = Q[h, rows, D] . K[mk, D]^T
-                        bmm(sh, d.qb + t0, dt::bf16, {nqs, rows, D}, {D * ld, 1, ld},
-                            l.kc[size_t(sh)] + slot * KD + g * D, dt::bf16, {1, D, mk},
-                            {D * KD, 1, KD}, d.fs, {nqs, rows, mk}, {FBQ * FBK, FBK, 1}, false);
+                        // S[h, rowsb, FBK] = Q[h, rowsb, D] . K[FBK, D]^T
+                        bmm(sh, d.qb + t0, dt::bf16, {nqs, rowsb, D}, {D * ld, 1, ld},
+                            l.kc[size_t(sh)] + slot * KD + g * D, dt::bf16, {1, D, FBK},
+                            {D * KD, 1, KD}, d.fs, {nqs, rowsb, FBK}, {FBQ * FBK, FBK, 1},
+                            false);
 
-                        k_flash_softmax(d.q, d.fs, d.fp, d.foacc, d.fm, d.fl, nqs, rows, mk, FBQ,
-                                        FBK, D, t0, j, pos0, window, scaling);
+                        k_flash_softmax(d.q, d.fs, d.fp, d.foacc, d.fm, d.fl, nqs, rowsb, FBK,
+                                        FBQ, FBK, D, t0, j, pos0, window, scaling);
 
-                        // O[h, rows, D] += P[h, rows, mk] . V[mk, D]
-                        bmm(sh, d.fp, dt::bf16, {nqs, rows, mk}, {FBQ * FBK, FBK, 1},
-                            l.vc[size_t(sh)] + slot * KD + g * D, dt::bf16, {1, mk, D},
-                            {mk * KD, KD, 1}, d.foacc, {nqs, rows, D}, {FBQ * D, D, 1}, true);
-
-                        j += mk;
+                        // O[h, rowsb, D] += P[h, rowsb, FBK] . V[FBK, D]
+                        bmm(sh, d.fp, dt::bf16, {nqs, rowsb, FBK}, {FBQ * FBK, FBK, 1},
+                            l.vc[size_t(sh)] + slot * KD + g * D, dt::bf16, {1, FBK, D},
+                            {FBK * KD, KD, 1}, d.foacc, {nqs, rowsb, D}, {FBQ * D, D, 1}, true);
                     }
+                    // only the live rows reach the residual stream
                     k_flash_finish(d.q, d.foacc, d.fl, d.of, nqs, rows, FBQ, D, ld, t0);
                 }
             }
@@ -3558,6 +3784,24 @@ namespace muse::gpu
                 // contiguous; the buffers are allocated [dim, block] so a
                 // 1-column view always fits. Prefill (n > 1) is unchanged.
                 const int64_t B = (n == 1) ? 1 : block_;
+                // GEMM width for this block, rounded up to a power of two.
+                //
+                // Every output column of a GEMM is independent, so computing a
+                // few extra and never reading them changes no result — and it
+                // collapses the set of oneDNN primitive shapes a serving
+                // workload can ask for from "one per distinct prompt length"
+                // to log2(block). That matters because a cold shape is not
+                // free and it is not local: oneDNN builds a primitive and its
+                // workspace out of its OWN allocator, which dalloc()'s seal
+                // cannot see, so an un-warmed width is both a stall and a
+                // hole in the allocation guarantee. The drafter measured the
+                // stall at 539-990 ms per round before its context widths were
+                // bucketed the same way.
+                //
+                // Below the arithmetic-intensity knee the extra columns are
+                // nearly free: a 20-token chunk and a 64-token chunk stream
+                // the same weights, which is the whole cost at that width.
+                const int64_t NG = (n == 1) ? 1 : row_bucket(n, block_);
 
                 std::vector<int32_t> h_ids(static_cast<size_t>(n));
                 for (int64_t t = 0; t < n; ++t)
@@ -3618,10 +3862,10 @@ namespace muse::gpu
                     for (int64_t sh = 0; sh < ns; ++sh)
                     {
                         Dev &d = shards_[size_t(sh)];
-                        gemm(int(sh), l.q[size_t(sh)], d.xb, d.qf, n, H, QDs, B, B);
-                        gemm(int(sh), l.k_[size_t(sh)], d.xb, d.kf, n, H, KD, B, B);
-                        gemm(int(sh), l.v_[size_t(sh)], d.xb, d.vf, n, H, KD, B, B);
-                        gemm(int(sh), l.gate[size_t(sh)], d.xb, d.gf, n, H, QDs, B, B);
+                        gemm(int(sh), l.q[size_t(sh)], d.xb, d.qf, NG, H, QDs, B, B);
+                        gemm(int(sh), l.k_[size_t(sh)], d.xb, d.kf, NG, H, KD, B, B);
+                        gemm(int(sh), l.v_[size_t(sh)], d.xb, d.vf, NG, H, KD, B, B);
+                        gemm(int(sh), l.gate[size_t(sh)], d.xb, d.gf, NG, H, QDs, B, B);
                     }
                     toc(S_QKV);
 
@@ -3690,7 +3934,7 @@ namespace muse::gpu
                         k_out_gate(d.q, d.of, d.gf, d.ob, QDs, n, B);
                         // column-sharded: each shard sums over its own QDs
                         // slice, so xf is a PARTIAL until the all-reduce
-                        gemm(int(sh), l.o[size_t(sh)], d.ob, d.xf, n, QDs, H, B, B);
+                        gemm(int(sh), l.o[size_t(sh)], d.ob, d.xf, NG, QDs, H, B, B);
                     }
                     toc(S_OPROJ);
                     tic();
@@ -3712,10 +3956,10 @@ namespace muse::gpu
                         Dev &d = shards_[size_t(sh)];
                         k_rmsnorm_auto(d.q, d.h, l.pre_ff_ln[size_t(sh)], d.xb, n, 1, H, B,
                                        c.rms_norm_eps, NK::Centered);
-                        gemm(int(sh), l.mlp_gate[size_t(sh)], d.xb, d.g1, n, H, Is, B, B);
-                        gemm(int(sh), l.mlp_up[size_t(sh)], d.xb, d.u1, n, H, Is, B, B);
+                        gemm(int(sh), l.mlp_gate[size_t(sh)], d.xb, d.g1, NG, H, Is, B, B);
+                        gemm(int(sh), l.mlp_up[size_t(sh)], d.xb, d.u1, NG, H, Is, B, B);
                         k_swiglu(d.q, d.g1, d.u1, d.g1b, Is, n, B);
-                        gemm(int(sh), l.mlp_down[size_t(sh)], d.g1b, d.xf, n, Is, H, B, B);
+                        gemm(int(sh), l.mlp_down[size_t(sh)], d.g1b, d.xf, NG, Is, H, B, B);
                     }
                     toc(S_MLP);
                     tic();
@@ -4056,6 +4300,7 @@ namespace muse::gpu
             mutable double dt_ctx_ = 0, dt_layers_ = 0, dt_head_ = 0;
             mutable std::chrono::steady_clock::time_point dtA_;
             int sealed_ = 0; // 0 off, 1 log, 2 refuse
+            int64_t post_seal_bytes_ = 0;
             int64_t tbytes_ = 0; // target weight bytes, so the drafter's can be reported apart
             struct DBuf
             {

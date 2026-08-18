@@ -553,8 +553,66 @@ orders and blaming one of them.
 The footprint is **static and checked**. Everything is allocated during
 construction and `bind_*`; `--seal N` then arms a tripwire (1 = log, 2 =
 refuse) so any later device allocation is a startup-shaped failure rather than
-a mid-request OOM. Verified: a full prefill + decode after `--seal 2` reports
-no violations.
+a mid-request OOM.
+
+### Prewarm, and why the seal alone was not enough
+
+A seal only catches allocations that go through `dalloc()`. It cannot see the
+ones the *libraries* make: oneDNN builds a primitive, a kernel, and a workspace
+per distinct matmul shape, out of its own allocator, the first time that shape
+is asked for. So an engine could pass `--seal 2` on the prompt it was tested
+with and still allocate on the next one — which, for a served model sitting at
+2 GiB of headroom, is the failure mode the seal exists to prevent.
+
+Three changes close it:
+
+1. **Prefill GEMM widths are bucketed** to powers of two (`row_bucket`, the
+   same trick the drafter's context already used). A GEMM's output columns are
+   independent, so computing a few extra and never reading them changes no
+   result — and it collapses the reachable shape set from "one per prompt
+   length" to `log2(chunk)`. Below the arithmetic-intensity knee it is nearly
+   free: a 20-row chunk and a 64-row chunk stream the same weights, which is
+   the whole cost at that width.
+2. **`--flash-prefill` tiles are fixed-shape.** Query rows are bucketed the
+   same way; key runs are always a full `FBK`-aligned tile, with the ring
+   capacity rounded up to a whole number of tiles so an aligned read never
+   crosses the wrap point. Out-of-range keys were already masked to `-inf` by
+   the softmax, so their `P` entries are exactly 0 and their `V` rows
+   contribute nothing — the padding is arithmetically inert. Measured cost at
+   3001 tokens: 1541.8 vs 1546.2 tok/s, i.e. nothing.
+3. **`prewarm()`** then drives every one of those shapes at the deepest
+   position the engine was built for — each width bucket at `max_seq`, the
+   shallow first-chunk case, a one-token decode at depth, every drafter context
+   bucket, a speculative verification block, and the tower at its bound patch
+   count — before the seal is armed. It costs 1.4 s at 8192 on the 30B and it
+   *speeds prefill up* (1546 vs 1446 tok/s), because the primitive-build cost
+   moves to startup where it belongs.
+
+`--seal-probe` is the check, and it has to run inside one process (a fresh one
+reloads 55 GiB and re-warms everything, which is exactly what it would have to
+avoid doing to prove anything). It sweeps 15 prompt lengths straddling every
+bucket boundary — 1, 2, 3, 7, 63, 64, 65, 127, 128, 129, … — with three decode
+steps and a drafting round each, twice, under `--seal 2`, and compares free
+VRAM:
+
+```
+[gpu] prewarm 1.40 s (widths 64 128 256 512 + decode, depth 8192)
+[gpu] card 0: 3.93 GiB free after prewarm
+[gpu] allocations sealed (mode 2) at 55.11 GiB
+[seal-probe] card 0: 0 bytes drift (steady state), 0 first-touch
+[seal-probe] card 1: 0 bytes drift (steady state), 0 first-touch
+```
+
+On the tiny model the first pass shows a **fixed 320 KiB** the Level-Zero
+runtime takes on its own account the first time this mix of kernels runs — it
+appears once, at the third prompt, and is byte-identical whether the prompts
+after it are 63 tokens or 129, which is what says it is not per-shape growth.
+The gate bounds it and gates the steady state at exactly zero. On the 30B it
+does not appear at all.
+
+A post-seal allocation now prints a backtrace, because a byte count alone does
+not tell you which surface grew and by the time it is reported the stack is
+gone.
 
 What is already saving VRAM:
 
@@ -763,6 +821,8 @@ slice is 16 wide. The 30B's slices are 2048 and 9984, both fine.
 | q8 argmax + top-k vs the f64 oracle | a separate accuracy tier, gated on its own terms |
 | q8 chunk-invariant + rerun bitwise | decode and prefill agree inside the tier |
 | image+text logits argmax + top-20 | the features land at the right token positions |
+| sealed engine: 15 prompt lengths, no post-seal alloc, no VRAM drift | the footprint really is static, including the libraries' |
+| the seal fires without prewarm | a tripwire nobody has seen trip is untested code |
 
 `MUSE_GPU_TRACE=<dir>` dumps the residual stream per layer (row-major `[n, H]`),
 which is how the oneDNN bug was localized to the head. `MUSE_GPU_PROFILE=1`

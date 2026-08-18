@@ -174,6 +174,24 @@ namespace muse::gpu
         virtual void set_vision_embeds(const std::vector<float> &feats,
                                        const std::vector<int64_t> &positions) = 0;
 
+        // Grow every lazily-created device surface at the widest and deepest
+        // shape this engine will ever run: the oneDNN primitive per GEMM
+        // width, the flash tiers' per-tile matmuls, the drafter's bucketed
+        // context, the tower's. A configuration that cannot serve then fails
+        // HERE, at startup, rather than in the middle of somebody's request —
+        // which is the whole point of the seal below. Leaves the caches reset.
+        //
+        // Costs one full-depth forward per prefill width bucket, so it is not
+        // free; it is what buys the guarantee.
+        virtual void prewarm() = 0;
+
+        // Free device memory per CARD, in bytes, right now. Needs
+        // ZES_ENABLE_SYSMAN=1 in the environment; without it the driver
+        // reports 0 and the caller should say so rather than print a fake
+        // number. Used to report the post-prewarm margin and to gate that a
+        // sealed engine's footprint really is static.
+        virtual std::vector<int64_t> free_mem() const = 0;
+
         // "Seal after load": every device allocation after this point should
         // have been reserved up front, because the engine serves one request at
         // a time and a mid-request allocation is a mid-request OOM. mode 1

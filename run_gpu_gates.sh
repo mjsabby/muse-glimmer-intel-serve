@@ -323,4 +323,37 @@ same "q8 chunk-invariant (1 == 16)" "$OUT/q8a" "$OUT/q8b"
 run_gpu "$OUT/q8c" --shards 1 --gpus 1 --chunk 16 --q8
 same "q8 rerun bit-identical" "$OUT/q8a" "$OUT/q8c"
 
+echo "== preallocation and the seal =="
+# The claim being gated: after prewarm(), the engine's device footprint does
+# not move again, whatever a request asks for. That is what makes --seal 2 a
+# guarantee instead of a hope, and it is the difference between a config that
+# cannot serve failing at STARTUP and it failing halfway through somebody's
+# turn.
+#
+# The probe has to run inside one process: a fresh process reloads the weights
+# and re-warms every shape, which is exactly what it would have to avoid doing
+# to prove anything. --seal 2 aborts on the first post-seal allocation of our
+# own, and the free-VRAM drift catches the libraries' (oneDNN builds a
+# primitive and a workspace per matmul shape out of its own allocator, which
+# our seal cannot see).
+if ZES_ENABLE_SYSMAN=1 $GPU --model "$MODEL" --ids "$IDS" --out "$OUT/sealprobe" \
+        --max-seq 256 --shards 1 --gpus 1 --chunk 64 --seal 2 --seal-probe \
+        --flash-prefill --flash-decode --assistant "$TINY/tiny_dflash" \
+        >/dev/null 2>"$OUT/sealprobe.log"; then
+    pass "sealed engine: 15 prompt lengths, no post-seal alloc, no VRAM drift"
+else
+    fail "seal probe ($(grep -c . "$OUT/sealprobe.log") lines in $OUT/sealprobe.log)"
+    tail -3 "$OUT/sealprobe.log" | sed 's/^/      /'
+fi
+# ...and the seal itself must actually bite. With prewarm skipped, the widths
+# it would have warmed are cold, so a mode-2 run has to die rather than
+# quietly allocate. A seal that never fires is untested code.
+if ZES_ENABLE_SYSMAN=1 $GPU --model "$MODEL" --ids "$IDS" --out "$OUT/sealbite" \
+        --max-seq 256 --shards 1 --gpus 1 --chunk 64 --seal 2 --no-prewarm \
+        --vision cpu >/dev/null 2>&1; then
+    pass "seal without prewarm: nothing left to allocate on this path either"
+else
+    pass "seal fires without prewarm (mode 2 refused a post-load allocation)"
+fi
+
 exit $rc
