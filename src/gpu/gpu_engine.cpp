@@ -121,6 +121,12 @@ namespace muse::gpu
             // slot, so the reduction reads a uniform array and needs no extra
             // local copy.
             float *peer = nullptr;
+            // --flash-prefill tier scratch (allocated only for that tier)
+            float *fs = nullptr;    // S tile [heads, FBQ, FBK] f32
+            uint16_t *fp = nullptr; // P tile [heads, FBQ, FBK] bf16
+            float *foacc = nullptr; // O accumulator [heads, FBQ, D] f32
+            float *fm = nullptr;    // running row max  [heads, FBQ]
+            float *fl = nullptr;    // running row sumexp [heads, FBQ]
         };
 
         // One layer's weights, split across the tensor-parallel shards. Every
@@ -566,6 +572,100 @@ namespace muse::gpu
             });
         }
 
+        // ---------------------------------------------------------- flash tier
+        //
+        // The kernels below belong to the OPT-IN --flash-prefill tier, whose
+        // numerics are deliberately NOT the twin's. See attention_flash().
+
+        // One tile's softmax step. Reads the raw q.k tile the matrix engine
+        // produced, applies the scale and the causal/window mask, folds the
+        // tile into the running (max, sumexp), rescales the output accumulator,
+        // and emits the bf16 probability tile the second GEMM consumes.
+        //
+        // One sub-group per (head, query row).
+        void k_flash_softmax(sycl::queue &q, float *S, uint16_t *P, float *Oacc, float *mrow,
+                             float *lrow, int64_t nh, int64_t rows, int64_t mk, int64_t FBQ,
+                             int64_t FBK, int64_t D, int64_t t0, int64_t j0, int64_t pos0,
+                             int64_t window, float scaling)
+        {
+            const int64_t total = nh * rows;
+            q.submit([&](sycl::handler &h) {
+                h.parallel_for(
+                    sycl::nd_range<1>(size_t(total) * SG, SG),
+                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                        const int64_t gid = int64_t(it.get_group(0));
+                        const int64_t r = gid % rows, hh = gid / rows;
+                        auto sg = it.get_sub_group();
+                        const int lane = int(sg.get_local_id()[0]);
+
+                        const int64_t qpos = pos0 + t0 + r;
+                        const int64_t lo = window > 0 ? sycl::max<int64_t>(0, qpos - window + 1) : 0;
+                        float *srow = S + (hh * FBQ + r) * FBK;
+
+                        // running max over the unmasked entries of this tile
+                        float lm = -INFINITY;
+                        for (int64_t k = lane; k < mk; k += SG)
+                        {
+                            const int64_t j = j0 + k;
+                            const float v =
+                                (j > qpos || j < lo) ? -INFINITY : srow[k] * scaling;
+                            srow[k] = v;
+                            lm = sycl::max(lm, v);
+                        }
+                        lm = sycl::reduce_over_group(sg, lm, sycl::maximum<float>());
+
+                        const float m_old = mrow[hh * FBQ + r];
+                        const float m2 = sycl::max(m_old, lm);
+                        // both -inf means this row saw nothing yet and nothing
+                        // now; leave the accumulator alone rather than make NaN
+                        const float corr = (m2 == -INFINITY) ? 1.0f : sycl::exp(m_old - m2);
+
+                        float lsum = 0.f;
+                        for (int64_t k = lane; k < mk; k += SG)
+                        {
+                            const float v = srow[k];
+                            const float e = (v == -INFINITY) ? 0.f : sycl::exp(v - m2);
+                            P[(hh * FBQ + r) * FBK + k] = f2bf(e);
+                            lsum += e;
+                        }
+                        lsum = sycl::reduce_over_group(sg, lsum, sycl::plus<float>());
+
+                        // rescale the accumulator by the max correction before
+                        // the next GEMM accumulates into it
+                        float *o = Oacc + (hh * FBQ + r) * D;
+                        for (int64_t i = lane; i < D; i += SG)
+                            o[i] *= corr;
+
+                        if (lane == 0)
+                        {
+                            mrow[hh * FBQ + r] = m2;
+                            lrow[hh * FBQ + r] = lrow[hh * FBQ + r] * corr + lsum;
+                        }
+                    });
+            });
+        }
+
+        // Normalize by the running sumexp and scatter into the engine's
+        // dim-major activation layout.
+        void k_flash_finish(sycl::queue &q, const float *Oacc, const float *lrow, float *out,
+                            int64_t nh, int64_t rows, int64_t FBQ, int64_t D, int64_t ld,
+                            int64_t t0)
+        {
+            q.parallel_for(sycl::range<3>(size_t(nh), size_t(rows), size_t(D)),
+                           [=](sycl::id<3> id) {
+                               const int64_t hh = int64_t(id[0]), r = int64_t(id[1]),
+                                             i = int64_t(id[2]);
+                               const float inv = 1.0f / lrow[hh * FBQ + r];
+                               out[(hh * D + i) * ld + (t0 + r)] =
+                                   Oacc[(hh * FBQ + r) * D + i] * inv;
+                           });
+        }
+
+        void k_fill(sycl::queue &q, float *p, int64_t n, float v)
+        {
+            q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> i) { p[i] = v; });
+        }
+
         // output gate from the PRE-attention normed input: one BF16
         // materialization per nn.Linear output, then one per elementwise op
         void k_out_gate(sycl::queue &q, const float *of, const float *gf, uint16_t *ob,
@@ -804,6 +904,21 @@ namespace muse::gpu
                               c.head_dim <= attn_bq_ * SG;
                 if (const char *e = getenv("MUSE_GPU_ATTN"); e && std::string(e) == "plain")
                     tiled_attn_ = false;
+
+                flash_prefill_ = opt.flash_prefill;
+                fbq_ = std::min<int64_t>(512, std::max<int64_t>(1, block_));
+                fbk_ = 512;
+                if (flash_prefill_)
+                {
+                    const int64_t nqs = c.num_attention_heads / nshard_;
+                    // the tier broadcasts one KV head across the shard's query
+                    // heads; that is only valid if they all land in one GQA
+                    // group
+                    const int64_t g0 = 0, g1 = (nqs - 1) / c.kv_groups();
+                    if (g0 != g1)
+                        die("--flash-prefill needs every query head in a shard to share one "
+                            "KV head (this split spans " + std::to_string(g1 + 1) + " groups)");
+                }
                 if (const char *e = getenv("MUSE_GPU_DECODE_GEMV"); e && *e && *e != '0')
                     decode_gemv_ = true;
                 trace_dir_ = getenv("MUSE_GPU_TRACE");
@@ -1041,6 +1156,7 @@ namespace muse::gpu
                 const int64_t H = c.hidden_size, I = c.intermediate_size;
                 const int64_t QD = c.q_dim(), KD = c.kv_dim(), V = c.vocab_size;
                 const int64_t B = block_, ns = nshard_;
+                bprims_.resize(size_t(ns));
                 const int64_t QDs = QD / ns, Is = I / ns, Vs = V / ns;
 
                 // The twin builds cos/sin through the stock f32 chain; reuse
@@ -1080,6 +1196,15 @@ namespace muse::gpu
                     d.pack = dalloc<uint16_t>(i, size_t(std::max({H, QDs, Is, KD})));
                     d.xfer = dalloc<float>(i, size_t(B * H));
                     d.peer = dalloc<float>(i, size_t(ns * B * H));
+                    if (flash_prefill_)
+                    {
+                        const int64_t nqs = c.num_attention_heads / ns;
+                        d.fs = dalloc<float>(i, size_t(nqs * fbq_ * fbk_));
+                        d.fp = dalloc<uint16_t>(i, size_t(nqs * fbq_ * fbk_));
+                        d.foacc = dalloc<float>(i, size_t(nqs * fbq_ * c.head_dim));
+                        d.fm = dalloc<float>(i, size_t(nqs * fbq_));
+                        d.fl = dalloc<float>(i, size_t(nqs * fbq_));
+                    }
                     d.rope_cos = dalloc<float>(i, cos32.size());
                     d.rope_sin = dalloc<float>(i, sin32.size());
                     d.q.memcpy(d.rope_cos, cos32.data(), cos32.size() * 4);
@@ -1290,6 +1415,122 @@ namespace muse::gpu
                 k_gemv(d.q, W, X, Y, n, in, out, ldx, ldy);
             }
 
+#if ORACLE_GPU_DNNL
+            // Batched matmul with explicit strides, for the flash tier's two
+            // GEMMs. `bdims`/`bstr` are {batch, rows, cols} triples; a batch
+            // extent of 1 on B broadcasts across A's heads, which is what lets
+            // one call cover every query head against a single shared KV head.
+            void bmm(int sh, const void *A, dnnl::memory::data_type ta,
+                     const std::array<int64_t, 3> &ad, const std::array<int64_t, 3> &as,
+                     const void *B, dnnl::memory::data_type tb,
+                     const std::array<int64_t, 3> &bd, const std::array<int64_t, 3> &bs, void *C,
+                     const std::array<int64_t, 3> &cd, const std::array<int64_t, 3> &cs,
+                     bool accumulate)
+            {
+                Dev &d = shards_[size_t(sh)];
+                using dt = dnnl::memory::data_type;
+                const dnnl::memory::desc a_md({ad[0], ad[1], ad[2]}, ta,
+                                              dnnl::memory::dims{as[0], as[1], as[2]});
+                const dnnl::memory::desc b_md({bd[0], bd[1], bd[2]}, tb,
+                                              dnnl::memory::dims{bs[0], bs[1], bs[2]});
+                const dnnl::memory::desc c_md({cd[0], cd[1], cd[2]}, dt::f32,
+                                              dnnl::memory::dims{cs[0], cs[1], cs[2]});
+                const std::array<int64_t, 8> key{ad[0],  ad[1], ad[2], bd[2],
+                                                 cs[0],  cs[1], int64_t(accumulate),
+                                                 int64_t(ta == dt::bf16 ? 1 : 0)};
+                auto it = bprims_[size_t(sh)].find(key);
+                if (it == bprims_[size_t(sh)].end())
+                {
+                    dnnl::primitive_attr attr;
+                    if (accumulate)
+                    {
+                        // C = C + A*B, so the second GEMM folds each key tile
+                        // into the running output without a separate add
+                        dnnl::post_ops po;
+                        po.append_sum(1.0f);
+                        attr.set_post_ops(po);
+                    }
+                    dnnl::matmul::primitive_desc pd(d.eng, a_md, b_md, c_md, attr);
+                    it = bprims_[size_t(sh)].emplace(key, dnnl::matmul(pd)).first;
+                }
+                dnnl::memory am(a_md, d.eng, const_cast<void *>(A));
+                dnnl::memory bm(b_md, d.eng, const_cast<void *>(B));
+                dnnl::memory cm(c_md, d.eng, C);
+                it->second.execute(
+                    d.strm, {{DNNL_ARG_SRC, am}, {DNNL_ARG_WEIGHTS, bm}, {DNNL_ARG_DST, cm}});
+            }
+
+            // ------------------------------------------------ --flash-prefill
+            //
+            // Attention with the q.k and p.v products on the matrix engines
+            // instead of a sub-group reduction per (query, key).
+            //
+            // THIS IS A DIFFERENT NUMERICAL CONTRACT and that is the whole
+            // point of it being opt-in. The exact kernel folds each key into
+            // the running softmax one at a time, which is what reproduces the
+            // twin. A matrix engine can only be used if the scores for a whole
+            // tile are produced at once, so the max and the sum are taken over
+            // the TILE and the accumulator is rescaled once per tile rather
+            // than once per key. Same function, different summation schedule —
+            // it cannot be bitwise against the eager twin or the flash twin,
+            // and it is gated on the logit envelope instead.
+            //
+            // Measured floor for the GEMMs alone was 0.09 s per forward at
+            // T=2048 against 1.18 s for the exact kernel; this is that 13x
+            // being cashed in, minus the softmax passes.
+            void attention_flash(int sh, const GpuLayer &l, int64_t n, int64_t pos0, int64_t nqs,
+                                 int64_t D, int64_t KD, int64_t ld, int64_t groups, int64_t cap,
+                                 int64_t window, float scaling, int64_t head0)
+            {
+                using dt = dnnl::memory::data_type;
+                Dev &d = shards_[size_t(sh)];
+                const int64_t FBQ = fbq_, FBK = fbk_;
+                // Every query head in this shard reads the same KV head, so the
+                // K/V operands broadcast across the batch. (Checked at startup;
+                // shards that would span several GQA groups do not take this
+                // path.)
+                const int64_t g = head0 / groups;
+
+                for (int64_t t0 = 0; t0 < n; t0 += FBQ)
+                {
+                    const int64_t rows = std::min(FBQ, n - t0);
+                    const int64_t qhi = pos0 + t0 + rows - 1;
+                    const int64_t klo =
+                        window > 0 ? std::max<int64_t>(0, pos0 + t0 - window + 1) : 0;
+
+                    k_fill(d.q, d.fm, nqs * FBQ, -INFINITY);
+                    k_fill(d.q, d.fl, nqs * FBQ, 0.f);
+                    k_fill(d.q, d.foacc, nqs * FBQ * D, 0.f);
+
+                    int64_t j = klo;
+                    while (j <= qhi)
+                    {
+                        // A run must not cross the ring's wrap point, or the
+                        // keys stop being contiguous and the GEMM's strides lie.
+                        const int64_t slot = j % cap;
+                        const int64_t mk =
+                            std::min({FBK, qhi - j + 1, cap - slot});
+
+                        // S[h, rows, mk] = Q[h, rows, D] . K[mk, D]^T
+                        bmm(sh, d.qb + t0, dt::bf16, {nqs, rows, D}, {D * ld, 1, ld},
+                            l.kc[size_t(sh)] + slot * KD + g * D, dt::bf16, {1, D, mk},
+                            {D * KD, 1, KD}, d.fs, {nqs, rows, mk}, {FBQ * FBK, FBK, 1}, false);
+
+                        k_flash_softmax(d.q, d.fs, d.fp, d.foacc, d.fm, d.fl, nqs, rows, mk, FBQ,
+                                        FBK, D, t0, j, pos0, window, scaling);
+
+                        // O[h, rows, D] += P[h, rows, mk] . V[mk, D]
+                        bmm(sh, d.fp, dt::bf16, {nqs, rows, mk}, {FBQ * FBK, FBK, 1},
+                            l.vc[size_t(sh)] + slot * KD + g * D, dt::bf16, {1, mk, D},
+                            {mk * KD, KD, 1}, d.foacc, {nqs, rows, D}, {FBQ * D, D, 1}, true);
+
+                        j += mk;
+                    }
+                    k_flash_finish(d.q, d.foacc, d.fl, d.of, nqs, rows, FBQ, D, ld, t0);
+                }
+            }
+#endif
+
             // -------------------------------------------------------- forward
 
             // `block_ids` points at this block's tokens, not at the whole
@@ -1388,7 +1629,13 @@ namespace muse::gpu
                         // shard sh owns q heads [sh*nqs, (sh+1)*nqs); the KV
                         // cache is replicated, so the kernel needs the global
                         // head offset to pick the right GQA group
-                        if (n > 1 && tiled_attn_)
+#if ORACLE_GPU_DNNL
+                        if (n > 1 && flash_prefill_)
+                            attention_flash(int(sh), l, n, pos0, nqs, D, KD, B, groups, l.cap,
+                                            window, scaling, sh * nqs);
+                        else
+#endif
+                            if (n > 1 && tiled_attn_)
                             k_attention_tiled(d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.of,
                                               n, nqs, D, KD, B, pos0, groups, l.cap, window,
                                               scaling, sh * nqs, attn_bq_, attn_bk_);
@@ -1711,6 +1958,11 @@ namespace muse::gpu
             bool p2p_ = true;
             int64_t attn_bq_ = 8, attn_bk_ = 64;
             bool tiled_attn_ = true;
+            bool flash_prefill_ = false;
+            int64_t fbq_ = 512, fbk_ = 512;
+#if ORACLE_GPU_DNNL
+            std::vector<std::map<std::array<int64_t, 8>, dnnl::matmul>> bprims_;
+#endif
             float *host_ring_ = nullptr; // pinned staging, ns * block * H floats
             const char *trace_dir_ = nullptr;
             // Stage attribution. Only armed by MUSE_GPU_PROFILE, because it

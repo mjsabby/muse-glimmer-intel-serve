@@ -56,6 +56,8 @@ namespace
                      "  --decode N         greedy-decode N tokens after prefill\n"
                      "  --top K            print the last position's top-K\n"
                      "  --no-dnnl          hand-written GEMV everywhere (diagnostic)\n"
+                     "  --flash-prefill    matrix-engine prefill attention (faster, and a\n"
+                     "                     LOOSER numerical contract - envelope-gated)\n"
                      "  --list-devices     enumerate the visible GPUs and exit\n"
                      "  --revision REV     HF revision when --model is a repo id\n");
     }
@@ -66,7 +68,7 @@ int main(int argc, char **argv)
     std::string model, ids_spec, out_dir = "out/gpu", revision = "main";
     int64_t chunk = 512, max_seq = 0, decode_n = 0;
     int gpus = 2, shards = 0, topk = 5;
-    bool no_dnnl = false;
+    bool no_dnnl = false, flash_prefill = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -101,6 +103,8 @@ int main(int argc, char **argv)
             topk = std::stoi(next());
         else if (a == "--no-dnnl")
             no_dnnl = true;
+        else if (a == "--flash-prefill")
+            flash_prefill = true;
         else if (a == "--list-devices")
         {
             auto ds = muse::gpu::enumerate_devices();
@@ -147,6 +151,7 @@ int main(int argc, char **argv)
         opt.block = chunk;
         opt.max_seq = max_seq;
         opt.no_dnnl = no_dnnl;
+        opt.flash_prefill = flash_prefill;
         opt.verbose = true;
 
         auto eng = muse::gpu::Engine::create(cfg, w, opt);
@@ -177,6 +182,7 @@ int main(int argc, char **argv)
         bm << "{\n \"kind\": \"gpu_sycl\",\n \"T\": 1,\n \"V\": " << cfg.vocab_size
            << ",\n \"prompt_len\": " << T << ",\n \"decode\": " << decode_n
            << ",\n \"gpus\": " << gpus << ",\n \"shards\": " << (shards > 0 ? shards : gpus)
+           << ",\n \"flash_prefill\": " << (flash_prefill ? "true" : "false")
            << ",\n \"chunk\": " << chunk
            << ",\n \"max_seq\": " << max_seq << ",\n \"prefill_tok_s\": "
            << (tm.prefill_s > 0 ? double(tm.prefill_tokens) / tm.prefill_s : 0.0)

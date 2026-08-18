@@ -221,10 +221,18 @@ same box (32-thread Zen 5, AVX-512, weights resident).
 | | tensor parallel | layer split | CPU | vs CPU |
 |---|---:|---:|---:|---:|
 | prefill 128 | 638 tok/s | 549 | 60.7 | 10.5× |
-| prefill 512 | **1008 tok/s** | 941 | 67.2 | 15.0× |
-| prefill 2048 | **860 tok/s** | 623 | 64.1 | 13.4× |
-| prefill 8192 | 549 tok/s | — | — | — |
+| prefill 512 | 1008 tok/s | 941 | 67.2 | 15.0× |
+| prefill 2048 | 860 tok/s | 623 | 64.1 | 13.4× |
+| prefill 8192 | 551 tok/s | — | — | — |
 | decode | **14.6 tok/s** | 8.89 | 1.13 | 12.9× |
+
+With `--flash-prefill` (looser contract, see below):
+
+| | flash tier | exact | vs CPU |
+|---|---:|---:|---:|
+| prefill 512 | **1173 tok/s** | 1008 | 17.5× |
+| prefill 2048 | **1624 tok/s** | 860 | 25.3× |
+| prefill 8192 | **1651 tok/s** | 551 | — |
 | weight upload | 54.72 GiB in ~22 s | 51.88 in ~15 s | — | — |
 
 Tensor parallelism is worth **1.67× on decode** and 1.39× on deep prefill over
@@ -276,29 +284,63 @@ exact-arithmetic contract requires: one sub-group reduction per key is what
 reproduces the twin's dot product. No amount of staging or reordering removes
 it.
 
-What does remove it is computing `S = Q·Kᵀ` and `P·V` on the matrix engines.
-Measured floor, one TP shard, 16 heads, T=2048, GEMMs only:
+What does remove it is computing `S = Q·Kᵀ` and `P·V` on the matrix engines —
+which is the `--flash-prefill` tier below.
 
-| | 52 layers |
-|---|---:|
-| oneDNN matrix-engine GEMMs (full square, no causal skip) | **0.09 s** |
-| this engine's hand-written attention | 1.18 s |
+The tiled kernel stays the default for the exact tier: bitwise-equivalent,
+marginally better at depth. `MUSE_GPU_ATTN=plain` selects the untiled one.
 
-**13×**, and a real kernel skips roughly half the square on top of that. At
-T=8192 that is the difference between 541 and roughly 1400 tok/s.
+## `--flash-prefill`: the matrix-engine attention tier
 
-The catch is the contract: a matrix-engine kernel has to materialize `S` per
-tile and take max/sum over the tile, which is a *different* softmax schedule
-from the twin's per-key online update. It cannot be bitwise against the eager
-twin or against the flash twin — it needs a third, looser contract, gated on
-the logit envelope. That is precisely the split gemma4 arrived at with its
-opt-in `--flash-prefill` tier, and it is a decision to take deliberately rather
-than slip in. It is the largest remaining prefill win and is not yet
-implemented.
+Opt-in, prefill only, and **a different numerical contract** — which is exactly
+why it is opt-in.
 
-The tiled kernel is kept as the default: it is bitwise-equivalent, marginally
-better at depth, and it is the K/V staging structure a matrix-engine tier would
-build on. `MUSE_GPU_ATTN=plain` selects the untiled one for A/B.
+The exact kernel folds keys into the running softmax one at a time; that per-key
+schedule is what reproduces the twin, and it is also what forces a cross-lane
+reduction per (query, key). A matrix engine can only be used if a whole tile of
+scores is produced at once, so this tier takes the max and the sum over a
+**tile** of keys and rescales the output accumulator once per tile instead of
+once per key. Same function, different summation schedule. It cannot be bitwise
+against the eager twin *or* the flash twin and is gated on the logit envelope —
+asserting bitwise here would be asserting something no fused kernel can meet,
+which is the trap the eager/flash twin split already exists to avoid.
+
+Structure, per (query tile, key run):
+
+1. `S[heads, rows, keys] = Q · Kᵀ` — one batched oneDNN matmul. Every query head
+   in a shard reads the same KV head, so K broadcasts across the batch and all
+   16 heads go in one call. (Startup refuses the tier if a shard would span more
+   than one GQA group.)
+2. a SYCL kernel applies the scale and the causal/window mask, folds the tile
+   into the running `(max, sumexp)`, rescales the accumulator, and emits the
+   bf16 probability tile;
+3. `O += P · V` — a second batched matmul with a `sum` post-op, so the tile
+   folds into the accumulator without a separate add.
+
+Key runs are split at the ring's wrap point: a run that crossed it would leave
+the keys non-contiguous and the GEMM's strides would quietly lie.
+
+### Measured, 30B, two cards
+
+| | attention | prefill |
+|---|---:|---:|
+| T=2048 exact | 1.181 s | 856 tok/s |
+| T=2048 **flash** | **0.073 s** (16×) | **1624 tok/s** |
+| T=8192 exact | 10.333 s | 551 tok/s |
+| T=8192 **flash** | **0.513 s** (20×) | **1651 tok/s** |
+
+Better than the 13× the GEMM-only floor predicted, because the tier skips the
+masked half of the square that the floor measurement included. Attention falls
+from 70% of prefill to 10%, and prefill stops degrading with depth — 1624 tok/s
+at 2048 against 1651 at 8192.
+
+Envelope against the bf16 twin on the 30B (prefill 128 + 8 decode steps): all 8
+generated tokens identical, argmax equal, top-64 overlap 98.4%, max abs logit
+difference 0.156 — against 0.094 for the exact tier, so the looser schedule
+costs about one extra bf16 ulp.
+
+Decode is untouched: it has one query and nothing to batch, so it keeps the
+exact kernel and the exact contract.
 
 ## Gates (`run_gpu_gates.sh`)
 
@@ -311,6 +353,9 @@ build on. `MUSE_GPU_ATTN=plain` selects the untiled one for A/B.
 | rerun bit-identical | determinism |
 | shards 2: 1 card == 2 cards, prefill **and decode** | tensor-parallel placement is not arithmetic |
 | 2-card rerun bit-identical | the all-reduce is order-fixed |
+| flash tier inside the twin's envelope | the looser tier is still the same function |
+| flash tier differs from the exact tier | the tier is actually active |
+| flash tier rerun + 1 card == 2 cards, bitwise | looser numerics, not sloppy ones |
 
 `MUSE_GPU_TRACE=<dir>` dumps the residual stream per layer (row-major `[n, H]`),
 which is how the oneDNN bug was localized to the head. `MUSE_GPU_PROFILE=1`

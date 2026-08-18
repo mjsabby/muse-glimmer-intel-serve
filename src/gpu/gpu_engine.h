@@ -60,6 +60,11 @@ namespace muse::gpu
         // Force the oneDNN matmul off and use the hand-written SYCL GEMV
         // everywhere. Diagnostic: the two must agree inside the envelope.
         bool no_dnnl = false;
+        // Opt-in prefill attention tier: q.k and p.v on the matrix engines,
+        // with the softmax max/sum taken per TILE instead of per key. Much
+        // faster and a DIFFERENT numerical contract from the twin — it is
+        // gated on the logit envelope, never bitwise. Decode is unaffected.
+        bool flash_prefill = false;
     };
 
     // Enumerate the Level-Zero GPUs the process can see. Never throws; an
