@@ -171,26 +171,35 @@ construction. The all-reduce sums in **shard order** on every shard for the same
 reason — the norms that follow are replicated, so a one-ulp disagreement between
 shards would compound rather than average out.
 
-### The transport is host-staged, and that is not the obvious choice
+### The exchange must be serialized, and peer access enabled before the context
 
-The all-reduce fires twice per layer, 104 times per token. Direct card-to-card
-`memcpy` in one shared SYCL context is the obvious transport and benchmarks at
-**48 GB/s** standalone. Inside this engine it measured **0.4 GB/s** — 70× slower
-— which made TP prefill *worse* than no TP at all (70 tok/s against 549).
+The all-reduce fires twice per layer, 104 times per token. Getting it wrong is
+expensive: the first working version ran the exchange at **0.4 GB/s**, which
+made TP prefill *worse* than no TP at all (70 tok/s against 549). Three
+separate things were wrong, and only the third is obvious in hindsight.
 
-What it is not: VRAM pressure (49.8 GB/s with 26 GiB of ballast per card), a
-kernel-written source surface (47.9 GB/s), or missing peer access (reported
-supported, and explicit enabling changes nothing). It does not reproduce
-standalone, and the cause is still open.
-
-Staging through **pinned host memory** — one hop longer — runs at 28.2 GB/s in
-the engine, essentially the PCIe ceiling, and is the default. `MUSE_GPU_P2P=1`
-selects the direct path for re-measuring when the driver changes.
+1. **Peer access has to be enabled BEFORE the spanning context is created.**
+   The Level-Zero V2 adapter establishes its cross-device mappings at context
+   creation; enabling afterwards is not an error, it just silently leaves them
+   absent. (gemma4 documents the same trap.)
+2. **The copy is a PULL**, issued on the destination's queue, not a push from
+   the source.
+3. **The two legs must be serialized.** Letting both cards pull from each other
+   concurrently is *bimodal* on this driver: the same 13.6 MB disjoint exchange
+   measures 0.56 ms (48 GB/s) on one run and 639 ms on the next, with no change
+   in size, alignment or aliasing. Serializing gives up the overlap and is
+   stable at 27 GB/s — and PCIe is the limit either way, so nothing is lost.
 
 | transport | exchange | prefill 512 |
 |---|---:|---:|
-| direct card-to-card | 0.4 GB/s | 70 tok/s |
-| **pinned host staging** | **28.2 GB/s** | **1030 tok/s** |
+| concurrent bidirectional pulls | 0.4 GB/s (bimodal) | 70 tok/s |
+| **serialized peer pulls** (default) | **26.6 GB/s** | **1008 tok/s** |
+| pinned host staging (`MUSE_GPU_XFER=host`) | 28.1 GB/s | 984 tok/s |
+
+Host staging is kept as a fallback because it is immune to the concurrency
+bug, but it is not needed: serialized peer copies are marginally faster
+end-to-end and avoid the host hop entirely. `MUSE_GPU_PEER_PROBE=1` times the
+peer path at two points in startup, which is how the bimodality was found.
 
 ### Memory
 
@@ -211,10 +220,11 @@ same box (32-thread Zen 5, AVX-512, weights resident).
 
 | | tensor parallel | layer split | CPU | vs CPU |
 |---|---:|---:|---:|---:|
-| prefill 128 | 644 tok/s | 549 | 60.7 | 10.6× |
-| prefill 512 | **1030 tok/s** | 941 | 67.2 | 15.3× |
-| prefill 2048 | **867 tok/s** | 623 | 64.1 | 13.5× |
-| decode | **14.81 tok/s** | 8.89 | 1.13 | 13.1× |
+| prefill 128 | 638 tok/s | 549 | 60.7 | 10.5× |
+| prefill 512 | **1008 tok/s** | 941 | 67.2 | 15.0× |
+| prefill 2048 | **860 tok/s** | 623 | 64.1 | 13.4× |
+| prefill 8192 | 549 tok/s | — | — | — |
+| decode | **14.6 tok/s** | 8.89 | 1.13 | 12.9× |
 | weight upload | 54.72 GiB in ~22 s | 51.88 in ~15 s | — | — |
 
 Tensor parallelism is worth **1.67× on decode** and 1.39× on deep prefill over
@@ -234,10 +244,61 @@ the floor, i.e. **~22 tok/s**. At 14.81 the engine is at 67% of it; the gap is
 the per-layer small kernels and the 104 all-reduce round trips (1.5 ms of
 transfer per token, plus their synchronization).
 
-Prefill still falls from 1030 to 867 tok/s between 512 and 2048 because the
-attention kernel is O(T²) with a serial key loop per (token, head). A
-tiled/flash prefill attention is the fix, and it is now the largest single item
-left.
+### Prefill attention: what was tried, and why it did not help
+
+Attention is the dominant prefill cost at depth — 49% at T=2048 and **70% at
+T=8192** — so it was the obvious target. Three restructurings were implemented
+and measured, all of them bitwise-identical to the kernel they replaced (same
+keys, same order, same per-key sub-group reduction, same online-softmax
+updates; only the memory source and the scheduling changed):
+
+| variant | attn @ 2048 | attn @ 8192 |
+|---|---:|---:|
+| untiled (baseline) | 1.176 s | 10.623 s |
+| tiled through local memory | 1.202 s | **10.391 s** |
+| tiled, flat loader with `e/D`, `e%D` | 1.447 s | — |
+| tiled, reductions batched ahead of the softmax | 2.029 s | — |
+
+Two findings worth keeping:
+
+* **Integer division is not free.** The first tile loader indexed elements
+  flat and computed `e / D`, `e % D` and `(jt+jj) % cap` per element. Xe has no
+  hardware integer divide, and that alone made the tiled kernel *slower* than
+  the untiled one. Hoisting to one division per thread recovered all of it.
+* **Attention here is not bandwidth-bound.** Staging K/V in local memory is the
+  textbook fix and it bought 2% at 8192 and nothing at 2048 — the L2 was already
+  absorbing the reuse. Batching the reductions ahead of the softmax (they are
+  independent; only the softmax updates are ordered) was worse still, because
+  the local-memory round trip costs more than the pipelining saves.
+
+The limiter is the **cross-lane reduction per (query, key) pair**, which the
+exact-arithmetic contract requires: one sub-group reduction per key is what
+reproduces the twin's dot product. No amount of staging or reordering removes
+it.
+
+What does remove it is computing `S = Q·Kᵀ` and `P·V` on the matrix engines.
+Measured floor, one TP shard, 16 heads, T=2048, GEMMs only:
+
+| | 52 layers |
+|---|---:|
+| oneDNN matrix-engine GEMMs (full square, no causal skip) | **0.09 s** |
+| this engine's hand-written attention | 1.18 s |
+
+**13×**, and a real kernel skips roughly half the square on top of that. At
+T=8192 that is the difference between 541 and roughly 1400 tok/s.
+
+The catch is the contract: a matrix-engine kernel has to materialize `S` per
+tile and take max/sum over the tile, which is a *different* softmax schedule
+from the twin's per-key online update. It cannot be bitwise against the eager
+twin or against the flash twin — it needs a third, looser contract, gated on
+the logit envelope. That is precisely the split gemma4 arrived at with its
+opt-in `--flash-prefill` tier, and it is a decision to take deliberately rather
+than slip in. It is the largest remaining prefill win and is not yet
+implemented.
+
+The tiled kernel is kept as the default: it is bitwise-equivalent, marginally
+better at depth, and it is the K/V staging structure a matrix-engine tier would
+build on. `MUSE_GPU_ATTN=plain` selects the untiled one for A/B.
 
 ## Gates (`run_gpu_gates.sh`)
 

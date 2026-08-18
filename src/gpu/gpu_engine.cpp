@@ -439,6 +439,133 @@ namespace muse::gpu
             });
         }
 
+        // Tiled prefill attention.
+        //
+        // IDENTICAL ARITHMETIC to k_attention: the same keys in the same order,
+        // the same per-key sub-group dot, the same online-softmax update. The
+        // only thing that changes is where K and V are read FROM. A work-group
+        // takes BQ consecutive queries of one head and stages each key tile in
+        // local memory, so the tile is fetched from global memory once per BQ
+        // queries instead of once per query.
+        //
+        // That is the whole cost at depth. The untiled kernel re-reads the
+        // cache per (query, head): at T=2048 that is ~894 GB per forward
+        // against a card that streams 599 GB/s, and the profile showed
+        // attention at 49% of prefill, which is exactly what those numbers
+        // predict. Dividing the traffic by BQ moves it off the critical path.
+        //
+        // Because the arithmetic is unchanged, this kernel is bitwise
+        // interchangeable with the untiled one and the gates check that
+        // (chunk-invariance and decode-vs-prefill both cross the boundary).
+        void k_attention_tiled(sycl::queue &q, const uint16_t *qb, const uint16_t *kc,
+                               const uint16_t *vc, float *out, int64_t n, int64_t nq, int64_t D,
+                               int64_t KD, int64_t ld, int64_t pos0, int64_t groups, int64_t cap,
+                               int64_t window, float scaling, int64_t head0, int64_t BQ,
+                               int64_t BK)
+        {
+            const int64_t qtiles = (n + BQ - 1) / BQ;
+            const size_t wg = size_t(BQ) * SG;
+            q.submit([&](sycl::handler &h) {
+                sycl::local_accessor<uint16_t, 1> ks(sycl::range<1>(size_t(BK * D)), h);
+                sycl::local_accessor<uint16_t, 1> vs(sycl::range<1>(size_t(BK * D)), h);
+                h.parallel_for(
+                    sycl::nd_range<1>(size_t(qtiles * nq) * wg, wg),
+                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                        const int64_t gid = int64_t(it.get_group(0));
+                        const int64_t qt = gid % qtiles, hh = gid / qtiles;
+                        auto sg = it.get_sub_group();
+                        const int lane = int(sg.get_local_id()[0]);
+                        const int64_t sgi = int64_t(sg.get_group_id()[0]);
+                        const int64_t lid = int64_t(it.get_local_id(0));
+
+                        const int64_t t = qt * BQ + sgi;
+                        const bool live = t < n;
+                        const int64_t qpos = pos0 + t;
+                        const int64_t g = (head0 + hh) / groups;
+                        const int64_t my_lo =
+                            window > 0 ? sycl::max<int64_t>(0, qpos - window + 1) : 0;
+
+                        // Key range for the WHOLE group, so every sub-group runs
+                        // the same tile loop and the barriers stay aligned.
+                        const int64_t t_lo = qt * BQ;
+                        const int64_t t_hi = sycl::min<int64_t>(t_lo + BQ - 1, n - 1);
+                        const int64_t hi_g = pos0 + t_hi;
+                        const int64_t lo_g =
+                            window > 0 ? sycl::max<int64_t>(0, pos0 + t_lo - window + 1) : 0;
+
+                        constexpr int MAXACC = 16;
+                        float acc[MAXACC], qv[MAXACC];
+                        int na = 0;
+                        for (int64_t i = lane; i < D; i += SG, ++na)
+                        {
+                            acc[na] = 0.f;
+                            qv[na] = live ? bf2f(qb[(hh * D + i) * ld + t]) : 0.f;
+                        }
+                        float mx = -INFINITY, sum = 0.f;
+
+                        // Loader indices, computed ONCE. The obvious flat loop
+                        // (`e / D`, `e % D`, `(jt+jj) % cap` per element) costs
+                        // three integer divisions per element, and Xe has no
+                        // hardware integer divide — that alone made the first
+                        // version of this kernel slower than the untiled one it
+                        // replaced. Everything below is add-and-compare.
+                        const int64_t my_d = lid % D;
+                        const int64_t my_row0 = lid / D;
+                        const int64_t row_step = int64_t(wg) / D;
+
+                        for (int64_t jt = lo_g; jt <= hi_g; jt += BK)
+                        {
+                            const int64_t jn = sycl::min<int64_t>(BK, hi_g - jt + 1);
+                            int64_t slot = jt % cap; // one modulo per tile
+                            slot += my_row0;
+                            if (slot >= cap)
+                                slot -= cap;
+                            for (int64_t jj = my_row0; jj < jn; jj += row_step)
+                            {
+                                ks[size_t(jj * D + my_d)] = kc[slot * KD + g * D + my_d];
+                                vs[size_t(jj * D + my_d)] = vc[slot * KD + g * D + my_d];
+                                slot += row_step;
+                                if (slot >= cap)
+                                    slot -= cap;
+                            }
+                            sycl::group_barrier(it.get_group());
+
+                            if (live)
+                            {
+                                for (int64_t jj = 0; jj < jn; ++jj)
+                                {
+                                    const int64_t j = jt + jj;
+                                    // sub-group-uniform: my_lo and qpos depend
+                                    // only on t
+                                    if (j < my_lo || j > qpos)
+                                        continue;
+                                    float part = 0.f;
+                                    for (int a = 0, i = lane; a < na; ++a, i += SG)
+                                        part += qv[a] * bf2f(ks[size_t(jj * D + i)]);
+                                    const float sc =
+                                        sycl::reduce_over_group(sg, part, sycl::plus<float>()) *
+                                        scaling;
+                                    const float m2 = sycl::max(mx, sc);
+                                    const float corr = sycl::exp(mx - m2);
+                                    const float ex = sycl::exp(sc - m2);
+                                    sum = sum * corr + ex;
+                                    for (int a = 0, i = lane; a < na; ++a, i += SG)
+                                        acc[a] = acc[a] * corr + ex * bf2f(vs[size_t(jj * D + i)]);
+                                    mx = m2;
+                                }
+                            }
+                            sycl::group_barrier(it.get_group());
+                        }
+                        if (live)
+                        {
+                            const float inv = 1.0f / sum;
+                            for (int a = 0, i = lane; a < na; ++a, i += SG)
+                                out[(hh * D + i) * ld + t] = acc[a] * inv;
+                        }
+                    });
+            });
+        }
+
         // output gate from the PRE-attention normed input: one BF16
         // materialization per nn.Linear output, then one per elementwise op
         void k_out_gate(sycl::queue &q, const float *of, const float *gf, uint16_t *ob,
@@ -621,11 +748,28 @@ namespace muse::gpu
         class SyclEngine final : public Engine
         {
         public:
+            // Selects the cards AND enables peer access between them.
+            //
+            // The ordering is load-bearing and not obvious: the Level-Zero V2
+            // adapter establishes its cross-device mappings when the spanning
+            // context is CREATED, so peer access has to be enabled before that.
+            // Enabling it afterwards is not an error — it just silently leaves
+            // the mappings absent, and every cross-card copy then crawls
+            // through a fallback (measured here: 0.4 GB/s against 28 for host
+            // staging and 48 for a properly mapped peer copy). This function
+            // runs before ctx_ because `used_` is declared before it.
             static std::vector<sycl::device> pick_devices(int want)
             {
                 auto all = sycl::device::get_devices(sycl::info::device_type::gpu);
                 const int n = want > 0 ? std::min<int>(want, int(all.size())) : 1;
-                return std::vector<sycl::device>(all.begin(), all.begin() + n);
+                std::vector<sycl::device> devs(all.begin(), all.begin() + n);
+                for (int i = 0; i < n; ++i)
+                    for (int j = 0; j < n; ++j)
+                        if (i != j &&
+                            devs[size_t(i)].ext_oneapi_can_access_peer(
+                                devs[size_t(j)], sycl::ext::oneapi::peer_access::access_supported))
+                            devs[size_t(i)].ext_oneapi_enable_peer_access(devs[size_t(j)]);
+                return devs;
             }
 
             SyclEngine(const Config &c, const Weights &w, const EngineOptions &opt)
@@ -648,11 +792,26 @@ namespace muse::gpu
 
                 block_ = opt.block;
                 max_seq_ = opt.max_seq;
+                // Tile geometry for the prefill attention. BQ queries share one
+                // staged key tile; BK is whatever keeps both tiles inside 32 KiB
+                // of local memory (the card has 128 KiB, but smaller tiles leave
+                // room for more concurrent work-groups).
+                attn_bq_ = 8;
+                attn_bk_ = std::clamp<int64_t>(8192 / c.head_dim, 8, 64);
+                // the tile loader gives each thread one (row, dim) slot, so the
+                // work-group must cover head_dim exactly
+                tiled_attn_ = (attn_bq_ * SG) % c.head_dim == 0 &&
+                              c.head_dim <= attn_bq_ * SG;
+                if (const char *e = getenv("MUSE_GPU_ATTN"); e && std::string(e) == "plain")
+                    tiled_attn_ = false;
                 if (const char *e = getenv("MUSE_GPU_DECODE_GEMV"); e && *e && *e != '0')
                     decode_gemv_ = true;
                 trace_dir_ = getenv("MUSE_GPU_TRACE");
-                if (const char *e = getenv("MUSE_GPU_P2P"); e && *e && *e != '0')
-                    p2p_ = true;
+                // direct card-to-card by default; MUSE_GPU_XFER=host selects
+                // the pinned-host staging path (same speed, one hop longer)
+                p2p_ = true;
+                if (const char *e = getenv("MUSE_GPU_XFER"); e && std::string(e) == "host")
+                    p2p_ = false;
                 if (const char *e = getenv("MUSE_GPU_PROFILE"); e && *e && *e != '0')
                     prof_on_ = true;
                 // k_attention carries head_dim/SG accumulators per lane in a
@@ -678,12 +837,15 @@ namespace muse::gpu
 #endif
                 }
 
+                peer_probe("before weight upload");
+
                 auto t0 = std::chrono::steady_clock::now();
                 upload_weights(w);
                 alloc_scratch();
                 // after alloc_scratch: the check drives the real gemm(), which
                 // uses the packing scratch on its n == 1 path
                 self_check();
+                peer_probe("after weights + scratch");
                 for (auto &d : shards_)
                     d.q.wait();
                 tim_.upload_s =
@@ -924,7 +1086,7 @@ namespace muse::gpu
                     d.q.memcpy(d.rope_sin, sin32.data(), sin32.size() * 4);
                     d.q.wait();
                 }
-                if (ns > 1)
+                if (ns > 1 && !p2p_)
                 {
                     // pinned: pageable host memory would halve the transfer
                     host_ring_ = sycl::malloc_host<float>(size_t(ns * B * H), ctx_);
@@ -965,25 +1127,30 @@ namespace muse::gpu
                     shards_[size_t(sh)].q.wait();
                 const auto tp = std::chrono::steady_clock::now();
 
-                // Transport. Direct card-to-card memcpy is the obvious choice
-                // and benchmarks at ~48 GB/s in isolation, but measured 0.4
-                // GB/s inside this engine — 70x slower — for reasons that do
-                // not reproduce standalone (not VRAM pressure, not a
-                // kernel-written source; both were tested). Staging through
-                // PINNED host memory is a hop longer and still ~26 GB/s, so it
-                // is the default. MUSE_GPU_P2P=1 selects the direct path for
-                // re-measuring when the driver changes.
+                // Transport: direct card-to-card, serialized (see below), with
+                // pinned-host staging available via MUSE_GPU_XFER=host. Both
+                // land at ~27 GB/s, which is the PCIe link, so the choice is
+                // about robustness rather than speed.
                 std::vector<sycl::event> ev;
                 if (p2p_)
                 {
-                    for (int64_t sh = 0; sh < ns; ++sh)
-                        for (int64_t r = 0; r < ns; ++r)
+                    // PULL, not push: issued on the DESTINATION's queue, which
+                    // is how both sibling repos do it.
+                    //
+                    // SERIALIZED, one leg at a time. Letting both cards pull
+                    // from each other concurrently is bimodal on this driver:
+                    // the same 13.6 MB disjoint exchange measures 0.56 ms
+                    // (48 GB/s) on one run and 639 ms on the next, with no
+                    // change in size, alignment or aliasing. Serializing costs
+                    // the concurrency but is stable at 28 GB/s — the same rate
+                    // host staging achieves, and PCIe is the limit either way.
+                    for (int64_t r = 0; r < ns; ++r)
+                        for (int64_t sh = 0; sh < ns; ++sh)
                             if (r != sh)
-                                ev.push_back(shards_[size_t(sh)].q.memcpy(
-                                    shards_[size_t(r)].peer + sh * slot,
-                                    shards_[size_t(sh)].peer + sh * slot, bytes));
-                    for (auto &e : ev)
-                        e.wait();
+                                shards_[size_t(r)]
+                                    .q.memcpy(shards_[size_t(r)].peer + sh * slot,
+                                              shards_[size_t(sh)].peer + sh * slot, bytes)
+                                    .wait();
                 }
                 else
                 {
@@ -1221,8 +1388,14 @@ namespace muse::gpu
                         // shard sh owns q heads [sh*nqs, (sh+1)*nqs); the KV
                         // cache is replicated, so the kernel needs the global
                         // head offset to pick the right GQA group
-                        k_attention(d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.of, n, nqs,
-                                    D, KD, B, pos0, groups, l.cap, window, scaling, sh * nqs);
+                        if (n > 1 && tiled_attn_)
+                            k_attention_tiled(d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.of,
+                                              n, nqs, D, KD, B, pos0, groups, l.cap, window,
+                                              scaling, sh * nqs, attn_bq_, attn_bk_);
+                        else
+                            k_attention(d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.of, n,
+                                        nqs, D, KD, B, pos0, groups, l.cap, window, scaling,
+                                        sh * nqs);
                     }
                     toc(S_ATTN);
 
@@ -1260,7 +1433,7 @@ namespace muse::gpu
                         k_swiglu(d.q, d.g1, d.u1, d.g1b, Is, n, B);
                         gemm(int(sh), l.mlp_down[size_t(sh)], d.g1b, d.xf, n, Is, H, B, B);
                     }
-                    toc(S_OPROJ);
+                    toc(S_MLP);
                     tic();
                     all_reduce(n, B);
                     toc(S_XFER);
@@ -1308,6 +1481,99 @@ namespace muse::gpu
                                   size_t(Vs) * 4)
                         .wait();
                 toc(S_HEAD);
+            }
+
+            // Time a cross-card copy at a known point in startup. Peer copies
+            // measured 48 GB/s standalone and 0.3 GB/s inside this engine; this
+            // says whether the collapse happens before or after the weights
+            // land, which is the difference between an allocation-pattern
+            // problem and a mapping problem.
+            void peer_probe(const char *when)
+            {
+                if (nshard_ < 2 || !getenv("MUSE_GPU_PEER_PROBE"))
+                    return;
+                // size to the engine's own block so the peer buffers are valid
+                const size_t n = size_t(block_) * size_t(cfg_->hidden_size), bytes = n * 4;
+                // 2 slots each, so the two directions touch DISJOINT regions —
+                // exactly what all_reduce does. An aliased pair is a data race
+                // and measures nonsense (or kills the device).
+                float *a = sycl::malloc_device<float>(2 * n, shards_[0].q);
+                float *b = sycl::malloc_device<float>(2 * n, shards_[1].q);
+                if (!a || !b)
+                {
+                    std::fprintf(stderr, "[peer] %s: alloc failed\n", when);
+                    return;
+                }
+                shards_[0].q.memset(a, 1, 2 * bytes).wait();
+                shards_[1].q.memset(b, 2, 2 * bytes).wait();
+                const int64_t slot = block_ * cfg_->hidden_size;
+                auto bench = [&](const char *what, auto &&fn, double payload) {
+                    fn();
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < 10; ++i)
+                        fn();
+                    const double sec =
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                            .count() /
+                        10;
+                    std::fprintf(stderr, "[peer] %-22s %-30s %7.3f ms  %6.1f GB/s\n", when, what,
+                                 sec * 1e3, payload / sec / 1e9);
+                };
+                bench("1 pull, own buffers", [&] { shards_[0].q.memcpy(a, b, bytes).wait(); },
+                      double(bytes));
+                bench("2 pulls, disjoint regions",
+                      [&] {
+                          auto e0 = shards_[0].q.memcpy(a, b, bytes);           // dev1[0]  -> dev0[0]
+                          auto e1 = shards_[1].q.memcpy(b + n, a + n, bytes);   // dev0[1] -> dev1[1]
+                          e0.wait();
+                          e1.wait();
+                      },
+                      2.0 * double(bytes));
+                bench("2 pulls, serialized",
+                      [&] {
+                          shards_[0].q.memcpy(a, b, bytes).wait();
+                          shards_[1].q.memcpy(b + n, a + n, bytes).wait();
+                      },
+                      2.0 * double(bytes));
+                // the combination all_reduce actually performs: a kernel writes
+                // the source region, then the peer PULLS it
+                bench("kernel-write then 2 pulls",
+                      [&] {
+                          shards_[0].q.parallel_for(sycl::range<1>(n),
+                                                    [=](sycl::id<1> i) { a[n + i] = float(i); });
+                          shards_[1].q.parallel_for(sycl::range<1>(n),
+                                                    [=](sycl::id<1> i) { b[i] = float(i); });
+                          shards_[0].q.wait();
+                          shards_[1].q.wait();
+                          auto e0 = shards_[0].q.memcpy(a, b, bytes);
+                          auto e1 = shards_[1].q.memcpy(b + n, a + n, bytes);
+                          e0.wait();
+                          e1.wait();
+                      },
+                      2.0 * double(bytes));
+                if (shards_[0].peer && shards_[1].peer)
+                {
+                    bench("1 pull, peer buffers",
+                          [&] {
+                              shards_[0]
+                                  .q.memcpy(shards_[0].peer + slot, shards_[1].peer + slot, bytes)
+                                  .wait();
+                          },
+                          double(bytes));
+                    bench("2 pulls, peer buffers (all_reduce)",
+                          [&] {
+                              auto e0 = shards_[0].q.memcpy(shards_[0].peer + slot,
+                                                            shards_[1].peer + slot, bytes);
+                              auto e1 = shards_[1].q.memcpy(shards_[1].peer, shards_[0].peer,
+                                                            bytes);
+                              e0.wait();
+                              e1.wait();
+                          },
+                          2.0 * double(bytes));
+                }
+                sycl::free(a, shards_[0].q);
+                sycl::free(b, shards_[1].q);
+                std::fflush(stderr);
             }
 
             // Prove, on this machine and this oneDNN build, that the GEMM
@@ -1442,7 +1708,9 @@ namespace muse::gpu
             sycl::context ctx_;
             int ngpu_ = 1, nshard_ = 1;
             bool decode_gemv_ = false;
-            bool p2p_ = false;
+            bool p2p_ = true;
+            int64_t attn_bq_ = 8, attn_bk_ = 64;
+            bool tiled_attn_ = true;
             float *host_ring_ = nullptr; // pinned staging, ns * block * H floats
             const char *trace_dir_ = nullptr;
             // Stage attribution. Only armed by MUSE_GPU_PROFILE, because it
