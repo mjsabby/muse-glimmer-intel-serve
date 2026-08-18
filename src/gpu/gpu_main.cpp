@@ -49,7 +49,8 @@ namespace
         std::fprintf(stderr,
                      "usage: muse-gpu --model DIR --ids A,B,C [options]\n"
                      "  --out DIR          artifact directory (default out/gpu)\n"
-                     "  --gpus N           cards to split the weights across (default 2)\n"
+                     "  --gpus N           physical cards to use (default 2)\n"
+                     "  --shards N         tensor-parallel shards (default: one per card)\n"
                      "  --chunk N          prefill block width (default 512)\n"
                      "  --max-seq N        KV allocation ceiling (default prompt+decode+64)\n"
                      "  --decode N         greedy-decode N tokens after prefill\n"
@@ -64,7 +65,7 @@ int main(int argc, char **argv)
 {
     std::string model, ids_spec, out_dir = "out/gpu", revision = "main";
     int64_t chunk = 512, max_seq = 0, decode_n = 0;
-    int gpus = 2, topk = 5;
+    int gpus = 2, shards = 0, topk = 5;
     bool no_dnnl = false;
 
     for (int i = 1; i < argc; ++i)
@@ -88,6 +89,8 @@ int main(int argc, char **argv)
             revision = next();
         else if (a == "--gpus")
             gpus = std::stoi(next());
+        else if (a == "--shards")
+            shards = std::stoi(next());
         else if (a == "--chunk")
             chunk = std::stoll(next());
         else if (a == "--max-seq")
@@ -140,6 +143,7 @@ int main(int argc, char **argv)
 
         muse::gpu::EngineOptions opt;
         opt.gpus = gpus;
+        opt.shards = shards;
         opt.block = chunk;
         opt.max_seq = max_seq;
         opt.no_dnnl = no_dnnl;
@@ -172,7 +176,8 @@ int main(int argc, char **argv)
         std::ostringstream bm;
         bm << "{\n \"kind\": \"gpu_sycl\",\n \"T\": 1,\n \"V\": " << cfg.vocab_size
            << ",\n \"prompt_len\": " << T << ",\n \"decode\": " << decode_n
-           << ",\n \"gpus\": " << gpus << ",\n \"chunk\": " << chunk
+           << ",\n \"gpus\": " << gpus << ",\n \"shards\": " << (shards > 0 ? shards : gpus)
+           << ",\n \"chunk\": " << chunk
            << ",\n \"max_seq\": " << max_seq << ",\n \"prefill_tok_s\": "
            << (tm.prefill_s > 0 ? double(tm.prefill_tokens) / tm.prefill_s : 0.0)
            << ",\n \"decode_tok_s\": "

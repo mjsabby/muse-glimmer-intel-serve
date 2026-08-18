@@ -48,7 +48,13 @@ namespace muse::gpu
     {
         int64_t max_seq = 4096;   // allocation ceiling for the KV caches
         int64_t block = 512;      // widest prefill chunk
-        int gpus = 1;             // cards to shard the weights across
+        int gpus = 1;             // physical cards to use
+        // Tensor-parallel shards. 0 means "one per card". Setting it larger
+        // than `gpus` puts several shards on one card, which changes only
+        // WHERE the arithmetic happens: the split is what fixes the reduction
+        // order, so --shards 2 --gpus 1 and --shards 2 --gpus 2 are bitwise
+        // identical and that equality is the dual-GPU gate.
+        int shards = 0;
         bool profile = false;
         bool verbose = false;
         // Force the oneDNN matmul off and use the hand-written SYCL GEMV

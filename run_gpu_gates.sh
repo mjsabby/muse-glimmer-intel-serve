@@ -7,7 +7,8 @@
 #   3. GEMM routes      oneDNN and the hand-written SYCL GEMM must agree
 #   4. decode == prefill  decoding N tokens must match prefilling the same seq
 #   5. determinism      reruns bit-identical
-#   6. device split     1 GPU == 2 GPUs (a layer split is not a numerics change)
+#   6. tensor parallel  --shards N fixes the arithmetic, --gpus M only places it,
+#                       so 1 card and 2 cards must agree bitwise (Phase 8 exit gate)
 #
 # Usage: ./run_gpu_gates.sh [tiny-dir]
 set -euo pipefail
@@ -49,11 +50,13 @@ echo "== visible GPUs: ${ngpu:-0} =="
 echo "== vs the bf16 twin (the referee) =="
 $CPU --model "$MODEL" --ids "$IDS" --out "$OUT/twin" --exec bf16 --chunk 16 --max-seq 256 \
     >/dev/null 2>&1
-run_gpu "$OUT/g16" --gpus 1 --chunk 16
-same "gpu == bf16 twin" "$OUT/g16" "$OUT/twin"
+run_gpu "$OUT/g16" --shards 1 --gpus 1 --chunk 16
+same "gpu (1 shard) == bf16 twin" "$OUT/g16" "$OUT/twin"
+run_gpu "$OUT/g16_tp" --shards 2 --gpus 1 --chunk 16
+same "gpu (2 shards) == bf16 twin" "$OUT/g16_tp" "$OUT/twin"
 
 echo "== chunk invariance (the ring must hold window + chunk rows) =="
-for ch in 1 2 4 8 16; do run_gpu "$OUT/ch_$ch" --gpus 1 --chunk "$ch"; done
+for ch in 1 2 4 8 16; do run_gpu "$OUT/ch_$ch" --shards 2 --gpus 1 --chunk "$ch"; done
 ok=1
 for ch in 1 2 4 8; do
     cmp -s "$OUT/ch_16/logits.bin" "$OUT/ch_$ch/logits.bin" || { ok=0; fail "chunk $ch differs from 16"; }
@@ -64,16 +67,16 @@ echo "== the two GEMM routes agree =="
 # oneDNN 3.11.2 silently drops the B-handle offset when the matrix has one
 # column, which made the head GEMM and every decode step wrong while every
 # layer stayed bitwise correct. This gate is why that is not still true.
-run_gpu "$OUT/nodnnl" --gpus 1 --chunk 16 --no-dnnl
+run_gpu "$OUT/nodnnl" --shards 1 --gpus 1 --chunk 16 --no-dnnl
 same "oneDNN == hand-written SYCL GEMM" "$OUT/g16" "$OUT/nodnnl"
 
 echo "== decode == prefill on the same sequence =="
 SHORT="1,5,7,11,13,17,19,23"
-$GPU --model "$MODEL" --ids "$SHORT" --out "$OUT/dec" --max-seq 256 --gpus 1 --chunk 8 \
-    --decode 8 >/dev/null 2>&1
+$GPU --model "$MODEL" --ids "$SHORT" --out "$OUT/dec" --max-seq 256 --shards 2 --gpus 1 \
+    --chunk 8 --decode 8 >/dev/null 2>&1
 GEN=$(.venv/bin/python -c "import json;print(','.join(map(str,json.load(open('$OUT/dec/meta.json'))['generated'])))")
-$GPU --model "$MODEL" --ids "$SHORT,$GEN" --out "$OUT/pre" --max-seq 256 --gpus 1 --chunk 16 \
-    >/dev/null 2>&1
+$GPU --model "$MODEL" --ids "$SHORT,$GEN" --out "$OUT/pre" --max-seq 256 --shards 2 \
+    --gpus 1 --chunk 16 >/dev/null 2>&1
 # prefilling prompt+generated must land on the same next-token distribution the
 # last decode step produced
 if cmp -s "$OUT/dec/logits.bin" "$OUT/pre/logits.bin"; then
@@ -83,31 +86,43 @@ else
 fi
 
 echo "== determinism =="
-run_gpu "$OUT/rep1" --gpus 1 --chunk 16
-run_gpu "$OUT/rep2" --gpus 1 --chunk 16
+run_gpu "$OUT/rep1" --shards 2 --gpus 1 --chunk 16
+run_gpu "$OUT/rep2" --shards 2 --gpus 1 --chunk 16
 same "rerun bit-identical" "$OUT/rep1" "$OUT/rep2"
 
+echo "== tensor parallelism: the split is arithmetic, the cards are placement =="
+# Sharding fixes the reduction order (o_proj and mlp_down become partial sums
+# that are added in shard order). WHERE a shard runs must therefore not change
+# a single bit — so `--shards 2` on one card and on two cards have to agree
+# exactly. That equality is Phase 8's exit gate, and it only means anything
+# because the shard count is what varies the arithmetic, not the card count.
+run_gpu "$OUT/tp2x1" --shards 2 --gpus 1 --chunk 16
 if [[ "${ngpu:-0}" -ge 2 ]]; then
-    echo "== device split is not a numerics change =="
-    run_gpu "$OUT/g2" --gpus 2 --chunk 16
-    same "1 GPU == 2 GPUs (prefill)" "$OUT/g16" "$OUT/g2"
+    run_gpu "$OUT/tp2x2" --shards 2 --gpus 2 --chunk 16
+    same "shards 2: 1 card == 2 cards (prefill)" "$OUT/tp2x1" "$OUT/tp2x2"
 
-    # Prefill alone does NOT cover the layer-split handoff. The residual stream
-    # is dim-major [H, block], so its live region is contiguous only when
+    # Prefill alone does NOT cover the cross-card path. The residual stream is
+    # dim-major [H, block], so its live region is contiguous only when
     # n == block — true for a full prefill chunk, false for every decode step.
-    # A prefill-only cross-card gate passes while decode silently reads the
-    # wrong columns, which is exactly what happened here on the 30B.
-    $GPU --model "$MODEL" --ids "$IDS" --out "$OUT/d1" --max-seq 256 --gpus 1 --chunk 16 \
-        --decode 8 >/dev/null 2>&1
-    $GPU --model "$MODEL" --ids "$IDS" --out "$OUT/d2" --max-seq 256 --gpus 2 --chunk 16 \
-        --decode 8 >/dev/null 2>&1
-    same "1 GPU == 2 GPUs (decode, n < block)" "$OUT/d1" "$OUT/d2"
+    # A prefill-only gate passed here while decode silently read the wrong
+    # columns on the 30B.
+    $GPU --model "$MODEL" --ids "$IDS" --out "$OUT/d1" --max-seq 256 --shards 2 --gpus 1 \
+        --chunk 16 --decode 8 >/dev/null 2>&1
+    $GPU --model "$MODEL" --ids "$IDS" --out "$OUT/d2" --max-seq 256 --shards 2 --gpus 2 \
+        --chunk 16 --decode 8 >/dev/null 2>&1
+    same "shards 2: 1 card == 2 cards (decode, n < block)" "$OUT/d1" "$OUT/d2"
     g1=$(.venv/bin/python -c "import json;print(json.load(open('$OUT/d1/meta.json'))['generated'])")
     g2=$(.venv/bin/python -c "import json;print(json.load(open('$OUT/d2/meta.json'))['generated'])")
     [[ "$g1" == "$g2" ]] && pass "generated tokens agree $g1" \
                          || fail "generated differ: $g1 vs $g2"
+
+    # every shard must hold the SAME reduced residual stream: the norms after
+    # an all-reduce are replicated, so a one-ulp disagreement between shards
+    # would compound instead of averaging out
+    run_gpu "$OUT/tp4" --shards 2 --gpus 2 --chunk 16
+    same "2-card run is reproducible" "$OUT/tp2x2" "$OUT/tp4"
 else
-    echo "== device split: skipped (needs 2 cards) =="
+    echo "  (only one card visible: cross-card gates skipped)"
 fi
 
 exit $rc

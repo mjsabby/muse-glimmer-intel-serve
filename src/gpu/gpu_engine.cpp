@@ -82,9 +82,13 @@ namespace muse::gpu
 
         // --------------------------------------------------------- device side
 
+        // One tensor-parallel shard. Shards map onto physical cards by
+        // `gpu`; two shards may share a card (that is how the 1-GPU vs 2-GPU
+        // bitwise gate runs on the tiny model).
         struct Dev
         {
             sycl::device dev;
+            int gpu = 0;
             sycl::queue q;
 #if ORACLE_GPU_DNNL
             dnnl::engine eng;
@@ -111,17 +115,34 @@ namespace muse::gpu
             float *rope_cos = nullptr, *rope_sin = nullptr;
             int32_t *ids = nullptr;
             uint16_t *pack = nullptr; // one packed activation column, for k_gemv1
-            float *xfer = nullptr;    // contiguous [H, n] staging for the layer-split handoff
+            float *xfer = nullptr;    // contiguous [H, n] staging, for --trace-dir
+            // All-reduce exchange buffer: `nshard` slots of [H, block], slot k
+            // holding shard k's partial. Shard s packs straight into its own
+            // slot, so the reduction reads a uniform array and needs no extra
+            // local copy.
+            float *peer = nullptr;
         };
 
+        // One layer's weights, split across the tensor-parallel shards. Every
+        // array below is indexed by shard.
+        //
+        // The split follows the shapes: q/gate/mlp_gate/mlp_up are sharded on
+        // their OUTPUT dim (contiguous row slices, no communication), o_proj
+        // and mlp_down on their INPUT dim (so each shard produces a partial
+        // [H, n] that must be all-reduced). Norms are replicated because they
+        // are 13 KB and a broadcast is not free.
+        //
+        // k_proj/v_proj and the KV cache are replicated rather than sharded by
+        // KV head. Muse Glimmer has only 2 KV heads and the tiny gate model has
+        // 1, so sharding them would either fail or need a second code path; the
+        // duplicated weight is 3.4 MB per layer per shard and the duplicated
+        // work is ~0.7% of the layer.
         struct GpuLayer
         {
-            int dev = 0;
-            uint16_t *input_ln = nullptr, *post_attn_ln = nullptr, *pre_ff_ln = nullptr,
-                     *post_ff_ln = nullptr;
-            uint16_t *q = nullptr, *k = nullptr, *v = nullptr, *gate = nullptr, *o = nullptr;
-            uint16_t *mlp_gate = nullptr, *mlp_up = nullptr, *mlp_down = nullptr;
-            uint16_t *kc = nullptr, *vc = nullptr; // KV cache, row-major [cap, KD]
+            std::vector<uint16_t *> input_ln, post_attn_ln, pre_ff_ln, post_ff_ln; // replicated
+            std::vector<uint16_t *> k, v, kc, vc;                                  // replicated
+            std::vector<uint16_t *> q, gate, mlp_gate, mlp_up;                     // row-sharded
+            std::vector<uint16_t *> o, mlp_down;                                   // col-sharded
             int64_t cap = 0;
         };
 
@@ -362,7 +383,7 @@ namespace muse::gpu
         void k_attention(sycl::queue &q, const uint16_t *qb, const uint16_t *kc,
                          const uint16_t *vc, float *out, int64_t n, int64_t nq, int64_t D,
                          int64_t KD, int64_t ld, int64_t pos0, int64_t groups, int64_t cap,
-                         int64_t window, float scaling)
+                         int64_t window, float scaling, int64_t head0)
         {
             const int64_t rows = n * nq;
             q.submit([&](sycl::handler &h) {
@@ -374,7 +395,10 @@ namespace muse::gpu
                         auto sg = it.get_sub_group();
                         const int lane = int(sg.get_local_id()[0]);
 
-                        const int64_t qpos = pos0 + t, g = hh / groups;
+                        // `hh` is local to this shard; the GQA group index must
+                        // come from the global head number because the KV cache
+                        // holds all heads.
+                        const int64_t qpos = pos0 + t, g = (head0 + hh) / groups;
                         const int64_t lo = window > 0 ? sycl::max<int64_t>(0, qpos - window + 1) : 0;
 
                         // at head_dim 128 and SG 32 this is 4 accumulators
@@ -508,6 +532,25 @@ namespace muse::gpu
             });
         }
 
+        // Sum the shards' packed partials and scatter the total back into a
+        // dim-major [dim, n] buffer with leading dimension `ld`.
+        //
+        // The loop runs in SHARD ORDER on every shard, so all shards compute
+        // bit-identical totals. That matters more than it looks: the norms
+        // after an all-reduce are replicated, so if two shards disagreed by one
+        // ulp here their residual streams would diverge and stay diverged.
+        void k_sum_shards(sycl::queue &q, const float *src, float *dst, int64_t nsh,
+                          int64_t slot, int64_t dim, int64_t n, int64_t ld)
+        {
+            q.parallel_for(sycl::range<2>(size_t(dim), size_t(n)), [=](sycl::id<2> id) {
+                const int64_t i = int64_t(id[0]), t = int64_t(id[1]);
+                float acc = src[i * n + t];
+                for (int64_t k = 1; k < nsh; ++k)
+                    acc += src[k * slot + i * n + t];
+                dst[i * ld + t] = acc;
+            });
+        }
+
         // Decode GEMV: Y[out] = W[out, in] * X[in], X packed. One sub-group per
         // output row with 8 bf16 per lane per step, so a sub-group pulls 512
         // contiguous bytes at a time instead of 64. Decode is weight-bandwidth
@@ -578,19 +621,38 @@ namespace muse::gpu
         class SyclEngine final : public Engine
         {
         public:
-            SyclEngine(const Config &c, const Weights &w, const EngineOptions &opt)
-                : cfg_(&c), opt_(opt)
+            static std::vector<sycl::device> pick_devices(int want)
             {
                 auto all = sycl::device::get_devices(sycl::info::device_type::gpu);
-                if (all.empty())
+                const int n = want > 0 ? std::min<int>(want, int(all.size())) : 1;
+                return std::vector<sycl::device>(all.begin(), all.begin() + n);
+            }
+
+            SyclEngine(const Config &c, const Weights &w, const EngineOptions &opt)
+                : cfg_(&c), opt_(opt), used_(pick_devices(opt.gpus)),
+                  ctx_(used_.empty() ? sycl::context() : sycl::context(used_))
+            {
+                if (used_.empty())
                     die("no Level-Zero GPU visible (check ONEAPI_DEVICE_SELECTOR and /dev/dri)");
-                ngpu_ = opt.gpus > 0 ? std::min<int>(opt.gpus, int(all.size())) : 1;
+                ngpu_ = int(used_.size());
+                nshard_ = opt.shards > 0 ? opt.shards : ngpu_;
+
+                // The tensor-parallel split has to divide the tensors it cuts.
+                // Checked here rather than discovered as a wrong logit later.
+                const int64_t ns = nshard_;
+                if (c.num_attention_heads % ns || c.intermediate_size % ns || c.vocab_size % ns)
+                    die("cannot split " + std::to_string(ns) + " ways: needs " +
+                        std::to_string(c.num_attention_heads) + " q heads, " +
+                        std::to_string(c.intermediate_size) + " intermediate and " +
+                        std::to_string(c.vocab_size) + " vocab all divisible");
 
                 block_ = opt.block;
                 max_seq_ = opt.max_seq;
                 if (const char *e = getenv("MUSE_GPU_DECODE_GEMV"); e && *e && *e != '0')
                     decode_gemv_ = true;
                 trace_dir_ = getenv("MUSE_GPU_TRACE");
+                if (const char *e = getenv("MUSE_GPU_P2P"); e && *e && *e != '0')
+                    p2p_ = true;
                 if (const char *e = getenv("MUSE_GPU_PROFILE"); e && *e && *e != '0')
                     prof_on_ = true;
                 // k_attention carries head_dim/SG accumulators per lane in a
@@ -600,17 +662,19 @@ namespace muse::gpu
                     die("head_dim " + std::to_string(c.head_dim) + " exceeds the attention "
                         "kernel's per-lane accumulator bound (" + std::to_string(SG * 16) + ")");
 
-                devs_.resize(size_t(ngpu_));
-                for (int i = 0; i < ngpu_; ++i)
+                // One context spanning every card in use. Without it the
+                // shards' USM pointers live in different contexts and the
+                // cross-card memcpy the all-reduce depends on is invalid.
+                shards_.resize(size_t(nshard_));
+                for (int i = 0; i < nshard_; ++i)
                 {
-                    devs_[size_t(i)].dev = all[size_t(i)];
-                    devs_[size_t(i)].q =
-                        sycl::queue(all[size_t(i)], sycl::property::queue::in_order{});
+                    Dev &d = shards_[size_t(i)];
+                    d.gpu = i % ngpu_;
+                    d.dev = used_[size_t(d.gpu)];
+                    d.q = sycl::queue(ctx_, d.dev, sycl::property::queue::in_order{});
 #if ORACLE_GPU_DNNL
-                    devs_[size_t(i)].eng = dnnl::sycl_interop::make_engine(
-                        all[size_t(i)], devs_[size_t(i)].q.get_context());
-                    devs_[size_t(i)].strm = dnnl::sycl_interop::make_stream(
-                        devs_[size_t(i)].eng, devs_[size_t(i)].q);
+                    d.eng = dnnl::sycl_interop::make_engine(d.dev, ctx_);
+                    d.strm = dnnl::sycl_interop::make_stream(d.eng, d.q);
 #endif
                 }
 
@@ -620,25 +684,29 @@ namespace muse::gpu
                 // after alloc_scratch: the check drives the real gemm(), which
                 // uses the packing scratch on its n == 1 path
                 self_check();
-                for (auto &d : devs_)
+                for (auto &d : shards_)
                     d.q.wait();
                 tim_.upload_s =
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
                 if (opt.verbose)
                 {
-                    std::fprintf(stderr, "[gpu] %d card(s), %.2f GiB weights, %.2f GiB KV, "
-                                         "upload %.1f s\n",
-                                 ngpu_, double(wbytes_) / 1073741824.0,
+                    std::fprintf(stderr,
+                                 "[gpu] %d shard(s) on %d card(s), %.2f GiB weights "
+                                 "(%.2f/shard), %.2f GiB KV, upload %.1f s\n",
+                                 nshard_, ngpu_, double(wbytes_) / 1073741824.0,
+                                 double(wbytes_) / 1073741824.0 / nshard_,
                                  double(kvbytes_) / 1073741824.0, tim_.upload_s);
                 }
             }
 
             ~SyclEngine() override
             {
+                if (host_ring_)
+                    sycl::free(host_ring_, ctx_);
                 for (const auto &p : owned_)
                     if (p.second >= 0 && p.first)
-                        sycl::free(p.first, devs_[size_t(p.second)].q);
+                        sycl::free(p.first, shards_[size_t(p.second)].q);
             }
 
             void prefill(const std::vector<int64_t> &ids, float *logits_last) override
@@ -670,8 +738,8 @@ namespace muse::gpu
 
             void report_profile(std::FILE *f) const override
             {
-                std::fprintf(f, "  weights   %8.2f GiB on %d card(s)\n",
-                             double(wbytes_) / 1073741824.0, ngpu_);
+                std::fprintf(f, "  weights   %8.2f GiB, %d shard(s) on %d card(s)\n",
+                             double(wbytes_) / 1073741824.0, nshard_, ngpu_);
                 std::fprintf(f, "  kv cache  %8.2f GiB\n", double(kvbytes_) / 1073741824.0);
                 std::fprintf(f, "  upload    %8.2f s\n", tim_.upload_s);
                 if (tim_.prefill_tokens)
@@ -695,6 +763,12 @@ namespace muse::gpu
                             std::fprintf(f, "  %-14s %8.3f s  %5.1f%%\n", nm[i], stage_s_[i],
                                          100.0 * stage_s_[i] / tot);
                     std::fprintf(f, "  %-14s %8.3f s\n", "total", tot);
+                    if (ar_calls_)
+                        std::fprintf(f,
+                                     "  all-reduce: %ld calls  pack %.3f s  exchange %.3f s "
+                                     "(%.2f GB, %.1f GB/s)  sum %.3f s\n",
+                                     ar_calls_, ar_pack_s_, ar_xchg_s_, ar_bytes_ / 1e9,
+                                     ar_bytes_ / ar_xchg_s_ / 1e9, ar_sum_s_);
                 }
             }
 
@@ -703,7 +777,7 @@ namespace muse::gpu
 
             template <class T> T *dalloc(int dev, size_t count)
             {
-                auto &d = devs_[size_t(dev)];
+                auto &d = shards_[size_t(dev)];
                 T *p = sycl::malloc_device<T>(count, d.q);
                 if (!p)
                     die("device " + std::to_string(dev) + ": out of memory allocating " +
@@ -715,9 +789,22 @@ namespace muse::gpu
             uint16_t *up(int dev, const uint16_t *src, size_t count)
             {
                 uint16_t *p = dalloc<uint16_t>(dev, count);
-                devs_[size_t(dev)].q.memcpy(p, src, count * 2).wait();
+                shards_[size_t(dev)].q.memcpy(p, src, count * 2).wait();
                 wbytes_ += int64_t(count * 2);
                 return p;
+            }
+
+            // Gather columns [c0, c0+cn) out of a row-major [rows, cols] tensor
+            // and upload. o_proj [H, QD] and mlp_down [H, I] are the
+            // column-sharded pair, and a column range of a row-major tensor is
+            // `rows` strided segments, not a slice.
+            uint16_t *up_cols(int s, const uint16_t *src, int64_t rows, int64_t cols, int64_t c0,
+                              int64_t cn)
+            {
+                stage_.resize(static_cast<size_t>(rows * cn));
+                for (int64_t r = 0; r < rows; ++r)
+                    std::memcpy(stage_.data() + r * cn, src + r * cols + c0, size_t(cn) * 2);
+                return up(s, stage_.data(), static_cast<size_t>(rows * cn));
             }
 
             void upload_weights(const Weights &w)
@@ -726,66 +813,77 @@ namespace muse::gpu
                 auto v = muse::bf16::bind(w);
                 const int64_t H = c.hidden_size, I = c.intermediate_size, V = c.vocab_size;
                 const int64_t QD = c.q_dim(), KD = c.kv_dim();
-                const int64_t L = c.num_hidden_layers;
+                const int64_t L = c.num_hidden_layers, ns = nshard_;
+                const int64_t QDs = QD / ns, Is = I / ns, Vs = V / ns;
 
-                // Layer-split placement. Tensor parallelism (Phase 8) shards
-                // each layer instead; this splits whole layers, which is what
-                // makes BF16 30B fit two 31.9 GiB cards at all. Single-stream
-                // decode latency is the same either way for a layer split —
-                // one card is idle while the other streams — so TP is still
-                // worth doing, it just is not what makes the model run.
+                embed_.assign(size_t(ns), nullptr);
+                lm_head_.assign(size_t(ns), nullptr);
+                final_norm_.assign(size_t(ns), nullptr);
+                for (int64_t sh = 0; sh < ns; ++sh)
+                {
+                    // The embedding table is replicated so every shard can build
+                    // its own copy of the residual stream with no broadcast.
+                    embed_[size_t(sh)] = up(int(sh), v.embed, size_t(V * H));
+                    final_norm_[size_t(sh)] = up(int(sh), v.final_norm, size_t(H));
+                    // vocab-parallel head: shard sh owns rows [sh*Vs, (sh+1)*Vs).
+                    // The multiplier and softcap are elementwise and commute
+                    // with the split, so no reduction is needed here.
+                    lm_head_[size_t(sh)] = up(int(sh), v.lm_head + sh * Vs * H, size_t(Vs * H));
+                }
+
                 layers_.resize(size_t(L));
                 for (int64_t li = 0; li < L; ++li)
-                    layers_[size_t(li)].dev = int(li * ngpu_ / L);
-
-                // embedding and head live with the layers that use them
-                embed_dev_ = layers_.front().dev;
-                head_dev_ = layers_.back().dev;
-                embed_ = up(embed_dev_, v.embed, size_t(V * H));
-                lm_head_ = (v.lm_head == v.embed && head_dev_ == embed_dev_)
-                               ? embed_
-                               : up(head_dev_, v.lm_head, size_t(V * H));
-                final_norm_ = up(head_dev_, v.final_norm, size_t(H));
-
-                for (int64_t li = 0; li < L; ++li)
                 {
-                    const auto &s = v.layers[size_t(li)];
+                    const auto &t = v.layers[size_t(li)];
                     GpuLayer &g = layers_[size_t(li)];
-                    const int dv = g.dev;
-                    g.input_ln = up(dv, s.input_ln, size_t(H));
-                    g.post_attn_ln = up(dv, s.post_attn_ln, size_t(H));
-                    g.pre_ff_ln = up(dv, s.pre_ff_ln, size_t(H));
-                    g.post_ff_ln = up(dv, s.post_ff_ln, size_t(H));
-                    g.q = up(dv, s.q, size_t(QD * H));
-                    g.k = up(dv, s.k, size_t(KD * H));
-                    g.v = up(dv, s.v, size_t(KD * H));
-                    g.gate = up(dv, s.gate, size_t(QD * H));
-                    g.o = up(dv, s.o, size_t(H * QD));
-                    g.mlp_gate = up(dv, s.mlp_gate, size_t(I * H));
-                    g.mlp_up = up(dv, s.mlp_up, size_t(I * H));
-                    g.mlp_down = up(dv, s.mlp_down, size_t(H * I));
-
                     g.cap = c.layer_is_sliding(li) ? std::min(c.sliding_window + block_, max_seq_)
                                                    : max_seq_;
-                    g.kc = dalloc<uint16_t>(dv, size_t(g.cap * KD));
-                    g.vc = dalloc<uint16_t>(dv, size_t(g.cap * KD));
-                    devs_[size_t(dv)].q.memset(g.kc, 0, size_t(g.cap * KD) * 2);
-                    devs_[size_t(dv)].q.memset(g.vc, 0, size_t(g.cap * KD) * 2);
-                    kvbytes_ += int64_t(g.cap * KD) * 4;
+                    for (auto *arr : {&g.input_ln, &g.post_attn_ln, &g.pre_ff_ln, &g.post_ff_ln,
+                                      &g.k, &g.v, &g.kc, &g.vc, &g.q, &g.gate, &g.mlp_gate,
+                                      &g.mlp_up, &g.o, &g.mlp_down})
+                        arr->assign(size_t(ns), nullptr);
+
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        const int d = int(sh);
+                        const size_t k = size_t(sh);
+                        g.input_ln[k] = up(d, t.input_ln, size_t(H));
+                        g.post_attn_ln[k] = up(d, t.post_attn_ln, size_t(H));
+                        g.pre_ff_ln[k] = up(d, t.pre_ff_ln, size_t(H));
+                        g.post_ff_ln[k] = up(d, t.post_ff_ln, size_t(H));
+                        g.k[k] = up(d, t.k, size_t(KD * H));
+                        g.v[k] = up(d, t.v, size_t(KD * H));
+                        // row shards: contiguous slices of a row-major [out, in]
+                        g.q[k] = up(d, t.q + sh * QDs * H, size_t(QDs * H));
+                        g.gate[k] = up(d, t.gate + sh * QDs * H, size_t(QDs * H));
+                        g.mlp_gate[k] = up(d, t.mlp_gate + sh * Is * H, size_t(Is * H));
+                        g.mlp_up[k] = up(d, t.mlp_up + sh * Is * H, size_t(Is * H));
+                        // column shards: partial sums, all-reduced after the GEMM
+                        g.o[k] = up_cols(d, t.o, H, QD, sh * QDs, QDs);
+                        g.mlp_down[k] = up_cols(d, t.mlp_down, H, I, sh * Is, Is);
+
+                        g.kc[k] = dalloc<uint16_t>(d, size_t(g.cap * KD));
+                        g.vc[k] = dalloc<uint16_t>(d, size_t(g.cap * KD));
+                        shards_[k].q.memset(g.kc[k], 0, size_t(g.cap * KD) * 2);
+                        shards_[k].q.memset(g.vc[k], 0, size_t(g.cap * KD) * 2);
+                        kvbytes_ += int64_t(g.cap * KD) * 4;
+                    }
                 }
+                stage_.clear();
+                stage_.shrink_to_fit();
             }
 
             void alloc_scratch()
             {
                 const Config &c = *cfg_;
                 const int64_t H = c.hidden_size, I = c.intermediate_size;
-                const int64_t QD = c.q_dim(), KD = c.kv_dim();
-                const int64_t B = block_;
+                const int64_t QD = c.q_dim(), KD = c.kv_dim(), V = c.vocab_size;
+                const int64_t B = block_, ns = nshard_;
+                const int64_t QDs = QD / ns, Is = I / ns, Vs = V / ns;
 
                 // The twin builds cos/sin through the stock f32 chain; reuse
                 // the oracle's builder so the two engines cannot drift on rope.
                 rope_ = muse::build_rope_table(c, max_seq_, false, prec::Dtype::BF16);
-                const int64_t half = c.head_dim / 2;
                 std::vector<float> cos32(rope_.cos.size()), sin32(rope_.sin.size());
                 for (size_t i = 0; i < rope_.cos.size(); ++i)
                 {
@@ -793,34 +891,134 @@ namespace muse::gpu
                     sin32[i] = float(rope_.sin[i]);
                 }
 
-                for (int i = 0; i < ngpu_; ++i)
+                for (int i = 0; i < nshard_; ++i)
                 {
-                    Dev &d = devs_[size_t(i)];
+                    Dev &d = shards_[size_t(i)];
+                    // replicated full-width: the residual stream and the KV
+                    // projections (k/v are not sharded, see GpuLayer)
                     d.h = dalloc<float>(i, size_t(B * H));
                     d.xf = dalloc<float>(i, size_t(B * H));
                     d.xb = dalloc<uint16_t>(i, size_t(B * H));
-                    d.qf = dalloc<float>(i, size_t(B * QD));
-                    d.qb = dalloc<uint16_t>(i, size_t(B * QD));
                     d.kf = dalloc<float>(i, size_t(B * KD));
                     d.kb = dalloc<uint16_t>(i, size_t(B * KD));
                     d.vf = dalloc<float>(i, size_t(B * KD));
-                    d.gf = dalloc<float>(i, size_t(B * QD));
-                    d.of = dalloc<float>(i, size_t(B * QD));
-                    d.ob = dalloc<uint16_t>(i, size_t(B * QD));
-                    d.g1 = dalloc<float>(i, size_t(B * I));
-                    d.u1 = dalloc<float>(i, size_t(B * I));
-                    d.g1b = dalloc<uint16_t>(i, size_t(B * I));
+                    // sharded widths
+                    d.qf = dalloc<float>(i, size_t(B * QDs));
+                    d.qb = dalloc<uint16_t>(i, size_t(B * QDs));
+                    d.gf = dalloc<float>(i, size_t(B * QDs));
+                    d.of = dalloc<float>(i, size_t(B * QDs));
+                    d.ob = dalloc<uint16_t>(i, size_t(B * QDs));
+                    d.g1 = dalloc<float>(i, size_t(B * Is));
+                    d.u1 = dalloc<float>(i, size_t(B * Is));
+                    d.g1b = dalloc<uint16_t>(i, size_t(B * Is));
+                    d.logits = dalloc<float>(i, size_t(Vs));
                     d.ids = dalloc<int32_t>(i, size_t(B));
-                    d.pack = dalloc<uint16_t>(i, size_t(std::max({H, I, QD, KD})));
+                    // widest GEMV input: H for q/k/v/gate/mlp/head, QDs for
+                    // o_proj, Is for mlp_down
+                    d.pack = dalloc<uint16_t>(i, size_t(std::max({H, QDs, Is, KD})));
                     d.xfer = dalloc<float>(i, size_t(B * H));
+                    d.peer = dalloc<float>(i, size_t(ns * B * H));
                     d.rope_cos = dalloc<float>(i, cos32.size());
                     d.rope_sin = dalloc<float>(i, sin32.size());
                     d.q.memcpy(d.rope_cos, cos32.data(), cos32.size() * 4);
                     d.q.memcpy(d.rope_sin, sin32.data(), sin32.size() * 4);
-                    if (i == head_dev_)
-                        d.logits = dalloc<float>(i, size_t(c.vocab_size));
                     d.q.wait();
-                    (void)half;
+                }
+                if (ns > 1)
+                {
+                    // pinned: pageable host memory would halve the transfer
+                    host_ring_ = sycl::malloc_host<float>(size_t(ns * B * H), ctx_);
+                    if (!host_ring_)
+                        die("could not pin the all-reduce staging ring");
+                }
+            }
+
+            // Sum the shards' partial residual streams and leave the total on
+            // every shard. Called after o_proj and after mlp_down, the two
+            // column-sharded GEMMs — 2 per layer, 104 per token at 52 layers.
+            //
+            // Two rules, both load-bearing on this hardware:
+            //  * no kernel ever dereferences peer USM. The exchange is a
+            //    copy-engine memcpy between cards in one shared context, which
+            //    is the only cross-card access the Arc driver tolerates.
+            //  * the sum runs in shard order on every shard (k_sum_shards), so
+            //    all shards hold bit-identical totals. The norms that follow
+            //    are replicated, so any disagreement here would compound.
+            void all_reduce(int64_t n, int64_t ld)
+            {
+                const int64_t ns = nshard_, H = cfg_->hidden_size;
+                if (ns == 1)
+                    return; // xf is already the whole sum
+                const int64_t slot = block_ * H;         // per-shard slot stride
+                const size_t bytes = size_t(n * H) * 4;  // live payload
+                const auto t_ar_ = std::chrono::steady_clock::now();
+
+                // Pack the live [H, n] block straight into this shard's own
+                // slot: it is contiguous only when n == ld, and a strided
+                // cross-card copy degenerates badly (see docs/gpu.md).
+                for (int64_t sh = 0; sh < ns; ++sh)
+                {
+                    Dev &d = shards_[size_t(sh)];
+                    k_pack2d(d.q, d.xf, d.peer + sh * slot, H, n, ld);
+                }
+                for (int64_t sh = 0; sh < ns; ++sh)
+                    shards_[size_t(sh)].q.wait();
+                const auto tp = std::chrono::steady_clock::now();
+
+                // Transport. Direct card-to-card memcpy is the obvious choice
+                // and benchmarks at ~48 GB/s in isolation, but measured 0.4
+                // GB/s inside this engine — 70x slower — for reasons that do
+                // not reproduce standalone (not VRAM pressure, not a
+                // kernel-written source; both were tested). Staging through
+                // PINNED host memory is a hop longer and still ~26 GB/s, so it
+                // is the default. MUSE_GPU_P2P=1 selects the direct path for
+                // re-measuring when the driver changes.
+                std::vector<sycl::event> ev;
+                if (p2p_)
+                {
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                        for (int64_t r = 0; r < ns; ++r)
+                            if (r != sh)
+                                ev.push_back(shards_[size_t(sh)].q.memcpy(
+                                    shards_[size_t(r)].peer + sh * slot,
+                                    shards_[size_t(sh)].peer + sh * slot, bytes));
+                    for (auto &e : ev)
+                        e.wait();
+                }
+                else
+                {
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                        ev.push_back(shards_[size_t(sh)].q.memcpy(
+                            host_ring_ + sh * slot, shards_[size_t(sh)].peer + sh * slot, bytes));
+                    for (auto &e : ev)
+                        e.wait();
+                    ev.clear();
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                        for (int64_t r = 0; r < ns; ++r)
+                            if (r != sh)
+                                ev.push_back(shards_[size_t(r)].q.memcpy(
+                                    shards_[size_t(r)].peer + sh * slot, host_ring_ + sh * slot,
+                                    bytes));
+                    for (auto &e : ev)
+                        e.wait();
+                }
+                const auto tx = std::chrono::steady_clock::now();
+
+                for (int64_t sh = 0; sh < ns; ++sh)
+                {
+                    Dev &d = shards_[size_t(sh)];
+                    k_sum_shards(d.q, d.peer, d.xf, ns, slot, H, n, ld);
+                }
+                if (prof_on_)
+                {
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                        shards_[size_t(sh)].q.wait();
+                    const auto te = std::chrono::steady_clock::now();
+                    ar_pack_s_ += std::chrono::duration<double>(tp - t_ar_).count();
+                    ar_xchg_s_ += std::chrono::duration<double>(tx - tp).count();
+                    ar_sum_s_ += std::chrono::duration<double>(te - tx).count();
+                    ar_bytes_ += double(bytes) * double(ns - 1) * double(ns);
+                    ar_calls_++;
                 }
             }
 
@@ -863,7 +1061,7 @@ namespace muse::gpu
             void gemm(int dev, const uint16_t *W, const uint16_t *X, float *Y, int64_t n,
                       int64_t in, int64_t out, int64_t ldx, int64_t ldy)
             {
-                Dev &d = devs_[size_t(dev)];
+                Dev &d = shards_[size_t(dev)];
 #if ORACLE_GPU_DNNL
                 // n == 1 NEVER goes to oneDNN. Measured on oneDNN 3.11.2 /
                 // Arc B70: a matmul whose B has exactly one column silently
@@ -939,6 +1137,8 @@ namespace muse::gpu
                 const int64_t H = c.hidden_size, I = c.intermediate_size, D = c.head_dim;
                 const int64_t nq = c.num_attention_heads, nkv = c.num_key_value_heads;
                 const int64_t QD = c.q_dim(), KD = c.kv_dim(), groups = c.kv_groups();
+                const int64_t V = c.vocab_size, ns = nshard_;
+                const int64_t QDs = QD / ns, Is = I / ns, Vs = V / ns, nqs = nq / ns;
                 const float scaling = float(1.0 / std::sqrt(double(D)));
                 const float qk_scale = float(c.qk_scale_factor);
                 // Leading dimension of every activation buffer for THIS block.
@@ -950,116 +1150,164 @@ namespace muse::gpu
                 // 1-column view always fits. Prefill (n > 1) is unchanged.
                 const int64_t B = (n == 1) ? 1 : block_;
 
-                // ---- embedding on the card that owns layer 0
+                std::vector<int32_t> h_ids(static_cast<size_t>(n));
+                for (int64_t t = 0; t < n; ++t)
+                    h_ids[size_t(t)] = int32_t(block_ids[t]);
+
+                // Every shard builds the whole residual stream itself. That is
+                // what the replicated embedding table buys: no broadcast, and
+                // every replicated op downstream (the norms) is computed from
+                // identical inputs and so stays identical by construction.
+                for (int64_t sh = 0; sh < ns; ++sh)
                 {
-                    Dev &d = devs_[size_t(embed_dev_)];
-                    std::vector<int32_t> h_ids(static_cast<size_t>(n));
-                    for (int64_t t = 0; t < n; ++t)
-                        h_ids[size_t(t)] = int32_t(block_ids[t]);
+                    Dev &d = shards_[size_t(sh)];
                     d.q.memcpy(d.ids, h_ids.data(), size_t(n) * 4).wait();
-                    k_embed(d.q, embed_, d.ids, d.h, n, H, B);
+                    k_embed(d.q, embed_[size_t(sh)], d.ids, d.h, n, H, B);
                     k_rmsnorm_f32(d.q, d.h, d.h, n, H, B, c.rms_norm_eps);
                 }
-                trace(embed_dev_, "embed", n, B);
+                trace(0, "embed", n, B);
 
-                int cur = embed_dev_;
                 for (int64_t li = 0; li < c.num_hidden_layers; ++li)
                 {
                     const GpuLayer &l = layers_[size_t(li)];
-                    if (l.dev != cur)
-                    {
-                        // layer-split handoff: the residual stream is the only
-                        // thing that crosses, H * n floats. Never let a kernel
-                        // dereference peer USM — this is an explicit copy.
-                        hand_off(cur, l.dev, n, B);
-                        cur = l.dev;
-                    }
-                    Dev &d = devs_[size_t(cur)];
                     const bool sliding = c.layer_is_sliding(li);
                     const bool use_rope = c.layer_has_rope(li);
                     const int64_t window = sliding ? c.sliding_window : 0;
 
-                    tic(cur);
-                    k_rmsnorm_auto(d.q, d.h, l.input_ln, d.xb, n, 1, H, B, c.rms_norm_eps,
-                              NK::Centered);
-                    toc(cur, S_NORM);
+                    // Shards run concurrently: the queues are independent and
+                    // only the two all-reduces below synchronize them.
+                    tic();
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        k_rmsnorm_auto(d.q, d.h, l.input_ln[size_t(sh)], d.xb, n, 1, H, B,
+                                       c.rms_norm_eps, NK::Centered);
+                    }
+                    toc(S_NORM);
 
-                    tic(cur);
-                    gemm(cur, l.q, d.xb, d.qf, n, H, QD, B, B);
-                    gemm(cur, l.k, d.xb, d.kf, n, H, KD, B, B);
-                    gemm(cur, l.v, d.xb, d.vf, n, H, KD, B, B);
-                    gemm(cur, l.gate, d.xb, d.gf, n, H, QD, B, B);
-                    toc(cur, S_QKV);
-                    tic(cur);
+                    tic();
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        gemm(int(sh), l.q[size_t(sh)], d.xb, d.qf, n, H, QDs, B, B);
+                        gemm(int(sh), l.k[size_t(sh)], d.xb, d.kf, n, H, KD, B, B);
+                        gemm(int(sh), l.v[size_t(sh)], d.xb, d.vf, n, H, KD, B, B);
+                        gemm(int(sh), l.gate[size_t(sh)], d.xb, d.gf, n, H, QDs, B, B);
+                    }
+                    toc(S_QKV);
 
-                    // weight-less QK-norm over head_dim, then qk_scale on q only
-                    k_rmsnorm_auto(d.q, d.qf, nullptr, d.qb, n, nq, D, B, c.rms_norm_eps,
-                              NK::Weightless);
-                    k_rmsnorm_auto(d.q, d.kf, nullptr, d.kb, n, nkv, D, B, c.rms_norm_eps,
-                              NK::Weightless);
-                    k_scale_bf16(d.q, d.qb, QD, n, B, qk_scale);
+                    tic();
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        // weight-less QK-norm over head_dim, then qk_scale on q
+                        k_rmsnorm_auto(d.q, d.qf, nullptr, d.qb, n, nqs, D, B, c.rms_norm_eps,
+                                       NK::Weightless);
+                        k_rmsnorm_auto(d.q, d.kf, nullptr, d.kb, n, nkv, D, B, c.rms_norm_eps,
+                                       NK::Weightless);
+                        k_scale_bf16(d.q, d.qb, QDs, n, B, qk_scale);
+                        if (use_rope)
+                            k_rope(d.q, d.qb, d.kb, n, nqs, nkv, D, B, d.rope_cos, d.rope_sin,
+                                   pos0);
+                        k_kv_append(d.q, d.kb, d.vf, l.kc[size_t(sh)], l.vc[size_t(sh)], n, KD, B,
+                                    pos0, l.cap);
+                    }
+                    toc(S_NORM);
 
-                    if (use_rope)
-                        k_rope(d.q, d.qb, d.kb, n, nq, nkv, D, B, d.rope_cos, d.rope_sin, pos0);
+                    tic();
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        // shard sh owns q heads [sh*nqs, (sh+1)*nqs); the KV
+                        // cache is replicated, so the kernel needs the global
+                        // head offset to pick the right GQA group
+                        k_attention(d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.of, n, nqs,
+                                    D, KD, B, pos0, groups, l.cap, window, scaling, sh * nqs);
+                    }
+                    toc(S_ATTN);
 
-                    toc(cur, S_NORM);
-                    tic(cur);
-                    k_kv_append(d.q, d.kb, d.vf, l.kc, l.vc, n, KD, B, pos0, l.cap);
-                    k_attention(d.q, d.qb, l.kc, l.vc, d.of, n, nq, D, KD, B, pos0, groups,
-                                l.cap, window, scaling);
-                    toc(cur, S_ATTN);
+                    tic();
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        k_out_gate(d.q, d.of, d.gf, d.ob, QDs, n, B);
+                        // column-sharded: each shard sums over its own QDs
+                        // slice, so xf is a PARTIAL until the all-reduce
+                        gemm(int(sh), l.o[size_t(sh)], d.ob, d.xf, n, QDs, H, B, B);
+                    }
+                    toc(S_OPROJ);
+                    tic();
+                    all_reduce(n, B);
+                    toc(S_XFER);
+                    tic();
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        k_rmsnorm_auto(d.q, d.xf, l.post_attn_ln[size_t(sh)], d.xb, n, 1, H, B,
+                                       c.post_norm_eps, NK::Centered);
+                        k_residual(d.q, d.h, d.xb, H, n, B);
+                    }
+                    toc(S_OPROJ);
 
-                    tic(cur);
-                    k_out_gate(d.q, d.of, d.gf, d.ob, QD, n, B);
-                    gemm(cur, l.o, d.ob, d.xf, n, QD, H, B, B);
-                    k_rmsnorm_auto(d.q, d.xf, l.post_attn_ln, d.xb, n, 1, H, B, c.post_norm_eps,
-                              NK::Centered);
-                    k_residual(d.q, d.h, d.xb, H, n, B);
-                    toc(cur, S_OPROJ);
-
-                    tic(cur);
-                    k_rmsnorm_auto(d.q, d.h, l.pre_ff_ln, d.xb, n, 1, H, B, c.rms_norm_eps,
-                              NK::Centered);
-                    gemm(cur, l.mlp_gate, d.xb, d.g1, n, H, I, B, B);
-                    gemm(cur, l.mlp_up, d.xb, d.u1, n, H, I, B, B);
-                    k_swiglu(d.q, d.g1, d.u1, d.g1b, I, n, B);
-                    gemm(cur, l.mlp_down, d.g1b, d.xf, n, I, H, B, B);
-                    k_rmsnorm_auto(d.q, d.xf, l.post_ff_ln, d.xb, n, 1, H, B, c.post_norm_eps,
-                              NK::Centered);
-                    k_residual(d.q, d.h, d.xb, H, n, B);
-                    toc(cur, S_MLP);
+                    tic();
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        k_rmsnorm_auto(d.q, d.h, l.pre_ff_ln[size_t(sh)], d.xb, n, 1, H, B,
+                                       c.rms_norm_eps, NK::Centered);
+                        gemm(int(sh), l.mlp_gate[size_t(sh)], d.xb, d.g1, n, H, Is, B, B);
+                        gemm(int(sh), l.mlp_up[size_t(sh)], d.xb, d.u1, n, H, Is, B, B);
+                        k_swiglu(d.q, d.g1, d.u1, d.g1b, Is, n, B);
+                        gemm(int(sh), l.mlp_down[size_t(sh)], d.g1b, d.xf, n, Is, H, B, B);
+                    }
+                    toc(S_OPROJ);
+                    tic();
+                    all_reduce(n, B);
+                    toc(S_XFER);
+                    tic();
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        k_rmsnorm_auto(d.q, d.xf, l.post_ff_ln[size_t(sh)], d.xb, n, 1, H, B,
+                                       c.post_norm_eps, NK::Centered);
+                        k_residual(d.q, d.h, d.xb, H, n, B);
+                    }
+                    toc(S_MLP);
                     if (trace_dir_)
                     {
                         char tg[64];
                         std::snprintf(tg, sizeof tg, "layer_%02d", int(li));
-                        trace(cur, tg, n, B);
+                        trace(0, tg, n, B);
                     }
                 }
                 len_ = pos0 + n;
 
                 if (!out_logits_last)
                 {
-                    devs_[size_t(cur)].q.wait();
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                        shards_[size_t(sh)].q.wait();
                     return;
                 }
-                if (cur != head_dev_)
+
+                // Vocab-parallel head, last row only (the serving shape). The
+                // multiplier and the softcap are elementwise, so they commute
+                // with the split and each shard finishes its own slice.
+                tic();
+                for (int64_t sh = 0; sh < ns; ++sh)
                 {
-                    hand_off(cur, head_dev_, n, B);
-                    cur = head_dev_;
+                    Dev &d = shards_[size_t(sh)];
+                    k_rmsnorm_auto(d.q, d.h + (n - 1), final_norm_[size_t(sh)], d.xb + (n - 1), 1,
+                                   1, H, B, c.rms_norm_eps, NK::Plain);
+                    gemm(int(sh), lm_head_[size_t(sh)], d.xb + (n - 1), d.logits, 1, H, Vs, B, 1);
+                    k_softcap(d.q, d.logits, Vs, float(c.output_multiplier),
+                              float(c.final_logit_softcapping));
                 }
-                Dev &d = devs_[size_t(cur)];
-                // final plain norm + lm_head, last row only (the serving shape).
-                // The last token is column n-1; shifting the base pointer by it
-                // makes a 1-column dim-major view whose leading dimension is
-                // still B, which is what the kernels and oneDNN expect.
-                tic(cur);
-                k_rmsnorm_auto(d.q, d.h + (n - 1), final_norm_, d.xb + (n - 1), 1, 1, H, B,
-                          c.rms_norm_eps, NK::Plain);
-                gemm(cur, lm_head_, d.xb + (n - 1), d.logits, 1, H, c.vocab_size, B, 1);
-                k_softcap(d.q, d.logits, c.vocab_size, float(c.output_multiplier),
-                          float(c.final_logit_softcapping));
-                d.q.memcpy(out_logits_last, d.logits, size_t(c.vocab_size) * 4).wait();
-                toc(cur, S_HEAD);
+                for (int64_t sh = 0; sh < ns; ++sh)
+                    shards_[size_t(sh)]
+                        .q.memcpy(out_logits_last + sh * Vs, shards_[size_t(sh)].logits,
+                                  size_t(Vs) * 4)
+                        .wait();
+                toc(S_HEAD);
             }
 
             // Prove, on this machine and this oneDNN build, that the GEMM
@@ -1074,7 +1322,7 @@ namespace muse::gpu
             void self_check()
             {
                 const Config &c = *cfg_;
-                Dev &d = devs_[0];
+                Dev &d = shards_[0];
                 const int64_t in = 64, out = 96;
                 const int64_t ld = std::max<int64_t>(block_, 8);
 
@@ -1145,9 +1393,9 @@ namespace muse::gpu
                 // same trap as hand_off: the live region is strided, so pull
                 // the H x n sub-block rather than the first n*H floats
                 std::vector<float> col(static_cast<size_t>(n * H));
-                k_pack2d(devs_[size_t(dev)].q, devs_[size_t(dev)].h, devs_[size_t(dev)].xfer, H,
+                k_pack2d(shards_[size_t(dev)].q, shards_[size_t(dev)].h, shards_[size_t(dev)].xfer, H,
                          n, ld);
-                devs_[size_t(dev)].q.memcpy(col.data(), devs_[size_t(dev)].xfer,
+                shards_[size_t(dev)].q.memcpy(col.data(), shards_[size_t(dev)].xfer,
                                             size_t(n * H) * 4)
                     .wait();
                 std::vector<float> row(static_cast<size_t>(n * H));
@@ -1179,8 +1427,8 @@ namespace muse::gpu
                 const size_t bytes = size_t(n * H) * 4;
                 if (host_stage_.size() < size_t(n * H))
                     host_stage_.resize(size_t(n * H));
-                Dev &src = devs_[size_t(from)];
-                Dev &dst = devs_[size_t(to)];
+                Dev &src = shards_[size_t(from)];
+                Dev &dst = shards_[size_t(to)];
                 k_pack2d(src.q, src.h, src.xfer, H, n, ld);
                 src.q.memcpy(host_stage_.data(), src.xfer, bytes).wait();
                 dst.q.memcpy(dst.xfer, host_stage_.data(), bytes).wait();
@@ -1189,8 +1437,13 @@ namespace muse::gpu
 
             const Config *cfg_;
             EngineOptions opt_;
-            int ngpu_ = 1, embed_dev_ = 0, head_dev_ = 0;
+            // used_ must be declared before ctx_: the context is built from it
+            std::vector<sycl::device> used_;
+            sycl::context ctx_;
+            int ngpu_ = 1, nshard_ = 1;
             bool decode_gemv_ = false;
+            bool p2p_ = false;
+            float *host_ring_ = nullptr; // pinned staging, ns * block * H floats
             const char *trace_dir_ = nullptr;
             // Stage attribution. Only armed by MUSE_GPU_PROFILE, because it
             // inserts a queue wait per stage and so changes the very thing it
@@ -1200,24 +1453,27 @@ namespace muse::gpu
             enum Stage { S_NORM, S_QKV, S_ATTN, S_OPROJ, S_MLP, S_HEAD, S_XFER, S_NSTAGE };
             mutable double stage_s_[S_NSTAGE] = {};
             mutable std::chrono::steady_clock::time_point tic_;
-            void tic(int dev)
+            mutable double ar_pack_s_ = 0, ar_xchg_s_ = 0, ar_sum_s_ = 0, ar_bytes_ = 0;
+            mutable long ar_calls_ = 0;
+            void tic()
             {
                 if (!prof_on_) return;
-                devs_[size_t(dev)].q.wait();
+                for (auto &d : shards_) d.q.wait();
                 tic_ = std::chrono::steady_clock::now();
             }
-            void toc(int dev, Stage st)
+            void toc(Stage st)
             {
                 if (!prof_on_) return;
-                devs_[size_t(dev)].q.wait();
+                for (auto &d : shards_) d.q.wait();
                 stage_s_[st] +=
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - tic_).count();
             }
             int64_t block_ = 0, max_seq_ = 0, len_ = 0;
             int64_t wbytes_ = 0, kvbytes_ = 0;
-            std::vector<Dev> devs_;
+            std::vector<Dev> shards_;
             std::vector<GpuLayer> layers_;
-            uint16_t *embed_ = nullptr, *lm_head_ = nullptr, *final_norm_ = nullptr;
+            std::vector<uint16_t *> embed_, lm_head_, final_norm_;
+            std::vector<uint16_t> stage_; // host gather buffer for column shards
             muse::RopeTable rope_;
             std::vector<float> host_stage_;
             std::vector<std::pair<void *, int>> owned_;
