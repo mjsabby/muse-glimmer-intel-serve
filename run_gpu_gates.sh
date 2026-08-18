@@ -10,7 +10,8 @@
 #   6. flash tier      --flash-prefill is envelope-gated, never bitwise
 #   7. DFlash          drafted tokens == the f64 oracle's
 #   8. vision         tower features within the bf16 twin's own deviation
-#   9. tensor parallel  --shards N fixes the arithmetic, --gpus M only places it,
+#   9. Q8_0 tier      argmax/top-k vs the f64 oracle (a separate accuracy tier)
+#  10. tensor parallel  --shards N fixes the arithmetic, --gpus M only places it,
 #                       so 1 card and 2 cards must agree bitwise (Phase 8 exit gate)
 #
 # Usage: ./run_gpu_gates.sh [tiny-dir]
@@ -237,5 +238,33 @@ print("  %s image+text logits (argmax %d vs %d, top-%d %.0f%%)" %
        100 * ov))
 sys.exit(0 if (ok and ok2) else 1)
 PY
+
+echo "== Q8_0 weight tier =="
+# A SEPARATE ACCURACY TIER, not the bf16 band: 8-bit weights are ~3x wider than
+# bf16 and gating them against the twin bitwise would be gating them against a
+# contract they are not trying to meet. So: argmax and top-k against the f64
+# ORACLE, plus determinism and placement-independence.
+#
+# The tiny model needs --shards 1 here: at 2 shards its o_proj column slice is
+# 16 wide, below Q8_0's 32-element block.
+$CPU --model "$MODEL" --ids "$IDS" --out "$OUT/orc" >/dev/null 2>&1
+run_gpu "$OUT/q8a" --shards 1 --gpus 1 --chunk 16 --q8
+run_gpu "$OUT/q8b" --shards 1 --gpus 1 --chunk 1 --q8
+.venv/bin/python - "$OUT" <<'PY' || rc=1
+import numpy as np, sys, json
+o = np.fromfile(sys.argv[1] + "/orc/logits.bin", dtype=np.float64)
+a = np.fromfile(sys.argv[1] + "/q8a/logits.bin", dtype=np.float64)
+o = o[-a.size:]                      # oracle writes every position
+k = 20
+ov = len(set(np.argsort(-a)[:k]) & set(np.argsort(-o)[:k])) / k
+ok = a.argmax() == o.argmax() and ov >= 0.85
+print("  %s q8 vs f64 oracle (argmax %d vs %d, top-%d %.0f%%, max %.3e)" %
+      ("[32mPASS[0m" if ok else "[31mFAIL[0m", a.argmax(), o.argmax(), k,
+       100 * ov, np.abs(a - o).max()))
+sys.exit(0 if ok else 1)
+PY
+same "q8 chunk-invariant (1 == 16)" "$OUT/q8a" "$OUT/q8b"
+run_gpu "$OUT/q8c" --shards 1 --gpus 1 --chunk 16 --q8
+same "q8 rerun bit-identical" "$OUT/q8a" "$OUT/q8c"
 
 exit $rc

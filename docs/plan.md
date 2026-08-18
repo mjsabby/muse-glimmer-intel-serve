@@ -481,7 +481,7 @@ model tier, GPU count, quantization, and depth.
 | 1 Tiny harness | ✅ | | **done** |
 | 2 f64 text oracle | ✅ (CPU only; the 30 B f64 forward runs in ~17 s for 6 tokens) | | **done** |
 | 3 bf16/f16 twin | ✅ | | **done** (text; drafter/tower twins written, not gated) |
-| 4 GGUF ingest | ✅ | | not started |
+| 4 GGUF ingest | ✅ | | not started (the Q8_0 tier quantizes at load from BF16 instead; see [gpu.md](gpu.md)) |
 | 5 DFlash oracle | ✅ | | **done** |
 | 6 Vision oracle | ✅ | | tower + projector **done** on CPU and GPU (20.8x, see [gpu.md](gpu.md)); pixel ingestion and video not started |
 | 7 SYCL single-GPU | design only | ✅ | **done** (text; see [gpu.md](gpu.md), incl. the opt-in `--flash-prefill` matrix-engine attention tier. No Q8 tier yet, no vision/DFlash on GPU) |

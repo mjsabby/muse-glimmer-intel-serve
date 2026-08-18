@@ -76,6 +76,11 @@ namespace muse::gpu
         // faster and a DIFFERENT numerical contract from the twin — it is
         // gated on the logit envelope, never bitwise. Decode is unaffected.
         bool flash_prefill = false;
+        // Q8_0 weight tier for the text model: quantized at load from the same
+        // BF16 checkpoint with llama.cpp's quantize_row_q8_0_ref semantics.
+        // Halves weight VRAM. A SEPARATE ACCURACY TIER, not the bf16 band --
+        // gated against the f64 oracle, never against the twin bitwise.
+        bool q8 = false;
         // Target hidden-state layers the DFlash drafter reads (its
         // `target_layer_ids`). Must be set before create(): the taps are
         // captured on the way through the forward pass, not recomputed.

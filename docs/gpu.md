@@ -487,6 +487,76 @@ without XMX/DPAS (the vector ALUs would give roughly 20-40), so the systolic
 path is what runs. The `--flash-prefill` tier puts attention's `Q·Kᵀ` and `P·V`
 on the same engines, which is where its 16-20x comes from.
 
+## Q8_0 weight tier (`--q8`)
+
+Quantized at load from the same BF16 checkpoint with llama.cpp's
+`quantize_row_q8_0_ref` semantics (per 32 elements: `d = amax/127` in f16,
+`q = round(x/d)`). Quants and scales are kept in **separate** arrays rather than
+llama.cpp's interleaved 34-byte block, so the GEMV reads a whole row of quants
+contiguously and touches scales 32× less often.
+
+| 30B, 2 cards | VRAM/card | decode | prefill |
+|---|---:|---:|---:|
+| BF16 | 27.36 GiB | 14.76 tok/s | 635 tok/s |
+| **Q8_0** | **15.71 GiB** | 15.07 tok/s | 245 tok/s |
+| Q8_0, `MUSE_GPU_Q8_BLOCKDOT=1` | 15.71 GiB | **21.10 tok/s** | 245 tok/s |
+
+**1.74× less weight VRAM**, and it generates the same 16 tokens as BF16 on the
+test prompt.
+
+### Prefill is slower, and that is oneDNN's doing
+
+oneDNN on this stack has **no grouped-scale path at all** — measured, not
+assumed:
+
+| configuration | accepted? |
+|---|---|
+| bf16 × s8, per-32 grouped scales (f16 or f32) | **no** |
+| f16 × s8, per-32 grouped scales | **no** |
+| bf16 × s8, per-column scales | yes, but `ocl:ref` (the reference kernel) |
+| bf16 × s8, grouped, transposed strides | no (`unsupported format tag`) |
+
+Q8_0 needs per-32 scales by construction, so the matrix engines cannot consume
+it directly. Prefill therefore expands each weight into a BF16 scratch tile and
+runs the ordinary DPAS GEMM on it — which costs a write and a re-read of the
+tile, hence 245 vs 635 tok/s. **Q8 here is a memory-and-decode tier, not a
+prefill one.**
+
+### Two dot arithmetics, and the choice is real
+
+llama.cpp's Q8_0 dot sums a block of products and scales once at the end. The
+prefill path *cannot* do that — it materializes `bf16(q·d)` per element so the
+matrix engines can run. Taking the fast form at decode makes decode disagree
+with prefill **inside one tier**, so a token this engine generated would not be
+reproduced by prefilling the same sequence. The default therefore matches
+prefill and is chunk-invariant; `MUSE_GPU_Q8_BLOCKDOT=1` selects llama.cpp's
+semantics and buys 40% of decode back.
+
+(`BLOCKDOT` is a template parameter, not a flag. As a runtime branch inside the
+unrolled inner loop it cost **12×** — 16.2 → 1.31 tok/s — because both arms stay
+in the loop body and the accumulators spill.)
+
+### The bug worth remembering
+
+The first version hand-rolled `f32_to_f16` and **flushed subnormals to zero**.
+That is not a corner case: up to **1.25% of Q8_0 blocks** in this checkpoint
+have a scale below f16's smallest normal (6.1e-5), so ~1% of every weight matrix
+was silently zeroed. The model still ran, still put the right token first, and
+still looked plausible — it had just lost most of its accuracy (logits differed
+from BF16 by **9.98 on a scale of 11**, top-64 overlap 41%). Using the
+compiler's `_Float16` conversion instead fixed it: max 0.31, top-64 89%, and the
+generated tokens became identical to BF16.
+
+Gating is against the **f64 oracle**, never the bf16 twin bitwise: 8-bit weights
+are a separate accuracy tier, roughly 3× wider than bf16, and asserting the twin's
+band would be asserting a contract Q8 is not trying to meet.
+
+### Constraint
+
+Every quantized matrix needs its input dimension divisible by 32. The tiny gate
+model must therefore run Q8 at `--shards 1`: at 2 shards its `o_proj` column
+slice is 16 wide. The 30B's slices are 2048 and 9984, both fine.
+
 ## Gates (`run_gpu_gates.sh`)
 
 | gate | what it protects |
@@ -504,6 +574,8 @@ on the same engines, which is where its 16-20x comes from.
 | drafter proposals == the f64 oracle's | the drafter's four inverted conventions |
 | drafter: 1 card == 2 cards | the drafter shards like the target |
 | vision features within the twin's own deviation of the oracle | the tower, judged against bf16 rather than against zero |
+| q8 argmax + top-k vs the f64 oracle | a separate accuracy tier, gated on its own terms |
+| q8 chunk-invariant + rerun bitwise | decode and prefill agree inside the tier |
 | image+text logits argmax + top-20 | the features land at the right token positions |
 
 `MUSE_GPU_TRACE=<dir>` dumps the residual stream per layer (row-major `[n, H]`),

@@ -67,6 +67,8 @@ namespace
                      "  --vision gpu|cpu   where to run the tower. cpu keeps ~1.9 GiB/card of\n"
                      "                     tower weights out of VRAM (it is bitwise-gated there)\n"
                      "  --seal N           0 off, 1 log, 2 refuse post-load allocations\n"
+                     "  --q8               Q8_0 weight tier: half the weight VRAM, a separate\n"
+                     "                     accuracy tier (gated vs the oracle, not the twin)\n"
                      "  --list-devices     enumerate the visible GPUs and exit\n"
                      "  --revision REV     HF revision when --model is a repo id\n");
     }
@@ -79,6 +81,7 @@ int main(int argc, char **argv)
     int gpus = 2, shards = 0, topk = 5;
     bool no_dnnl = false, flash_prefill = false;
     std::string vision_on = "gpu";
+    bool q8 = false;
     int seal = 2;
 
     for (int i = 1; i < argc; ++i)
@@ -126,6 +129,8 @@ int main(int argc, char **argv)
             vision_on = next();
         else if (a == "--seal")
             seal = std::stoi(next());
+        else if (a == "--q8")
+            q8 = true;
         else if (a == "--list-devices")
         {
             auto ds = muse::gpu::enumerate_devices();
@@ -192,6 +197,7 @@ int main(int argc, char **argv)
         opt.max_seq = max_seq;
         opt.no_dnnl = no_dnnl;
         opt.flash_prefill = flash_prefill;
+        opt.q8 = q8;
         opt.verbose = true;
 
         auto eng = muse::gpu::Engine::create(cfg, w, opt);
@@ -325,6 +331,7 @@ int main(int argc, char **argv)
         bm << "{\n \"kind\": \"gpu_sycl\",\n \"T\": 1,\n \"V\": " << cfg.vocab_size
            << ",\n \"prompt_len\": " << T << ",\n \"decode\": " << decode_n
            << ",\n \"gpus\": " << gpus << ",\n \"shards\": " << (shards > 0 ? shards : gpus)
+           << ",\n \"q8\": " << (q8 ? "true" : "false")
            << ",\n \"flash_prefill\": " << (flash_prefill ? "true" : "false")
            << ",\n \"chunk\": " << chunk
            << ",\n \"max_seq\": " << max_seq << ",\n \"prefill_tok_s\": "

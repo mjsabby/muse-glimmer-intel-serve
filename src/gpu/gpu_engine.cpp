@@ -87,6 +87,41 @@ namespace muse::gpu
 
         // --------------------------------------------------------- device side
 
+        // A weight, in whichever tier it was loaded at. Q8_0 keeps the int8
+        // quants and the per-32 f16 scales in SEPARATE arrays rather than
+        // llama.cpp's interleaved 34-byte block: the GEMV reads a whole row of
+        // quants contiguously and touches the scales 32x less often, and an
+        // interleaved layout would break both accesses.
+        struct QW
+        {
+            const uint16_t *w = nullptr;  // bf16 weights, or null in the Q8 tier
+            const int8_t *qs = nullptr;   // int8 quants [out, in]
+            const uint16_t *d = nullptr;  // f16 scales  [out, in/32]
+            bool q8() const { return qs != nullptr; }
+        };
+
+        // llama.cpp quantize_row_q8_0_ref, so the quantized weights are the
+        // same bits a Q8_0 GGUF would carry: per 32 elements, d = amax/127 in
+        // f16, q = round(x/d).
+        constexpr int64_t QK8 = 32;
+        // f32 -> f16, via the compiler's IEEE conversion rather than a
+        // hand-rolled one.
+        //
+        // The hand-rolled version flushed SUBNORMALS to zero, and that is not a
+        // corner case here: up to 1.25% of Q8_0 blocks in this checkpoint have
+        // a scale below f16's smallest normal (6.1e-5). Flushing them zeroed
+        // ~1% of every weight matrix, which does not look like a bug from the
+        // outside -- the model still runs and still puts the right token first
+        // -- it just quietly loses most of its accuracy (logits differed from
+        // bf16 by 9.98 on a scale of 11).
+        inline uint16_t f32_to_f16(float f)
+        {
+            _Float16 h = static_cast<_Float16>(f);
+            uint16_t b;
+            std::memcpy(&b, &h, 2);
+            return b;
+        }
+
         // One tensor-parallel shard. Shards map onto physical cards by
         // `gpu`; two shards may share a card (that is how the 1-GPU vs 2-GPU
         // bitwise gate runs on the tiny model).
@@ -126,6 +161,7 @@ namespace muse::gpu
             // slot, so the reduction reads a uniform array and needs no extra
             // local copy.
             float *peer = nullptr;
+            uint16_t *deq = nullptr; // Q8 prefill: one weight expanded to bf16
             // --flash-prefill tier scratch (allocated only for that tier)
             float *fs = nullptr;    // S tile [heads, FBQ, FBK] f32
             uint16_t *fp = nullptr; // P tile [heads, FBQ, FBK] bf16
@@ -155,9 +191,10 @@ namespace muse::gpu
         struct GpuLayer
         {
             std::vector<uint16_t *> input_ln, post_attn_ln, pre_ff_ln, post_ff_ln; // replicated
-            std::vector<uint16_t *> k, v, kc, vc;                                  // replicated
-            std::vector<uint16_t *> q, gate, mlp_gate, mlp_up;                     // row-sharded
-            std::vector<uint16_t *> o, mlp_down;                                   // col-sharded
+            std::vector<uint16_t *> kc, vc;                                        // KV cache
+            std::vector<QW> k_, v_;                        // replicated, tier-agnostic
+            std::vector<QW> q, gate, mlp_gate, mlp_up;     // row-sharded
+            std::vector<QW> o, mlp_down;                   // col-sharded
             int64_t cap = 0;
         };
 
@@ -681,6 +718,104 @@ namespace muse::gpu
                                    for (int64_t i = lane; i < D; i += SG)
                                        out[r * D + i] = rb(float(double(X[r * D + i]) * rs));
                                });
+            });
+        }
+
+        // ------------------------------------------------------------- Q8_0
+        //
+        // Decode GEMV over Q8_0 weights, "variant A": dequantize in-register
+        // into the ordinary f32 fma structure, one scale per 32-element block.
+        // Quants are read 32 bytes per lane as 8 dwords and unpacked with
+        // shifts -- byte-at-a-time loads measured 166 GB/s against this form's
+        // ~330, which was the difference between Q8 being a win and a wash.
+        // BLOCKDOT is a template parameter, not a flag: as a runtime branch inside
+        // the unrolled inner loop it cost 12x (16.2 -> 1.31 tok/s), because both
+        // arms stay in the loop body and the accumulators spill.
+        template <bool BLOCKDOT>
+        void k_gemv_q8(sycl::queue &q, const int8_t *W, const uint16_t *D, const uint16_t *X,
+                       float *Y, int64_t in, int64_t out, int64_t ldy)
+        {
+            constexpr int RPG = 8;
+            const int64_t nblk = in / QK8;
+            const int64_t groups = (out + RPG - 1) / RPG;
+            q.submit([&](sycl::handler &h) {
+                h.parallel_for(
+                    sycl::nd_range<1>(size_t(groups) * RPG * SG, RPG * SG),
+                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                        auto sg = it.get_sub_group();
+                        const int64_t o =
+                            int64_t(it.get_group(0)) * RPG + int64_t(sg.get_group_id()[0]);
+                        if (o >= out)
+                            return;
+                        const int lane = int(sg.get_local_id()[0]);
+                        const uint32_t *w = reinterpret_cast<const uint32_t *>(W + o * in);
+                        const sycl::half *dd =
+                            reinterpret_cast<const sycl::half *>(D + o * nblk);
+                        float part = 0.f;
+                        for (int64_t b = lane; b < nblk; b += SG)
+                        {
+                            const uint32_t *wb = w + b * (QK8 / 4);
+                            const uint16_t *xb = X + b * QK8;
+                            const float sc = float(dd[b]);
+                            // Two arithmetics, and the choice is a real one.
+                            //
+                            // `blockdot` sums the block first and scales once,
+                            // which is what llama.cpp's Q8_0 dot does -- and
+                            // it is 24% faster here. But prefill cannot do it:
+                            // it dequantizes to a BF16 tile so the matrix
+                            // engines can run, which materializes bf16(q*d) per
+                            // element. Taking the fast form at decode makes
+                            // decode disagree with prefill INSIDE ONE TIER, so
+                            // a token this engine generates would not be
+                            // reproduced by prefilling the same sequence. The
+                            // default therefore matches prefill; the fast form
+                            // is behind MUSE_GPU_Q8_BLOCKDOT for anyone who
+                            // wants llama.cpp-exact dot semantics instead.
+                            float acc = 0.f;
+#pragma unroll
+                            for (int u = 0; u < QK8 / 4; ++u)
+                            {
+                                const uint32_t v = wb[u];
+#pragma unroll
+                                for (int k = 0; k < 4; ++k)
+                                {
+                                    const float qv = float(int8_t((v >> (8 * k)) & 0xff));
+                                    const float xv = bf2f(xb[u * 4 + k]);
+                                    if constexpr (BLOCKDOT)
+                                        acc += qv * xv;
+                                    else
+                                        part += rb(qv * sc) * xv;
+                                }
+                            }
+                            if constexpr (BLOCKDOT)
+                                part += acc * sc;
+                            else
+                                (void)acc;
+                        }
+                        const float s = sycl::reduce_over_group(sg, part, sycl::plus<float>());
+                        if (lane == 0)
+                            Y[o * ldy] = s;
+                    });
+            });
+        }
+
+        // Prefill stays on the matrix engines: oneDNN has no grouped-scale
+        // path on this stack (measured -- see docs), so the weight is expanded
+        // to bf16 in a scratch tile and the ordinary DPAS GEMM runs on it. That
+        // costs a write and a re-read of the tile, which is why Q8 is a decode
+        // and memory tier rather than a prefill one.
+        void k_dequant_q8(sycl::queue &q, const int8_t *W, const uint16_t *D, uint16_t *out,
+                          int64_t in, int64_t out_rows)
+        {
+            const int64_t nblk = in / QK8;
+            q.parallel_for(sycl::range<2>(size_t(out_rows), size_t(nblk)), [=](sycl::id<2> id) {
+                const int64_t o = int64_t(id[0]), b = int64_t(id[1]);
+                const sycl::half *dd = reinterpret_cast<const sycl::half *>(D + o * nblk);
+                const float sc = float(dd[b]);
+                const int8_t *wb = W + o * in + b * QK8;
+                uint16_t *ob = out + o * in + b * QK8;
+                for (int k = 0; k < QK8; ++k)
+                    ob[k] = f2bf(float(wb[k]) * sc);
             });
         }
 
@@ -1318,6 +1453,9 @@ namespace muse::gpu
                     tiled_attn_ = false;
 
                 flash_prefill_ = opt.flash_prefill;
+                q8_ = opt.q8;
+                if (const char *e = getenv("MUSE_GPU_Q8_BLOCKDOT"); e && *e && *e != '0')
+                    q8_blockdot_ = true;
                 tap_layers_ = opt.tap_layers;
                 fbq_ = std::min<int64_t>(512, std::max<int64_t>(1, block_));
                 fbk_ = 512;
@@ -1383,9 +1521,10 @@ namespace muse::gpu
                 if (opt.verbose)
                 {
                     std::fprintf(stderr,
-                                 "[gpu] %d shard(s) on %d card(s), %.2f GiB weights "
+                                 "[gpu] %d shard(s) on %d card(s), %s, %.2f GiB weights "
                                  "(%.2f/shard), %.2f GiB KV, upload %.1f s\n",
-                                 nshard_, ngpu_, double(wbytes_) / 1073741824.0,
+                                 nshard_, ngpu_, q8_ ? "Q8_0" : "BF16",
+                                 double(wbytes_) / 1073741824.0,
                                  double(wbytes_) / 1073741824.0 / nshard_,
                                  double(kvbytes_) / 1073741824.0, tim_.upload_s);
                 }
@@ -1515,6 +1654,53 @@ namespace muse::gpu
                 return up(s, stage_.data(), static_cast<size_t>(rows * cn));
             }
 
+            // Upload one [out, in] matrix in whatever tier is active. Q8_0 is
+            // quantized here, from the same BF16 checkpoint the bf16 tier
+            // binds, with llama.cpp's quantize_row_q8_0_ref semantics.
+            QW up_w(int sh, const uint16_t *src, int64_t out, int64_t in)
+            {
+                if (!q8_)
+                    return QW{up(sh, src, size_t(out * in)), nullptr, nullptr};
+                if (in % QK8)
+                    die("Q8_0 needs the input dim divisible by 32 (got " +
+                        std::to_string(in) + ")");
+                const int64_t nblk = in / QK8;
+                qbuf_.resize(static_cast<size_t>(out * in));
+                dbuf8_.resize(static_cast<size_t>(out * nblk));
+                // 25 G elements for the 30B, so this is not a place for a
+                // serial loop: rows are independent and write disjoint output.
+#pragma omp parallel for schedule(static)
+                for (int64_t o = 0; o < out; ++o)
+                    for (int64_t b = 0; b < nblk; ++b)
+                    {
+                        const uint16_t *row = src + o * in + b * QK8;
+                        float amax = 0.f;
+                        for (int64_t i = 0; i < QK8; ++i)
+                            amax = std::max(amax, std::fabs(muse::bf16::bf16_to_f32(row[i])));
+                        const float d = amax / 127.f;
+                        const float id = d != 0.f ? 1.f / d : 0.f;
+                        dbuf8_[size_t(o * nblk + b)] = f32_to_f16(d);
+                        for (int64_t i = 0; i < QK8; ++i)
+                            qbuf_[size_t(o * in + b * QK8 + i)] = int8_t(
+                                std::lround(muse::bf16::bf16_to_f32(row[i]) * id));
+                    }
+                int8_t *dq = dalloc<int8_t>(sh, size_t(out * in));
+                uint16_t *dd = dalloc<uint16_t>(sh, size_t(out * nblk));
+                shards_[size_t(sh)].q.memcpy(dq, qbuf_.data(), qbuf_.size()).wait();
+                shards_[size_t(sh)].q.memcpy(dd, dbuf8_.data(), dbuf8_.size() * 2).wait();
+                wbytes_ += int64_t(out * in) + int64_t(out * nblk) * 2;
+                return QW{nullptr, dq, dd};
+            }
+
+            QW up_cols_w(int sh, const uint16_t *src, int64_t rows, int64_t cols, int64_t c0,
+                         int64_t cn)
+            {
+                stage_.resize(static_cast<size_t>(rows * cn));
+                for (int64_t r = 0; r < rows; ++r)
+                    std::memcpy(stage_.data() + r * cn, src + r * cols + c0, size_t(cn) * 2);
+                return up_w(sh, stage_.data(), rows, cn);
+            }
+
             void upload_weights(const Weights &w)
             {
                 const Config &c = *cfg_;
@@ -1525,7 +1711,7 @@ namespace muse::gpu
                 const int64_t QDs = QD / ns, Is = I / ns, Vs = V / ns;
 
                 embed_.assign(size_t(ns), nullptr);
-                lm_head_.assign(size_t(ns), nullptr);
+                lm_head_.assign(size_t(ns), QW{});
                 final_norm_.assign(size_t(ns), nullptr);
                 for (int64_t sh = 0; sh < ns; ++sh)
                 {
@@ -1536,7 +1722,7 @@ namespace muse::gpu
                     // vocab-parallel head: shard sh owns rows [sh*Vs, (sh+1)*Vs).
                     // The multiplier and softcap are elementwise and commute
                     // with the split, so no reduction is needed here.
-                    lm_head_[size_t(sh)] = up(int(sh), v.lm_head + sh * Vs * H, size_t(Vs * H));
+                    lm_head_[size_t(sh)] = up_w(int(sh), v.lm_head + sh * Vs * H, Vs, H);
                 }
 
                 layers_.resize(size_t(L));
@@ -1547,9 +1733,11 @@ namespace muse::gpu
                     g.cap = c.layer_is_sliding(li) ? std::min(c.sliding_window + block_, max_seq_)
                                                    : max_seq_;
                     for (auto *arr : {&g.input_ln, &g.post_attn_ln, &g.pre_ff_ln, &g.post_ff_ln,
-                                      &g.k, &g.v, &g.kc, &g.vc, &g.q, &g.gate, &g.mlp_gate,
-                                      &g.mlp_up, &g.o, &g.mlp_down})
+                                      &g.kc, &g.vc})
                         arr->assign(size_t(ns), nullptr);
+                    for (auto *arr : {&g.k_, &g.v_, &g.q, &g.gate, &g.mlp_gate, &g.mlp_up, &g.o,
+                                      &g.mlp_down})
+                        arr->assign(size_t(ns), QW{});
 
                     for (int64_t sh = 0; sh < ns; ++sh)
                     {
@@ -1559,16 +1747,16 @@ namespace muse::gpu
                         g.post_attn_ln[k] = up(d, t.post_attn_ln, size_t(H));
                         g.pre_ff_ln[k] = up(d, t.pre_ff_ln, size_t(H));
                         g.post_ff_ln[k] = up(d, t.post_ff_ln, size_t(H));
-                        g.k[k] = up(d, t.k, size_t(KD * H));
-                        g.v[k] = up(d, t.v, size_t(KD * H));
+                        g.k_[k] = up_w(d, t.k, KD, H);
+                        g.v_[k] = up_w(d, t.v, KD, H);
                         // row shards: contiguous slices of a row-major [out, in]
-                        g.q[k] = up(d, t.q + sh * QDs * H, size_t(QDs * H));
-                        g.gate[k] = up(d, t.gate + sh * QDs * H, size_t(QDs * H));
-                        g.mlp_gate[k] = up(d, t.mlp_gate + sh * Is * H, size_t(Is * H));
-                        g.mlp_up[k] = up(d, t.mlp_up + sh * Is * H, size_t(Is * H));
+                        g.q[k] = up_w(d, t.q + sh * QDs * H, QDs, H);
+                        g.gate[k] = up_w(d, t.gate + sh * QDs * H, QDs, H);
+                        g.mlp_gate[k] = up_w(d, t.mlp_gate + sh * Is * H, Is, H);
+                        g.mlp_up[k] = up_w(d, t.mlp_up + sh * Is * H, Is, H);
                         // column shards: partial sums, all-reduced after the GEMM
-                        g.o[k] = up_cols(d, t.o, H, QD, sh * QDs, QDs);
-                        g.mlp_down[k] = up_cols(d, t.mlp_down, H, I, sh * Is, Is);
+                        g.o[k] = up_cols_w(d, t.o, H, QD, sh * QDs, QDs);
+                        g.mlp_down[k] = up_cols_w(d, t.mlp_down, H, I, sh * Is, Is);
 
                         g.kc[k] = dalloc<uint16_t>(d, size_t(g.cap * KD));
                         g.vc[k] = dalloc<uint16_t>(d, size_t(g.cap * KD));
@@ -1579,6 +1767,10 @@ namespace muse::gpu
                 }
                 stage_.clear();
                 stage_.shrink_to_fit();
+                qbuf_.clear();
+                qbuf_.shrink_to_fit();
+                dbuf8_.clear();
+                dbuf8_.shrink_to_fit();
             }
 
             void alloc_scratch()
@@ -1625,6 +1817,12 @@ namespace muse::gpu
                     // widest GEMV input: H for q/k/v/gate/mlp/head, QDs for
                     // o_proj, Is for mlp_down
                     d.pack = dalloc<uint16_t>(i, size_t(std::max({H, QDs, Is, KD})));
+                    if (q8_)
+                    {
+                        // widest sharded weight, expanded to bf16 for prefill
+                        deq_cap_ = std::max({Is * H, H * Is, QDs * H, H * QDs, Vs * H});
+                        d.deq = dalloc<uint16_t>(i, size_t(deq_cap_));
+                    }
                     d.xfer = dalloc<float>(i, size_t(B * H));
                     d.taps.assign(tap_layers_.size(), nullptr);
                     for (size_t k = 0; k < tap_layers_.size(); ++k)
@@ -1784,8 +1982,37 @@ namespace muse::gpu
             // per-block leading dimension the moment decode started collapsing
             // it to 1 — the GEMMs addressed a stride the rest of the kernels no
             // longer used, and decode produced a stuck token with no error.
-            void gemm(int dev, const uint16_t *W, const uint16_t *X, float *Y, int64_t n,
-                      int64_t in, int64_t out, int64_t ldx, int64_t ldy)
+            // Tier-aware. Q8_0 takes the hand-written GEMV at decode (where the
+            // halved byte count is the whole point) and expands to bf16 for
+            // prefill (where oneDNN's DPAS path is, and where oneDNN has no
+            // grouped-scale entry to take instead).
+            void gemm(int dev, const QW &w, const uint16_t *X, float *Y, int64_t n, int64_t in,
+                      int64_t out, int64_t ldx, int64_t ldy)
+            {
+                Dev &d = shards_[size_t(dev)];
+                if (w.q8())
+                {
+                    if (n == 1)
+                    {
+                        k_compact(d.q, X, d.pack, in, ldx);
+                        if (q8_blockdot_)
+                            k_gemv_q8<true>(d.q, w.qs, w.d, d.pack, Y, in, out, ldy);
+                        else
+                            k_gemv_q8<false>(d.q, w.qs, w.d, d.pack, Y, in, out, ldy);
+                        return;
+                    }
+                    if (int64_t(out * in) > deq_cap_)
+                        die("Q8 prefill scratch too small for a " + std::to_string(out) + "x" +
+                            std::to_string(in) + " weight");
+                    k_dequant_q8(d.q, w.qs, w.d, d.deq, in, out);
+                    gemm_bf16(dev, d.deq, X, Y, n, in, out, ldx, ldy);
+                    return;
+                }
+                gemm_bf16(dev, w.w, X, Y, n, in, out, ldx, ldy);
+            }
+
+            void gemm_bf16(int dev, const uint16_t *W, const uint16_t *X, float *Y, int64_t n,
+                           int64_t in, int64_t out, int64_t ldx, int64_t ldy)
             {
                 Dev &d = shards_[size_t(dev)];
 #if ORACLE_GPU_DNNL
@@ -1969,6 +2196,25 @@ namespace muse::gpu
             // Y[rows, out] = X[rows, in] . W[out, in]^T, everything row-major.
             // The drafter's shapes are small (16 rows), so the layout that
             // matches the reference beats the one tuned for 2048-token GEMMs.
+            // Tier-aware overload, for the one row-major call that reaches a
+            // tier-carrying weight: the drafter heads through the TARGET's
+            // lm_head. The drafter's and the tower's own weights stay bf16.
+            void gemm_rm(int sh, const QW &w, const uint16_t *X, float *Y, int64_t rows,
+                         int64_t in, int64_t out)
+            {
+                if (!w.q8())
+                {
+                    gemm_rm(sh, w.w, X, Y, rows, in, out);
+                    return;
+                }
+                Dev &d = shards_[size_t(sh)];
+                if (int64_t(out * in) > deq_cap_)
+                    die("Q8 scratch too small for a " + std::to_string(out) + "x" +
+                        std::to_string(in) + " weight");
+                k_dequant_q8(d.q, w.qs, w.d, d.deq, in, out);
+                gemm_rm(sh, d.deq, X, Y, rows, in, out);
+            }
+
             void gemm_rm(int sh, const uint16_t *W, const uint16_t *X, float *Y, int64_t rows,
                          int64_t in, int64_t out)
             {
@@ -2701,8 +2947,8 @@ namespace muse::gpu
                     {
                         Dev &d = shards_[size_t(sh)];
                         gemm(int(sh), l.q[size_t(sh)], d.xb, d.qf, n, H, QDs, B, B);
-                        gemm(int(sh), l.k[size_t(sh)], d.xb, d.kf, n, H, KD, B, B);
-                        gemm(int(sh), l.v[size_t(sh)], d.xb, d.vf, n, H, KD, B, B);
+                        gemm(int(sh), l.k_[size_t(sh)], d.xb, d.kf, n, H, KD, B, B);
+                        gemm(int(sh), l.v_[size_t(sh)], d.xb, d.vf, n, H, KD, B, B);
                         gemm(int(sh), l.gate[size_t(sh)], d.xb, d.gf, n, H, QDs, B, B);
                     }
                     toc(S_QKV);
@@ -2974,7 +3220,7 @@ namespace muse::gpu
                 {
                     std::vector<float> viaA(size_t(out * ld)), viaB(size_t(out * ld));
                     d.q.memset(Y, 0, size_t(out * ld) * 4).wait();
-                    gemm(0, W, X + off, Y, n, in, out, ld, ld);
+                    gemm_bf16(0, W, X + off, Y, n, in, out, ld, ld);
                     d.q.wait();
                     d.q.memcpy(viaA.data(), Y, viaA.size() * 4).wait();
 
@@ -3078,6 +3324,10 @@ namespace muse::gpu
             std::vector<uint16_t *> enc_norm_, dfinal_norm_;
             std::vector<float *> drope_cos_, drope_sin_;
             std::vector<int64_t> tap_layers_;
+            bool q8_ = false, q8_blockdot_ = false;
+            int64_t deq_cap_ = 0;
+            std::vector<int8_t> qbuf_;
+            std::vector<uint16_t> dbuf8_;
             int sealed_ = 0; // 0 off, 1 log, 2 refuse
             int64_t tbytes_ = 0; // target weight bytes, so the drafter's can be reported apart
             struct DBuf
@@ -3142,7 +3392,8 @@ namespace muse::gpu
             int64_t wbytes_ = 0, kvbytes_ = 0;
             std::vector<Dev> shards_;
             std::vector<GpuLayer> layers_;
-            std::vector<uint16_t *> embed_, lm_head_, final_norm_;
+            std::vector<uint16_t *> embed_, final_norm_;
+            std::vector<QW> lm_head_;
             std::vector<uint16_t> stage_; // host gather buffer for column shards
             muse::RopeTable rope_;
             std::vector<float> host_stage_;
