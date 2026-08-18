@@ -79,6 +79,13 @@ add_test(NAME fmath_test COMMAND fmath-test)
 # changed by the GPU toolchain.
 option(MUSE_GPU "Build the SYCL/Level-Zero backend for Intel Arc" OFF)
 if(MUSE_GPU)
+  # icpx's own OpenMP codegen (-fiopenmp, which is what find_package(OpenMP)
+  # selects under this compiler) segfaults the clang frontend on
+  # muse::vision::forward. The LLVM OpenMP (-fopenmp) compiles it. Scoped to
+  # this build tree only: the bitwise referee is the g++ build, so which
+  # OpenMP runtime the GPU tree uses is not part of any contract.
+  set_property(TARGET OpenMP::OpenMP_CXX PROPERTY INTERFACE_COMPILE_OPTIONS -fopenmp)
+  set_property(TARGET OpenMP::OpenMP_CXX PROPERTY INTERFACE_LINK_OPTIONS -fopenmp)
   set(GPU_SYCL_COMPILE
       -fsycl
       -fsycl-targets=spir64_gen

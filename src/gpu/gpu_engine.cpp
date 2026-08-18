@@ -1466,9 +1466,26 @@ namespace muse::gpu
         private:
             // ------------------------------------------------------------ alloc
 
+            void seal_allocs(int mode) override
+            {
+                sealed_ = mode;
+                if (opt_.verbose && mode)
+                    std::fprintf(stderr, "[gpu] allocations sealed (mode %d) at %.2f GiB\n", mode,
+                                 double(wbytes_ + kvbytes_) / 1073741824.0);
+            }
+
             template <class T> T *dalloc(int dev, size_t count)
             {
                 auto &d = shards_[size_t(dev)];
+                if (sealed_)
+                {
+                    const std::string msg =
+                        "allocation of " + std::to_string(count * sizeof(T) / 1048576) +
+                        " MiB on shard " + std::to_string(dev) + " AFTER the load seal";
+                    if (sealed_ >= 2)
+                        die(msg + " (mode 2: refusing — this would be a mid-request OOM)");
+                    std::fprintf(stderr, "[seal] %s\n", msg.c_str());
+                }
                 T *p = sycl::malloc_device<T>(count, d.q);
                 if (!p)
                     die("device " + std::to_string(dev) + ": out of memory allocating " +
@@ -3061,6 +3078,7 @@ namespace muse::gpu
             std::vector<uint16_t *> enc_norm_, dfinal_norm_;
             std::vector<float *> drope_cos_, drope_sin_;
             std::vector<int64_t> tap_layers_;
+            int sealed_ = 0; // 0 off, 1 log, 2 refuse
             int64_t tbytes_ = 0; // target weight bytes, so the drafter's can be reported apart
             struct DBuf
             {

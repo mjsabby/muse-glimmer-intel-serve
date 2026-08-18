@@ -64,6 +64,9 @@ namespace
                      "  --assistant DIR    DFlash drafter; runs one drafting round after prefill\n"
                      "  --pixels FILE      f64 [N, patch_dim] pixel values (with --grid)\n"
                      "  --grid t,h,w[;..]  patch grid per image\n"
+                     "  --vision gpu|cpu   where to run the tower. cpu keeps ~1.9 GiB/card of\n"
+                     "                     tower weights out of VRAM (it is bitwise-gated there)\n"
+                     "  --seal N           0 off, 1 log, 2 refuse post-load allocations\n"
                      "  --list-devices     enumerate the visible GPUs and exit\n"
                      "  --revision REV     HF revision when --model is a repo id\n");
     }
@@ -75,6 +78,8 @@ int main(int argc, char **argv)
     int64_t chunk = 512, max_seq = 0, decode_n = 0;
     int gpus = 2, shards = 0, topk = 5;
     bool no_dnnl = false, flash_prefill = false;
+    std::string vision_on = "gpu";
+    int seal = 2;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -117,6 +122,10 @@ int main(int argc, char **argv)
             pixels_path = next();
         else if (a == "--grid")
             grid_spec = next();
+        else if (a == "--vision")
+            vision_on = next();
+        else if (a == "--seal")
+            seal = std::stoi(next());
         else if (a == "--list-devices")
         {
             auto ds = muse::gpu::enumerate_devices();
@@ -233,10 +242,27 @@ int main(int argc, char **argv)
                          grids.size(), (long long)npatch, (long long)vcfg.num_hidden_layers,
                          (long long)vcfg.hidden_size,
                          (long long)(npatch / vcfg.merge_unit()));
-            eng->bind_vision(vcfg, vw, npatch);
+            // The tower is ~1.9 GiB/card once sharded. Running it on the CPU
+            // keeps that out of VRAM entirely, and the CPU path is the
+            // bitwise-gated one — for a single image per request the tower is
+            // not the latency that matters, so this is often the better trade.
+            std::vector<float> feats;
+            if (vision_on == "gpu")
+                eng->bind_vision(vcfg, vw, npatch); // upload, not forward
             const auto vt0 = std::chrono::steady_clock::now();
-            const std::vector<float> feats = eng->vision_features(px.data(), grids);
-            std::fprintf(stderr, "  tower forward: %.3f s\n",
+            if (vision_on == "cpu")
+            {
+                muse::vision::Options vopt;
+                vopt.dtype = prec::Dtype::BF16;
+                const std::vector<double> vd =
+                    muse::vision::forward(vcfg, vw, cfg, px.data(), grids, vopt);
+                feats.assign(vd.begin(), vd.end());
+            }
+            else if (vision_on == "gpu")
+                feats = eng->vision_features(px.data(), grids);
+            else
+                throw std::runtime_error("--vision must be gpu or cpu");
+            std::fprintf(stderr, "  tower forward (%s): %.3f s\n", vision_on.c_str(),
                          std::chrono::duration<double>(std::chrono::steady_clock::now() - vt0)
                              .count());
             {
@@ -254,6 +280,9 @@ int main(int argc, char **argv)
                                          " != merged vision tokens " + std::to_string(M));
             eng->set_vision_embeds(feats, at);
         }
+
+        // everything that will ever be allocated has been by now
+        eng->seal_allocs(seal);
 
         std::vector<float> lg(size_t(cfg.vocab_size), 0.f);
         eng->prefill(ids, lg.data());

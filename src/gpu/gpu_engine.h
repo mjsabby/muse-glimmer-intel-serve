@@ -141,6 +141,14 @@ namespace muse::gpu
         virtual void set_vision_embeds(const std::vector<float> &feats,
                                        const std::vector<int64_t> &positions) = 0;
 
+        // "Seal after load": every device allocation after this point should
+        // have been reserved up front, because the engine serves one request at
+        // a time and a mid-request allocation is a mid-request OOM. mode 1
+        // logs and continues (enumerate them all in one run), mode 2 throws on
+        // the first. Turns "I believe the footprint is static" into a checked
+        // property.
+        virtual void seal_allocs(int mode) = 0;
+
         virtual const Timings &timings() const = 0;
         virtual void report_profile(std::FILE *f) const = 0;
     };

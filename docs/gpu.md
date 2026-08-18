@@ -437,6 +437,56 @@ exceed 1.5× the **twin's** distance from the oracle. Comparing GPU to twin
 directly and calling the difference an error would be comparing two reduction
 orders and blaming one of them.
 
+## VRAM
+
+The footprint is **static and checked**. Everything is allocated during
+construction and `bind_*`; `--seal N` then arms a tripwire (1 = log, 2 =
+refuse) so any later device allocation is a startup-shaped failure rather than
+a mid-request OOM. Verified: a full prefill + decode after `--seal 2` reports
+no violations.
+
+What is already saving VRAM:
+
+* **Sliding-window KV ring.** The 39 sliding layers hold `sliding_window +
+  chunk` rows, not `max_seq` — their cache is independent of context length.
+  Only the 13 global layers grow, and at 2 KV heads that is 1 KiB per layer per
+  token, so the full 131 072 window costs 1.71 GiB/card.
+* **No S-sized attention scratch on the text path.** The exact kernels carry the
+  online softmax in registers, so there is no per-work-group score buffer and
+  therefore no SLM-bound context ceiling. (gemma4 hit exactly that: their global
+  attention keeps all `S` scores in 128 KiB of SLM and aborts past ~32 K. The
+  `--flash-prefill` tier does materialize a tile, but a bounded one — `FBQ x
+  FBK`, not `S`.)
+* **`--vision cpu`.** The tower is ~1.86 GiB/card once sharded. Running it on
+  the CPU keeps that out of VRAM entirely, and the CPU path is the
+  bitwise-gated one:
+
+  | | tower forward | VRAM |
+  |---|---:|---:|
+  | `--vision gpu` | **0.545 s** | 29.24 GiB/card |
+  | `--vision cpu` | 13.071 s | **27.37 GiB/card** |
+
+  For one image per request against a long generation, trading 12.5 s for 1.86
+  GiB is often the right way round; for image-heavy serving it is not. Both are
+  one flag.
+
+Two techniques from gemma4 that do **not** transfer, checked rather than
+assumed:
+
+* **`k = v` dedup.** Muse Glimmer's `k_proj` and `v_proj` are different tensors
+  (max abs difference 6.8e-2 on layer 0), so there is nothing to dedup. It would
+  not be worth much anyway: 2 KV heads make the cache tiny to begin with.
+* **oneDNN Q8 matmul.** See the Q8 section — grouped scales are unsupported in
+  this build.
+
+## Are the matrix engines actually used?
+
+Yes. oneDNN reports `jit:gemm:any` for the prefill shapes, which names the
+dispatcher rather than the kernel — but **173 TFLOP/s bf16** is not reachable
+without XMX/DPAS (the vector ALUs would give roughly 20-40), so the systolic
+path is what runs. The `--flash-prefill` tier puts attention's `Q·Kᵀ` and `P·V`
+on the same engines, which is where its 16-20x comes from.
+
 ## Gates (`run_gpu_gates.sh`)
 
 | gate | what it protects |
