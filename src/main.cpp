@@ -340,7 +340,11 @@ int main(int argc, char **argv)
                     grids.size(), (long long)npatch, (long long)vcfg.num_hidden_layers,
                     (long long)vcfg.hidden_size,
                     (long long)(npatch / vcfg.merge_unit()));
+            const auto vt0 = std::chrono::steady_clock::now();
             vision_out = muse::vision::forward(vcfg, vw, cfg, px.data(), grids, vopt);
+            fprintf(stderr, "  tower forward: %.3f s\n",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - vt0)
+                        .count());
             write_bin(out_dir + "/vision.bin", vision_out.data(), vision_out.size());
             int64_t placeholders = 0;
             for (int64_t id : ids)

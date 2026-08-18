@@ -9,7 +9,8 @@
 #   5. determinism      reruns bit-identical
 #   6. flash tier      --flash-prefill is envelope-gated, never bitwise
 #   7. DFlash          drafted tokens == the f64 oracle's
-#   8. tensor parallel  --shards N fixes the arithmetic, --gpus M only places it,
+#   8. vision         tower features within the bf16 twin's own deviation
+#   9. tensor parallel  --shards N fixes the arithmetic, --gpus M only places it,
 #                       so 1 card and 2 cards must agree bitwise (Phase 8 exit gate)
 #
 # Usage: ./run_gpu_gates.sh [tiny-dir]
@@ -198,5 +199,43 @@ if [[ "${ngpu:-0}" -ge 2 ]]; then
     [[ "$DG1" == "$DG2" ]] && pass "drafter: 1 card == 2 cards" \
                           || fail "drafter differs across cards: '$DG1' vs '$DG2'"
 fi
+
+echo "== vision tower =="
+# The tower is gated against the f64 ORACLE with the CPU bf16 twin's own
+# deviation as the budget: a GPU that is no further from the oracle than the
+# twin is has not introduced anything beyond bf16 noise. Comparing GPU to twin
+# directly would be comparing two different reduction orders and calling the
+# difference an error.
+VM="$TINY/tiny_vision"
+VIDS=$(.venv/bin/python -c "print(','.join(['1'] + ['500']*20 + ['7']))")
+.venv/bin/python py/ref_vision.py --model "$VM" --images SYNTH:120,150,5 --out "$OUT/vref" \
+    --pure --fixed-reduce --threads 1 --ids "$VIDS" >/dev/null 2>&1
+VGRID=$(.venv/bin/python -c "import json;print(json.load(open('$OUT/vref/meta.json'))['grid_arg'])")
+$CPU --model "$VM" --ids "$VIDS" --out "$OUT/vorc" --pixels "$OUT/vref/pixel_values.bin" \
+    --grid "$VGRID" >/dev/null 2>&1
+$CPU --model "$VM" --ids "$VIDS" --out "$OUT/vtwin" --pixels "$OUT/vref/pixel_values.bin" \
+    --grid "$VGRID" --dtype bf16 >/dev/null 2>&1
+$GPU --model "$VM" --ids "$VIDS" --out "$OUT/vgpu" --shards 1 --gpus 1 --chunk 22 --max-seq 64 \
+    --pixels "$OUT/vref/pixel_values.bin" --grid "$VGRID" >/dev/null 2>&1
+.venv/bin/python - "$OUT" <<'PY' || rc=1
+import numpy as np, sys
+o = np.fromfile(sys.argv[1] + "/vorc/vision.bin", dtype=np.float64)
+t = np.fromfile(sys.argv[1] + "/vtwin/vision.bin", dtype=np.float64)
+g = np.fromfile(sys.argv[1] + "/vgpu/vision.bin", dtype=np.float64)
+budget = max(1.5 * np.abs(t - o).max(), 1e-6)
+err = np.abs(g - o).max()
+ok = g.shape == o.shape and err <= budget
+print("  %s vision features vs oracle (max %.3e, twin's own %.3e)" %
+      ("[32mPASS[0m" if ok else "[31mFAIL[0m", err, np.abs(t - o).max()))
+lg = np.fromfile(sys.argv[1] + "/vgpu/logits.bin", dtype=np.float64)
+lt = np.fromfile(sys.argv[1] + "/vorc/logits.bin", dtype=np.float64)[-lg.size:]
+k = 20
+ov = len(set(np.argsort(-lg)[:k]) & set(np.argsort(-lt)[:k])) / k
+ok2 = lg.argmax() == lt.argmax() and ov >= 0.85
+print("  %s image+text logits (argmax %d vs %d, top-%d %.0f%%)" %
+      ("[32mPASS[0m" if ok2 else "[31mFAIL[0m", lg.argmax(), lt.argmax(), k,
+       100 * ov))
+sys.exit(0 if (ok and ok2) else 1)
+PY
 
 exit $rc

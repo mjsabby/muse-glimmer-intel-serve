@@ -29,6 +29,7 @@
 
 #include "bf16exec.hpp"
 #include "dflash.hpp"
+#include "vision.hpp"
 #include "muse_glimmer.hpp"
 
 #include <sycl/sycl.hpp>
@@ -76,6 +77,9 @@ namespace muse::gpu
         // `bf16_to_f32(f32_to_bf16(x))` idiom, which appears once per
         // nn.Linear output and once per elementwise op
         inline float rb(float f) { return bf2f(f2bf(f)); }
+
+        // host-side bf16 round-trip (device code uses rb())
+        inline float bf16_rt(float f) { return bf2f(muse::bf16::f32_to_bf16(f)); }
 
         constexpr int SG = 32; // sub-group width used by every reduction kernel
 
@@ -166,6 +170,20 @@ namespace muse::gpu
             std::vector<uint16_t *> k, v;                                   // replicated
             std::vector<uint16_t *> q, mlp_gate, mlp_up;                    // row-sharded
             std::vector<uint16_t *> o, mlp_down;                            // col-sharded
+        };
+
+        // One vision-tower layer. LayerNorms carry a bias as well as a weight
+        // (this is not the text stack's RMSNorm), and every projection has a
+        // bias. Biases on the COLUMN-sharded projections are replicated and
+        // added after the all-reduce -- adding them per shard would add them
+        // `nshard` times.
+        struct VLayer
+        {
+            std::vector<uint16_t *> n1w, n1b, n2w, n2b;   // replicated
+            std::vector<uint16_t *> qw, kw, vw, fc1w;     // row-sharded
+            std::vector<uint16_t *> qb, kb, vb, fc1b;     // row-sharded bias
+            std::vector<uint16_t *> ow, fc2w;             // column-sharded
+            std::vector<uint16_t *> ob, fc2b;             // replicated bias
         };
 
         // =====================================================================
@@ -638,6 +656,213 @@ namespace muse::gpu
                                const float lo = p[j], hi = p[j + half];
                                p[j] = rb(rb(lo * cj) + rb(-hi * sj));
                                p[j + half] = rb(rb(hi * cj) + rb(lo * sj));
+                           });
+        }
+
+        // weight-less RMSNorm over row-major rows (the vision projection tail
+        // uses the SAME norm the text embedding does)
+        void k_dnorm_wl(sycl::queue &q, const float *X, float *out, int64_t rows, int64_t D,
+                        double eps)
+        {
+            q.submit([&](sycl::handler &h) {
+                h.parallel_for(sycl::nd_range<1>(size_t(rows) * SG, SG),
+                               [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                                   const int64_t r = int64_t(it.get_group(0));
+                                   auto sg = it.get_sub_group();
+                                   const int lane = int(sg.get_local_id()[0]);
+                                   double ss = 0;
+                                   for (int64_t i = lane; i < D; i += SG)
+                                   {
+                                       const double v = double(X[r * D + i]);
+                                       ss += v * v;
+                                   }
+                                   ss = sycl::reduce_over_group(sg, ss, sycl::plus<double>());
+                                   const double rs = 1.0 / sycl::sqrt(ss / double(D) + eps);
+                                   for (int64_t i = lane; i < D; i += SG)
+                                       out[r * D + i] = rb(float(double(X[r * D + i]) * rs));
+                               });
+            });
+        }
+
+        // -------------------------------------------------------------- vision
+        //
+        // LayerNorm: mean and variance, then weight and bias. Not RMSNorm --
+        // the tower is a ViT and centres its activations.
+        void k_layernorm(sycl::queue &q, const float *X, const uint16_t *W, const uint16_t *Bs,
+                         float *out, int64_t rows, int64_t dim, double eps)
+        {
+            q.submit([&](sycl::handler &h) {
+                h.parallel_for(sycl::nd_range<1>(size_t(rows) * SG, SG),
+                               [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                                   const int64_t r = int64_t(it.get_group(0));
+                                   auto sg = it.get_sub_group();
+                                   const int lane = int(sg.get_local_id()[0]);
+                                   const float *x = X + r * dim;
+                                   double sum = 0;
+                                   for (int64_t i = lane; i < dim; i += SG)
+                                       sum += double(x[i]);
+                                   sum = sycl::reduce_over_group(sg, sum, sycl::plus<double>());
+                                   const double mean = sum / double(dim);
+                                   double var = 0;
+                                   for (int64_t i = lane; i < dim; i += SG)
+                                   {
+                                       const double d = double(x[i]) - mean;
+                                       var += d * d;
+                                   }
+                                   var = sycl::reduce_over_group(sg, var, sycl::plus<double>());
+                                   const double rs = 1.0 / sycl::sqrt(var / double(dim) + eps);
+                                   float *y = out + r * dim;
+                                   for (int64_t i = lane; i < dim; i += SG)
+                                       y[i] = rb(float((double(x[i]) - mean) * rs *
+                                                           double(bf2f(W[i])) +
+                                                       double(bf2f(Bs[i]))));
+                               });
+            });
+        }
+
+        // add a bias row and round, the tail of every vision nn.Linear
+        void k_bias(sycl::queue &q, float *Y, const uint16_t *B, int64_t rows, int64_t out)
+        {
+            q.parallel_for(sycl::range<2>(size_t(rows), size_t(out)), [=](sycl::id<2> id) {
+                const int64_t r = int64_t(id[0]), o = int64_t(id[1]);
+                Y[r * out + o] = rb(Y[r * out + o] + bf2f(B[o]));
+            });
+        }
+
+        void k_gelu(sycl::queue &q, float *X, int64_t n)
+        {
+            q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> i) {
+                const float v = X[i];
+                // erf-exact GELU, matching fmath::gelu rather than the tanh
+                // approximation -- the reference uses the exact one
+                X[i] = rb(0.5f * v * (1.0f + sycl::erf(v * 0.70710678118654752f)));
+            });
+        }
+
+        // patch embedding + the bilinear position table, whose four corners and
+        // weights are resolved on the host (pos_taps) and uploaded
+        void k_pos_add(sycl::queue &q, float *X, const uint16_t *table, const int32_t *idx,
+                       const float *wgt, int64_t N, int64_t H)
+        {
+            q.parallel_for(sycl::range<2>(size_t(N), size_t(H)), [=](sycl::id<2> id) {
+                const int64_t t = int64_t(id[0]), d = int64_t(id[1]);
+                float acc = 0.f;
+                for (int k = 0; k < 4; ++k)
+                    acc += bf2f(table[int64_t(idx[t * 4 + k]) * H + d]) * wgt[t * 4 + k];
+                X[t * H + d] = rb(X[t * H + d] + acc);
+            });
+        }
+
+        // gather rows: dst[t] = src[map[t]]
+        void k_gather_rows(sycl::queue &q, const float *src, float *dst, const int32_t *map,
+                           int64_t N, int64_t H)
+        {
+            q.parallel_for(sycl::range<2>(size_t(N), size_t(H)), [=](sycl::id<2> id) {
+                const int64_t t = int64_t(id[0]), d = int64_t(id[1]);
+                dst[t * H + d] = src[int64_t(map[t]) * H + d];
+            });
+        }
+        // scatter rows: dst[map[t]] = src[t]
+        void k_scatter_rows(sycl::queue &q, const float *src, float *dst, const int32_t *map,
+                            int64_t N, int64_t H)
+        {
+            q.parallel_for(sycl::range<2>(size_t(N), size_t(H)), [=](sycl::id<2> id) {
+                const int64_t t = int64_t(id[0]), d = int64_t(id[1]);
+                dst[int64_t(map[t]) * H + d] = src[t * H + d];
+            });
+        }
+
+        // 2-D rope: cos/sin are per TOKEN and shared by every head, and the
+        // rotation uses cos[j+half]/sin[j+half] on the upper half rather than
+        // reusing the lower half's -- the frequency layout is [fw|fh|fw|fh].
+        void k_vrope(sycl::queue &q, float *Q, float *K, const float *cosv, const float *sinv,
+                     int64_t N, int64_t nh, int64_t D, int64_t Hs)
+        {
+            const int64_t half = D / 2;
+            q.submit([&](sycl::handler &h) {
+                h.parallel_for(sycl::range<3>(size_t(N), size_t(nh), size_t(half)),
+                               [=](sycl::id<3> id) {
+                                   const int64_t t = int64_t(id[0]), hh = int64_t(id[1]),
+                                                 j = int64_t(id[2]);
+                                   const float *co = cosv + t * D, *si = sinv + t * D;
+                                   float *pq = Q + t * Hs + hh * D;
+                                   float *pk = K + t * Hs + hh * D;
+                                   for (float *p : {pq, pk})
+                                   {
+                                       const float lo = p[j], hi = p[j + half];
+                                       p[j] = rb(rb(lo * co[j]) + rb(-hi * si[j]));
+                                       p[j + half] =
+                                           rb(rb(hi * co[j + half]) + rb(lo * si[j + half]));
+                                   }
+                               });
+            });
+        }
+
+        // Bidirectional attention inside each cu_seqlens segment (a window, or
+        // a whole image for the full-attention layers). One sub-group per
+        // (token, head); `seg` maps a token to its segment.
+        void k_vattn(sycl::queue &q, const float *Q, const float *K, const float *V, float *O,
+                     float *sc, const int32_t *seg, const int32_t *cu, int64_t N, int64_t nh,
+                     int64_t D, int64_t Hs, int64_t maxseg, float scaling)
+        {
+            const int64_t rows = N * nh;
+            q.submit([&](sycl::handler &h) {
+                h.parallel_for(
+                    sycl::nd_range<1>(size_t(rows) * SG, SG),
+                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                        const int64_t gid = int64_t(it.get_group(0));
+                        const int64_t i = gid % N, hh = gid / N;
+                        auto sg = it.get_sub_group();
+                        const int lane = int(sg.get_local_id()[0]);
+                        const int64_t s = seg[i];
+                        const int64_t a = cu[s], b = cu[s + 1];
+                        const float *qv = Q + i * Hs + hh * D;
+                        float *row = sc + gid * maxseg;
+
+                        float mx = -INFINITY;
+                        for (int64_t j = a + lane; j < b; j += SG)
+                        {
+                            const float *kv = K + j * Hs + hh * D;
+                            float acc = 0.f;
+                            for (int64_t d = 0; d < D; ++d)
+                                acc += qv[d] * kv[d];
+                            const float v = rb(rb(acc) * scaling);
+                            row[j - a] = v;
+                            mx = sycl::max(mx, v);
+                        }
+                        mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+                        float sum = 0.f;
+                        for (int64_t j = a + lane; j < b; j += SG)
+                        {
+                            const float e = sycl::exp(row[j - a] - mx);
+                            row[j - a] = e;
+                            sum += e;
+                        }
+                        sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+                        sycl::group_barrier(sg);
+
+                        float *o = O + i * Hs + hh * D;
+                        for (int64_t d = lane; d < D; d += SG)
+                        {
+                            float acc = 0.f;
+                            for (int64_t j = a; j < b; ++j)
+                                acc += rb(row[j - a] / sum) * V[j * Hs + hh * D + d];
+                            o[d] = rb(acc);
+                        }
+                    });
+            });
+        }
+
+        // pixel shuffle: out[row][d*mu + k] = X[tok[row*mu + k]][d]
+        void k_pixel_shuffle(sycl::queue &q, const float *X, float *out, const int32_t *tok,
+                             int64_t M, int64_t H, int64_t mu)
+        {
+            q.parallel_for(sycl::range<3>(size_t(M), size_t(H), size_t(mu)),
+                           [=](sycl::id<3> id) {
+                               const int64_t r = int64_t(id[0]), d = int64_t(id[1]),
+                                             k = int64_t(id[2]);
+                               out[r * H * mu + d * mu + k] =
+                                   X[int64_t(tok[r * mu + k]) * H + d];
                            });
         }
 
@@ -1768,6 +1993,349 @@ namespace muse::gpu
                 }
             }
 
+            // ============================================================ vision
+            //
+            // The tower is 50 layers of ViT at hidden 1536 and runs once per
+            // image; on CPU that is seconds, which is why it is worth moving.
+            //
+            // Everything that is an INDEX rather than an arithmetic result is
+            // computed on the host by the already-gated code in vision.hpp --
+            // the window permutation, the cu_seqlens segment bounds, the
+            // bilinear position taps, the 2-D rope table, the pixel-shuffle
+            // source map. Those are the parts with the fiddly conventions (the
+            // w/h flip and +1, the [fw|fh|fw|fh] frequency layout, the
+            // channel-major merge), and reimplementing them on the device would
+            // be reimplementing the traps.
+            void bind_vision(const vision::Config &vc, const vision::Weights &vw,
+                             int64_t max_patches) override
+            {
+                vcfg_ = vc;
+                vmaxn_ = max_patches;
+                const int64_t ns = nshard_, H = vc.hidden_size, I = vc.intermediate_size;
+                const int64_t Hs = H / ns, Is = I / ns;
+                const int64_t P = vc.projector_hidden_size, OH = vc.out_hidden_size;
+                const int64_t TH = cfg_->hidden_size;
+                if (H % ns || I % ns || vc.num_attention_heads % ns)
+                    die("vision tower does not split " + std::to_string(ns) + " ways");
+                auto bf = [](const st::Tensor &t) { return muse::bf16::as_bf16(t); };
+
+                vpatch_.assign(size_t(ns), nullptr);
+                vpos_.assign(size_t(ns), nullptr);
+                vlnpre_w_.assign(size_t(ns), nullptr);
+                vlnpre_b_.assign(size_t(ns), nullptr);
+                vlnpost_w_.assign(size_t(ns), nullptr);
+                vlnpost_b_.assign(size_t(ns), nullptr);
+                vad1_.assign(size_t(ns), nullptr);
+                vad2_.assign(size_t(ns), nullptr);
+                vproj_.assign(size_t(ns), nullptr);
+                for (int64_t sh = 0; sh < ns; ++sh)
+                {
+                    const int d = int(sh);
+                    vpatch_[size_t(sh)] = up(d, bf(*vw.patch_embed), size_t(H * vc.patch_dim()));
+                    vpos_[size_t(sh)] = up(d, bf(*vw.pos_table),
+                                           size_t(vc.pos_emb_height * vc.pos_emb_width * H));
+                    vlnpre_w_[size_t(sh)] = up(d, bf(*vw.ln_pre_w), size_t(H));
+                    vlnpre_b_[size_t(sh)] = up(d, bf(*vw.ln_pre_b), size_t(H));
+                    vlnpost_w_[size_t(sh)] = up(d, bf(*vw.ln_post_w), size_t(H));
+                    vlnpost_b_[size_t(sh)] = up(d, bf(*vw.ln_post_b), size_t(H));
+                    vad1_[size_t(sh)] = up(d, bf(*vw.adapter_fc1), size_t(P * OH));
+                    vad2_[size_t(sh)] = up(d, bf(*vw.adapter_fc2), size_t(P * P));
+                    vproj_[size_t(sh)] = up(d, bf(*vw.projection), size_t(TH * P));
+                }
+
+                vlayers_.resize(size_t(vc.num_hidden_layers));
+                for (int64_t li = 0; li < vc.num_hidden_layers; ++li)
+                {
+                    const auto &t = vw.layers[size_t(li)];
+                    VLayer &g = vlayers_[size_t(li)];
+                    for (auto *arr : {&g.n1w, &g.n1b, &g.n2w, &g.n2b, &g.qw, &g.kw, &g.vw,
+                                      &g.fc1w, &g.qb, &g.kb, &g.vb, &g.fc1b, &g.ow, &g.fc2w,
+                                      &g.ob, &g.fc2b})
+                        arr->assign(size_t(ns), nullptr);
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        const int d = int(sh);
+                        const size_t k = size_t(sh);
+                        g.n1w[k] = up(d, bf(*t.norm1_w), size_t(H));
+                        g.n1b[k] = up(d, bf(*t.norm1_b), size_t(H));
+                        g.n2w[k] = up(d, bf(*t.norm2_w), size_t(H));
+                        g.n2b[k] = up(d, bf(*t.norm2_b), size_t(H));
+                        g.qw[k] = up(d, bf(*t.q_w) + sh * Hs * H, size_t(Hs * H));
+                        g.kw[k] = up(d, bf(*t.k_w) + sh * Hs * H, size_t(Hs * H));
+                        g.vw[k] = up(d, bf(*t.v_w) + sh * Hs * H, size_t(Hs * H));
+                        g.qb[k] = up(d, bf(*t.q_b) + sh * Hs, size_t(Hs));
+                        g.kb[k] = up(d, bf(*t.k_b) + sh * Hs, size_t(Hs));
+                        g.vb[k] = up(d, bf(*t.v_b) + sh * Hs, size_t(Hs));
+                        g.fc1w[k] = up(d, bf(*t.fc1_w) + sh * Is * H, size_t(Is * H));
+                        g.fc1b[k] = up(d, bf(*t.fc1_b) + sh * Is, size_t(Is));
+                        g.ow[k] = up_cols(d, bf(*t.o_w), H, H, sh * Hs, Hs);
+                        g.fc2w[k] = up_cols(d, bf(*t.fc2_w), H, I, sh * Is, Is);
+                        g.ob[k] = up(d, bf(*t.o_b), size_t(H));
+                        g.fc2b[k] = up(d, bf(*t.fc2_b), size_t(H));
+                    }
+                }
+                stage_.clear();
+                stage_.shrink_to_fit();
+
+                const int64_t N = vmaxn_, D = vc.head_dim(), mu = vc.merge_unit();
+                vbuf_.assign(size_t(ns), {});
+                for (int64_t sh = 0; sh < ns; ++sh)
+                {
+                    const int d = int(sh);
+                    VBuf &b = vbuf_[size_t(sh)];
+                    b.x = dalloc<float>(d, size_t(N * H));
+                    b.h = dalloc<float>(d, size_t(N * H));
+                    b.xn = dalloc<float>(d, size_t(N * H));
+                    b.mix = dalloc<float>(d, size_t(N * H));
+                    b.Q = dalloc<float>(d, size_t(N * Hs));
+                    b.K = dalloc<float>(d, size_t(N * Hs));
+                    b.V = dalloc<float>(d, size_t(N * Hs));
+                    b.O = dalloc<float>(d, size_t(N * Hs));
+                    b.F1 = dalloc<float>(d, size_t(N * Is));
+                    b.bstage = dalloc<uint16_t>(d, size_t(N * std::max({H, Is, vc.patch_dim(),
+                                                                       OH, P})));
+                    b.cosv = dalloc<float>(d, size_t(N * D));
+                    b.sinv = dalloc<float>(d, size_t(N * D));
+                    b.widx = dalloc<int32_t>(d, size_t(N));
+                    b.seg = dalloc<int32_t>(d, size_t(N));
+                    b.cuw = dalloc<int32_t>(d, size_t(N + 2));
+                    b.cuf = dalloc<int32_t>(d, size_t(N + 2));
+                    b.segf = dalloc<int32_t>(d, size_t(N));
+                    b.posidx = dalloc<int32_t>(d, size_t(N * 4));
+                    b.poswgt = dalloc<float>(d, size_t(N * 4));
+                    b.shuf = dalloc<int32_t>(d, size_t(N * mu));
+                    b.pix = dalloc<uint16_t>(d, size_t(N * vc.patch_dim()));
+                    b.merged = dalloc<float>(d, size_t((N / mu + 1) * OH));
+                    b.a1 = dalloc<float>(d, size_t((N / mu + 1) * P));
+                    b.a2 = dalloc<float>(d, size_t((N / mu + 1) * P));
+                    b.out = dalloc<float>(d, size_t((N / mu + 1) * TH));
+                    b.sc = dalloc<float>(d, size_t(N * (vc.num_attention_heads / ns) *
+                                                   vseg_cap_));
+                    shards_[size_t(sh)].q.wait();
+                }
+                if (opt_.verbose)
+                    std::fprintf(stderr, "[gpu] vision tower: %lld layers, up to %lld patches\n",
+                                 (long long)vc.num_hidden_layers, (long long)N);
+            }
+
+            std::vector<float> vision_features(const double *pixels,
+                                               const std::vector<vision::Grid> &grids) override
+            {
+                const vision::Config &vc = vcfg_;
+                const int64_t ns = nshard_, H = vc.hidden_size, I = vc.intermediate_size;
+                const int64_t Hs = H / ns, Is = I / ns, D = vc.head_dim();
+                const int64_t nh = vc.num_attention_heads, nhs = nh / ns, mu = vc.merge_unit();
+                const int64_t P = vc.projector_hidden_size, OH = vc.out_hidden_size;
+                const int64_t TH = cfg_->hidden_size;
+                if (vlayers_.empty())
+                    die("vision_features() before bind_vision()");
+                int64_t N = 0;
+                for (const auto &g : grids)
+                    N += g.tokens();
+                if (N > vmaxn_)
+                    die("image needs " + std::to_string(N) + " patches, tower was bound for " +
+                        std::to_string(vmaxn_));
+
+                // ---- host-side index work, from the gated CPU implementation
+                std::vector<int64_t> widx, wcu;
+                vision::window_index(vc, grids, widx, wcu);
+                const std::vector<int64_t> fcu = vision::full_cu_seqlens(grids);
+                std::vector<std::array<int64_t, 4>> pidx;
+                std::vector<std::array<double, 4>> pwgt;
+                vision::pos_taps(vc, grids, pidx, pwgt);
+                std::vector<int64_t> wid, hid;
+                vision::position_ids(grids, wid, hid);
+
+                auto seg_of = [&](const std::vector<int64_t> &cu) {
+                    std::vector<int32_t> v(static_cast<size_t>(N), 0);
+                    for (size_t si = 0; si + 1 < cu.size(); ++si)
+                        for (int64_t i = cu[si]; i < cu[si + 1]; ++i)
+                            v[size_t(i)] = int32_t(si);
+                    return v;
+                };
+                const std::vector<int32_t> segw = seg_of(wcu), segf = seg_of(fcu);
+                int64_t maxseg = 0;
+                for (const std::vector<int64_t> *cu : {(const std::vector<int64_t> *)&wcu,
+                                                       (const std::vector<int64_t> *)&fcu})
+                    for (size_t si = 0; si + 1 < cu->size(); ++si)
+                        maxseg = std::max(maxseg, (*cu)[si + 1] - (*cu)[si]);
+                if (maxseg > vseg_cap_)
+                    die("attention segment of " + std::to_string(maxseg) +
+                        " exceeds the tower's scratch (" + std::to_string(vseg_cap_) + ")");
+
+                // 2-D rope, built exactly as the twin builds it
+                const int64_t sd = vc.spatial_dim();
+                std::vector<float> cosv(static_cast<size_t>(N * D)),
+                    sinv(static_cast<size_t>(N * D));
+                {
+                    std::vector<float> inv32(static_cast<size_t>(sd / 2));
+                    for (int64_t j = 0; j < sd / 2; ++j)
+                        inv32[size_t(j)] = 1.0f / float(fmath::pow(double(float(vc.rope_theta)),
+                                                                   double(float(2 * j) /
+                                                                          float(sd))));
+                    for (int64_t t = 0; t < N; ++t)
+                    {
+                        const int64_t src = widx[size_t(t)];
+                        const float pw = float(wid[size_t(src)]), ph = float(hid[size_t(src)]);
+                        for (int64_t j = 0; j < D; ++j)
+                        {
+                            const int64_t qd = j / (sd / 2), r = j % (sd / 2);
+                            const float pp = (qd == 0 || qd == 2) ? pw : ph;
+                            const double ang = double(pp * inv32[size_t(r)]);
+                            cosv[size_t(t * D + j)] = bf16_rt(float(fmath::cos(ang)));
+                            sinv[size_t(t * D + j)] = bf16_rt(float(fmath::sin(ang)));
+                        }
+                    }
+                }
+
+                // pixel-shuffle source map and the window permutation
+                std::vector<int32_t> shuf;
+                {
+                    int64_t in_off = 0;
+                    for (const auto &g : grids)
+                        for (int64_t f = 0; f < g.t; ++f)
+                            for (int64_t by = 0; by < g.h / vc.merge_size; ++by)
+                                for (int64_t bx = 0; bx < g.w / vc.merge_size; ++bx)
+                                    for (int64_t k = 0; k < mu; ++k)
+                                    {
+                                        const int64_t iy = by * vc.merge_size + k / vc.merge_size;
+                                        const int64_t ix = bx * vc.merge_size + k % vc.merge_size;
+                                        shuf.push_back(int32_t(in_off + f * g.h * g.w +
+                                                               iy * g.w + ix));
+                                    }
+                    for (const auto &g : grids)
+                        in_off += g.tokens();
+                }
+                const int64_t M = int64_t(shuf.size()) / mu;
+
+                std::vector<int32_t> w32(widx.begin(), widx.end());
+                std::vector<int32_t> cuw32(wcu.begin(), wcu.end()),
+                    cuf32(fcu.begin(), fcu.end());
+                std::vector<int32_t> pi(static_cast<size_t>(N * 4));
+                std::vector<float> pwf(static_cast<size_t>(N * 4));
+                for (int64_t t = 0; t < N; ++t)
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        pi[size_t(t * 4 + k)] = int32_t(pidx[size_t(t)][size_t(k)]);
+                        pwf[size_t(t * 4 + k)] = float(pwgt[size_t(t)][size_t(k)]);
+                    }
+                std::vector<uint16_t> pxb(static_cast<size_t>(N * vc.patch_dim()));
+                for (size_t i = 0; i < pxb.size(); ++i)
+                    pxb[i] = muse::bf16::f32_to_bf16(float(pixels[i]));
+
+                for (int64_t sh = 0; sh < ns; ++sh)
+                {
+                    Dev &d = shards_[size_t(sh)];
+                    VBuf &b = vbuf_[size_t(sh)];
+                    d.q.memcpy(b.pix, pxb.data(), pxb.size() * 2);
+                    d.q.memcpy(b.widx, w32.data(), w32.size() * 4);
+                    d.q.memcpy(b.cuw, cuw32.data(), cuw32.size() * 4);
+                    d.q.memcpy(b.cuf, cuf32.data(), cuf32.size() * 4);
+                    d.q.memcpy(b.seg, segw.data(), segw.size() * 4);
+                    d.q.memcpy(b.segf, segf.data(), segf.size() * 4);
+                    d.q.memcpy(b.posidx, pi.data(), pi.size() * 4);
+                    d.q.memcpy(b.poswgt, pwf.data(), pwf.size() * 4);
+                    d.q.memcpy(b.cosv, cosv.data(), cosv.size() * 4);
+                    d.q.memcpy(b.sinv, sinv.data(), sinv.size() * 4);
+                    d.q.memcpy(b.shuf, shuf.data(), shuf.size() * 4);
+                    d.q.wait();
+
+                    // patch embed (no bias) + bilinear position table, ln_pre,
+                    // then the window permutation
+                    gemm_rm(int(sh), vpatch_[size_t(sh)], b.pix, b.x, N, vc.patch_dim(), H);
+                    k_pos_add(d.q, b.x, vpos_[size_t(sh)], b.posidx, b.poswgt, N, H);
+                    k_layernorm(d.q, b.x, vlnpre_w_[size_t(sh)], vlnpre_b_[size_t(sh)], b.x, N,
+                                H, vc.layer_norm_eps);
+                    k_gather_rows(d.q, b.x, b.h, b.widx, N, H);
+                }
+
+                const float scaling = float(1.0 / std::sqrt(double(D)));
+                for (int64_t li = 0; li < vc.num_hidden_layers; ++li)
+                {
+                    const VLayer &l = vlayers_[size_t(li)];
+                    const bool win = vc.layer_is_window(li);
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        VBuf &b = vbuf_[size_t(sh)];
+                        k_layernorm(d.q, b.h, l.n1w[size_t(sh)], l.n1b[size_t(sh)], b.xn, N, H,
+                                    vc.layer_norm_eps);
+                        k_round(d.q, b.xn, b.bstage, N * H);
+                        gemm_rm(int(sh), l.qw[size_t(sh)], b.bstage, b.Q, N, H, Hs);
+                        gemm_rm(int(sh), l.kw[size_t(sh)], b.bstage, b.K, N, H, Hs);
+                        gemm_rm(int(sh), l.vw[size_t(sh)], b.bstage, b.V, N, H, Hs);
+                        k_bias(d.q, b.Q, l.qb[size_t(sh)], N, Hs);
+                        k_bias(d.q, b.K, l.kb[size_t(sh)], N, Hs);
+                        k_bias(d.q, b.V, l.vb[size_t(sh)], N, Hs);
+                        k_vrope(d.q, b.Q, b.K, b.cosv, b.sinv, N, nhs, D, Hs);
+                        k_vattn(d.q, b.Q, b.K, b.V, b.O, b.sc, win ? b.seg : b.segf,
+                                win ? b.cuw : b.cuf, N, nhs, D, Hs, vseg_cap_, scaling);
+                        k_round(d.q, b.O, b.bstage, N * Hs);
+                        gemm_rm(int(sh), l.ow[size_t(sh)], b.bstage, b.mix, N, Hs, H);
+                    }
+                    all_reduce_buf(N * H, [&](int sh) { return vbuf_[size_t(sh)].mix; });
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        VBuf &b = vbuf_[size_t(sh)];
+                        // bias AFTER the all-reduce: per shard it would land
+                        // `nshard` times
+                        k_bias(d.q, b.mix, l.ob[size_t(sh)], N, H);
+                        k_dresid(d.q, b.h, b.mix, N * H);
+                        k_layernorm(d.q, b.h, l.n2w[size_t(sh)], l.n2b[size_t(sh)], b.xn, N, H,
+                                    vc.layer_norm_eps);
+                        k_round(d.q, b.xn, b.bstage, N * H);
+                        gemm_rm(int(sh), l.fc1w[size_t(sh)], b.bstage, b.F1, N, H, Is);
+                        k_bias(d.q, b.F1, l.fc1b[size_t(sh)], N, Is);
+                        k_gelu(d.q, b.F1, N * Is);
+                        k_round(d.q, b.F1, b.bstage, N * Is);
+                        gemm_rm(int(sh), l.fc2w[size_t(sh)], b.bstage, b.mix, N, Is, H);
+                    }
+                    all_reduce_buf(N * H, [&](int sh) { return vbuf_[size_t(sh)].mix; });
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                    {
+                        Dev &d = shards_[size_t(sh)];
+                        VBuf &b = vbuf_[size_t(sh)];
+                        k_bias(d.q, b.mix, l.fc2b[size_t(sh)], N, H);
+                        k_dresid(d.q, b.h, b.mix, N * H);
+                    }
+                }
+
+                // undo the window permutation, ln_post, pixel shuffle, adapter,
+                // projection, then the SAME weight-less RMSNorm the text
+                // embedding uses -- which is what puts both on one scale
+                std::vector<float> feats(static_cast<size_t>(M * TH));
+                for (int64_t sh = 0; sh < ns; ++sh)
+                {
+                    Dev &d = shards_[size_t(sh)];
+                    VBuf &b = vbuf_[size_t(sh)];
+                    k_scatter_rows(d.q, b.h, b.x, b.widx, N, H);
+                    k_layernorm(d.q, b.x, vlnpost_w_[size_t(sh)], vlnpost_b_[size_t(sh)], b.x, N,
+                                H, vc.layer_norm_eps);
+                    k_pixel_shuffle(d.q, b.x, b.merged, b.shuf, M, H, mu);
+                    k_round(d.q, b.merged, b.bstage, M * OH);
+                    gemm_rm(int(sh), vad1_[size_t(sh)], b.bstage, b.a1, M, OH, P);
+                    k_gelu(d.q, b.a1, M * P);
+                    k_round(d.q, b.a1, b.bstage, M * P);
+                    gemm_rm(int(sh), vad2_[size_t(sh)], b.bstage, b.a2, M, P, P);
+                    k_gelu(d.q, b.a2, M * P);
+                    k_round(d.q, b.a2, b.bstage, M * P);
+                    gemm_rm(int(sh), vproj_[size_t(sh)], b.bstage, b.out, M, P, TH);
+                    k_dnorm_wl(d.q, b.out, b.out, M, TH, cfg_->rms_norm_eps);
+                }
+                shards_[0].q.memcpy(feats.data(), vbuf_[0].out, feats.size() * 4).wait();
+                return feats;
+            }
+
+            // features are scattered AFTER the embedding norm, which is where
+            // the reference puts them
+            void set_vision_embeds(const std::vector<float> &feats,
+                                   const std::vector<int64_t> &positions) override
+            {
+                vfeat_ = feats;
+                vpos_at_ = positions;
+            }
+
             // ============================================================ DFlash
             //
             // The block-diffusion drafter. One forward per round over
@@ -2070,6 +2638,26 @@ namespace muse::gpu
                     d.q.memcpy(d.ids, h_ids.data(), size_t(n) * 4).wait();
                     k_embed(d.q, embed_[size_t(sh)], d.ids, d.h, n, H, B);
                     k_rmsnorm_f32(d.q, d.h, d.h, n, H, B, c.rms_norm_eps);
+                }
+                // vision features replace the embedding at the image/video
+                // placeholder positions, AFTER the norm
+                if (!vfeat_.empty())
+                {
+                    const int64_t TH = H;
+                    std::vector<float> col(static_cast<size_t>(TH));
+                    for (size_t k = 0; k < vpos_at_.size(); ++k)
+                    {
+                        const int64_t p = vpos_at_[k] - pos0;
+                        if (p < 0 || p >= n)
+                            continue;
+                        for (int64_t i = 0; i < TH; ++i)
+                            col[size_t(i)] = vfeat_[k * size_t(TH) + size_t(i)];
+                        for (int64_t sh = 0; sh < ns; ++sh)
+                            shards_[size_t(sh)]
+                                .q.ext_oneapi_memcpy2d(shards_[size_t(sh)].h + p, size_t(B) * 4,
+                                                       col.data(), 4, 4, size_t(TH))
+                                .wait();
+                    }
                 }
                 trace(0, "embed", n, B);
 
@@ -2483,6 +3071,26 @@ namespace muse::gpu
                          *Gb = nullptr;
             };
             std::vector<DBuf> dbuf_;
+            // ---- vision tower state (empty until bind_vision) ----
+            vision::Config vcfg_;
+            std::vector<VLayer> vlayers_;
+            std::vector<uint16_t *> vpatch_, vpos_, vlnpre_w_, vlnpre_b_, vlnpost_w_,
+                vlnpost_b_, vad1_, vad2_, vproj_;
+            int64_t vmaxn_ = 0;
+            static constexpr int64_t vseg_cap_ = 4096; // widest attention segment
+            struct VBuf
+            {
+                float *x = nullptr, *h = nullptr, *xn = nullptr, *mix = nullptr, *Q = nullptr;
+                float *K = nullptr, *V = nullptr, *O = nullptr, *F1 = nullptr, *sc = nullptr;
+                float *cosv = nullptr, *sinv = nullptr, *poswgt = nullptr;
+                float *merged = nullptr, *a1 = nullptr, *a2 = nullptr, *out = nullptr;
+                uint16_t *bstage = nullptr, *pix = nullptr;
+                int32_t *widx = nullptr, *seg = nullptr, *segf = nullptr, *cuw = nullptr;
+                int32_t *cuf = nullptr, *posidx = nullptr, *shuf = nullptr;
+            };
+            std::vector<VBuf> vbuf_;
+            std::vector<float> vfeat_;
+            std::vector<int64_t> vpos_at_;
             int64_t fbq_ = 512, fbk_ = 512;
 #if ORACLE_GPU_DNNL
             std::vector<std::map<std::array<int64_t, 8>, dnnl::matmul>> bprims_;

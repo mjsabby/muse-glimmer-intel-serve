@@ -26,6 +26,12 @@ namespace muse
         struct Config;
         struct Weights;
     }
+    namespace vision
+    {
+        struct Config;
+        struct Weights;
+        struct Grid;
+    }
 }
 
 namespace muse::gpu
@@ -121,6 +127,19 @@ namespace muse::gpu
         // pass. `n` context positions, anchored on `anchor` at absolute
         // position `pos0`.
         virtual DraftResult draft(int64_t n, int64_t anchor, int64_t pos0) = 0;
+
+        // Vision tower. `max_patches` sizes the scratch once, so an image
+        // larger than it is a startup-shaped error rather than a mid-request
+        // allocation.
+        virtual void bind_vision(const vision::Config &vc, const vision::Weights &vw,
+                                 int64_t max_patches) = 0;
+        // pixel_values [N, patch_dim] -> [M, text hidden], ready to scatter
+        virtual std::vector<float> vision_features(const double *pixels,
+                                                   const std::vector<vision::Grid> &grids) = 0;
+        // Scattered into the residual stream AFTER the embedding norm, which is
+        // where the reference puts them.
+        virtual void set_vision_embeds(const std::vector<float> &feats,
+                                       const std::vector<int64_t> &positions) = 0;
 
         virtual const Timings &timings() const = 0;
         virtual void report_profile(std::FILE *f) const = 0;

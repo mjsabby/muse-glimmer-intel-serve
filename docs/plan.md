@@ -483,7 +483,7 @@ model tier, GPU count, quantization, and depth.
 | 3 bf16/f16 twin | ✅ | | **done** (text; drafter/tower twins written, not gated) |
 | 4 GGUF ingest | ✅ | | not started |
 | 5 DFlash oracle | ✅ | | **done** |
-| 6 Vision oracle | ✅ | | tower + projector **done**; pixel ingestion and video not started |
+| 6 Vision oracle | ✅ | | tower + projector **done** on CPU and GPU (20.8x, see [gpu.md](gpu.md)); pixel ingestion and video not started |
 | 7 SYCL single-GPU | design only | ✅ | **done** (text; see [gpu.md](gpu.md), incl. the opt-in `--flash-prefill` matrix-engine attention tier. No Q8 tier yet, no vision/DFlash on GPU) |
 | 8 Dual-GPU TP | design only | ✅ | **done** (text; head/FFN/vocab split, KV replicated — see [gpu.md](gpu.md)). 14.81 tok/s decode, 1030 tok/s prefill, full 131 072 context fits |
 | 9 Serving frontend | ✅ except live gates | ✅ for `live_api_tests.py` | not started |

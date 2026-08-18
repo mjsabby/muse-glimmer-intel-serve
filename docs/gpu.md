@@ -388,6 +388,55 @@ GiB/card for the drafter and expected the margin to run out). Sharding the
 drafter the same way as the target is what buys it. It is still tight, and a
 quantized drafter remains the comfortable configuration.
 
+## Vision tower
+
+`--pixels FILE --grid t,h,w` runs the 50-layer ViT on the cards and scatters its
+output at the image/video placeholder tokens, after the embedding norm.
+
+| 1024 patches, 30B tower | |
+|---|---:|
+| CPU (bf16, 32 threads, AVX-512) | 11.391 s |
+| **GPU (2 cards)** | **0.547 s** |
+| | **20.8×** |
+
+Everything that is an **index** rather than an arithmetic result is computed on
+the host by the already-gated code in `vision.hpp` — the window permutation, the
+`cu_seqlens` segment bounds, the bilinear position taps, the 2-D rope table, the
+pixel-shuffle source map. Those are the parts carrying the fiddly conventions
+(the w/h flip and +1, the `[fw|fh|fw|fh]` frequency layout, the channel-major
+merge), and reimplementing them on the device would be reimplementing the traps.
+The device does arithmetic only.
+
+Two things the tower does that the text stack does not, and both are separate
+kernels rather than flags:
+
+* **LayerNorm, not RMSNorm** — it subtracts a mean and carries a bias.
+* **Every projection has a bias.** On the column-sharded ones (`o_proj`,
+  `fc2`) the bias is added *after* the all-reduce; adding it per shard would add
+  it `nshard` times.
+
+### Accuracy: read this against the twin, not the oracle
+
+The tower in bf16 is genuinely noisy — 50 LayerNorm layers accumulate — and the
+right reference is the CPU bf16 twin's own deviation, not zero. On the 30B with
+80 patches:
+
+| | max abs | cos (min per row) |
+|---|---:|---:|
+| CPU bf16 twin vs f64 oracle | 3.386 | 0.9668 |
+| **GPU vs f64 oracle** | **3.347** | **0.9808** |
+| GPU vs CPU bf16 twin | 1.875 | 0.9965 |
+
+The GPU is *closer to the oracle than the CPU twin is*, so it has introduced
+nothing beyond bf16. GPU and twin also agree on the top-3 ordering where the f64
+oracle differs — bf16 flips a near-tie, on both of them, the same way. At 1024
+patches, GPU vs twin is cosine 0.9843 min / 0.9990 mean.
+
+The gate encodes exactly this: the GPU's distance from the **oracle** must not
+exceed 1.5× the **twin's** distance from the oracle. Comparing GPU to twin
+directly and calling the difference an error would be comparing two reduction
+orders and blaming one of them.
+
 ## Gates (`run_gpu_gates.sh`)
 
 | gate | what it protects |
@@ -404,6 +453,8 @@ quantized drafter remains the comfortable configuration.
 | flash tier rerun + 1 card == 2 cards, bitwise | looser numerics, not sloppy ones |
 | drafter proposals == the f64 oracle's | the drafter's four inverted conventions |
 | drafter: 1 card == 2 cards | the drafter shards like the target |
+| vision features within the twin's own deviation of the oracle | the tower, judged against bf16 rather than against zero |
+| image+text logits argmax + top-20 | the features land at the right token positions |
 
 `MUSE_GPU_TRACE=<dir>` dumps the residual stream per layer (row-major `[n, H]`),
 which is how the oneDNN bug was localized to the head. `MUSE_GPU_PROFILE=1`

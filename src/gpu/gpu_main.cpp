@@ -7,6 +7,7 @@
 
 #include "hf.hpp"
 #include "dflash.hpp"
+#include "vision.hpp"
 #include "muse_glimmer.hpp"
 
 #include <algorithm>
@@ -61,6 +62,8 @@ namespace
                      "  --flash-prefill    matrix-engine prefill attention (faster, and a\n"
                      "                     LOOSER numerical contract - envelope-gated)\n"
                      "  --assistant DIR    DFlash drafter; runs one drafting round after prefill\n"
+                     "  --pixels FILE      f64 [N, patch_dim] pixel values (with --grid)\n"
+                     "  --grid t,h,w[;..]  patch grid per image\n"
                      "  --list-devices     enumerate the visible GPUs and exit\n"
                      "  --revision REV     HF revision when --model is a repo id\n");
     }
@@ -68,7 +71,7 @@ namespace
 
 int main(int argc, char **argv)
 {
-    std::string model, ids_spec, out_dir = "out/gpu", revision = "main", assistant;
+    std::string model, ids_spec, out_dir = "out/gpu", revision = "main", assistant, pixels_path, grid_spec;
     int64_t chunk = 512, max_seq = 0, decode_n = 0;
     int gpus = 2, shards = 0, topk = 5;
     bool no_dnnl = false, flash_prefill = false;
@@ -110,6 +113,10 @@ int main(int argc, char **argv)
             flash_prefill = true;
         else if (a == "--assistant")
             assistant = next();
+        else if (a == "--pixels")
+            pixels_path = next();
+        else if (a == "--grid")
+            grid_spec = next();
         else if (a == "--list-devices")
         {
             auto ds = muse::gpu::enumerate_devices();
@@ -181,6 +188,72 @@ int main(int argc, char **argv)
         auto eng = muse::gpu::Engine::create(cfg, w, opt);
         if (!assistant.empty())
             eng->bind_drafter(acfg, aw);
+
+        // ---- vision: run the tower, then scatter its output at the
+        //      image/video placeholder tokens
+        if (!pixels_path.empty() != !grid_spec.empty())
+            throw std::runtime_error("--pixels and --grid must be given together");
+        if (!pixels_path.empty())
+        {
+            muse::vision::Config vcfg = muse::vision::parse_config(*mf.config);
+            muse::vision::Weights vw = muse::vision::bind_weights(mf, vcfg, cfg);
+            std::vector<muse::vision::Grid> grids;
+            {
+                std::string spec = grid_spec;
+                for (auto &ch : spec)
+                    if (ch == ',' || ch == ';')
+                        ch = ' ';
+                std::istringstream gs(spec);
+                int64_t gt, gh, gw;
+                while (gs >> gt >> gh >> gw)
+                    grids.push_back({gt, gh, gw});
+                if (grids.empty())
+                    throw std::runtime_error("--grid must be t,h,w[;t,h,w...]");
+            }
+            int64_t npatch = 0;
+            for (const auto &g : grids)
+                npatch += g.tokens();
+            std::vector<double> px(size_t(npatch * vcfg.patch_dim()));
+            {
+                std::ifstream f(pixels_path, std::ios::binary);
+                if (!f)
+                    throw std::runtime_error("cannot read " + pixels_path);
+                f.seekg(0, std::ios::end);
+                const std::streamoff have = f.tellg();
+                const std::streamoff want = std::streamoff(px.size() * 8);
+                if (have != want)
+                    throw std::runtime_error(pixels_path + ": " + std::to_string(int64_t(have)) +
+                                             " bytes, expected " + std::to_string(int64_t(want)));
+                f.seekg(0);
+                f.read(reinterpret_cast<char *>(px.data()), want);
+            }
+            std::fprintf(stderr,
+                         "vision: %zu grid(s), %lld patches, tower %lld layers x %lld, "
+                         "%lld merged tokens\n",
+                         grids.size(), (long long)npatch, (long long)vcfg.num_hidden_layers,
+                         (long long)vcfg.hidden_size,
+                         (long long)(npatch / vcfg.merge_unit()));
+            eng->bind_vision(vcfg, vw, npatch);
+            const auto vt0 = std::chrono::steady_clock::now();
+            const std::vector<float> feats = eng->vision_features(px.data(), grids);
+            std::fprintf(stderr, "  tower forward: %.3f s\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - vt0)
+                             .count());
+            {
+                std::vector<double> fd(feats.begin(), feats.end());
+                std::filesystem::create_directories(out_dir);
+                write_bin(out_dir + "/vision.bin", fd.data(), fd.size());
+            }
+            std::vector<int64_t> at;
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (ids[i] == cfg.image_token_id || ids[i] == cfg.video_token_id)
+                    at.push_back(int64_t(i));
+            const int64_t M = npatch / vcfg.merge_unit();
+            if (int64_t(at.size()) != M)
+                throw std::runtime_error("placeholder count " + std::to_string(at.size()) +
+                                         " != merged vision tokens " + std::to_string(M));
+            eng->set_vision_embeds(feats, at);
+        }
 
         std::vector<float> lg(size_t(cfg.vocab_size), 0.f);
         eng->prefill(ids, lg.data());
