@@ -800,6 +800,91 @@ namespace muse::gpu
             });
         }
 
+        // Q8_0 GEMM for a FEW rows: Y[M, out] = X[M, in] . dequant(W)[out, in]^T,
+        // both activations and output row-major.
+        //
+        // The drafter's GEMMs are 16 rows wide. Sending them through the
+        // prefill dequantize-to-scratch path reads the quants, writes a full
+        // bf16 copy of the weight and reads it back -- 4.75x the traffic of
+        // just reading the quants -- which is why a Q8 drafter cost 25% of
+        // speculative throughput.
+        //
+        // Reading the weight once is necessary but not sufficient. The naive
+        // form (one sub-group per output row, walking the whole input) then
+        // re-reads the ACTIVATIONS once per output row: `out * M * in` element
+        // loads, 2.1 GB per matrix at the MLP shape. That dominated, and the
+        // first version of this kernel was barely faster than dequantizing.
+        //
+        // So: a work-group owns SGPW output rows and stages a tile of the
+        // activations in local memory, which every one of its sub-groups reads
+        // instead of going back to cache. Global activation traffic drops by
+        // SGPW. Lanes cover ELEMENTS within the tile (not blocks), so both the
+        // quant reads and the SLM reads are contiguous across the sub-group.
+        template <int MMAX, int SGPW, int TILE>
+        void k_gemm_q8_smallm(sycl::queue &q, const int8_t *W, const uint16_t *Dsc,
+                              const uint16_t *X, float *Y, int64_t M, int64_t in, int64_t out)
+        {
+            const int64_t groups = (out + SGPW - 1) / SGPW;
+            q.submit([&](sycl::handler &h) {
+                sycl::local_accessor<uint16_t, 1> xs(sycl::range<1>(size_t(MMAX * TILE)), h);
+                h.parallel_for(
+                    sycl::nd_range<1>(size_t(groups) * SGPW * SG, SGPW * SG),
+                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                        auto sg = it.get_sub_group();
+                        const int64_t o =
+                            int64_t(it.get_group(0)) * SGPW + int64_t(sg.get_group_id()[0]);
+                        const int lane = int(sg.get_local_id()[0]);
+                        const int64_t lid = int64_t(it.get_local_id(0));
+                        const bool live = o < out;
+                        const int8_t *w = W + (live ? o : 0) * in;
+                        const sycl::half *dd =
+                            reinterpret_cast<const sycl::half *>(Dsc + (live ? o : 0) * (in / QK8));
+
+                        float acc[MMAX];
+#pragma unroll
+                        for (int r = 0; r < MMAX; ++r)
+                            acc[r] = 0.f;
+
+                        for (int64_t t0 = 0; t0 < in; t0 += TILE)
+                        {
+                            const int64_t tn = sycl::min<int64_t>(TILE, in - t0);
+                            // stage X[0..M, t0..t0+tn) cooperatively
+                            for (int64_t e = lid; e < MMAX * tn; e += int64_t(SGPW) * SG)
+                            {
+                                const int64_t r = e / tn, c = e % tn;
+                                xs[size_t(r * TILE + c)] =
+                                    (int64_t(r) < M) ? X[r * in + t0 + c] : 0;
+                            }
+                            sycl::group_barrier(it.get_group());
+
+                            if (live)
+                                for (int64_t c = lane; c < tn; c += SG)
+                                {
+                                    // per-element dequantization, exactly as
+                                    // k_dequant_q8 does it, so the tier stays
+                                    // internally consistent
+                                    const float wv =
+                                        rb(float(w[t0 + c]) * float(dd[(t0 + c) / QK8]));
+#pragma unroll
+                                    for (int r = 0; r < MMAX; ++r)
+                                        acc[r] += wv * bf2f(xs[size_t(r * TILE + c)]);
+                                }
+                            sycl::group_barrier(it.get_group());
+                        }
+                        if (!live)
+                            return;
+#pragma unroll
+                        for (int r = 0; r < MMAX; ++r)
+                        {
+                            const float sres =
+                                sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+                            if (lane == 0 && int64_t(r) < M)
+                                Y[int64_t(r) * out + o] = sres;
+                        }
+                    });
+            });
+        }
+
         // Prefill stays on the matrix engines: oneDNN has no grouped-scale
         // path on this stack (measured -- see docs), so the weight is expanded
         // to bf16 in a scratch tile and the ordinary DPAS GEMM runs on it. That
@@ -2411,6 +2496,12 @@ namespace muse::gpu
                     return;
                 }
                 Dev &d = shards_[size_t(sh)];
+                if (rows <= q8_smallm_)
+                {
+                    // reads the weight once instead of expanding it
+                    k_gemm_q8_smallm<16, 16, 256>(d.q, w.qs, w.d, X, Y, rows, in, out);
+                    return;
+                }
                 if (int64_t(out * in) > deq_cap_)
                     die("Q8 scratch too small for a " + std::to_string(out) + "x" +
                         std::to_string(in) + " weight");
@@ -3734,6 +3825,7 @@ namespace muse::gpu
             std::vector<int64_t> tap_layers_;
             bool q8_ = false, q8_asst_ = false, q8_blockdot_ = false;
             int64_t deq_cap_ = 0;
+            static constexpr int64_t q8_smallm_ = 16; // matches k_gemm_q8_smallm<16>
             std::vector<int8_t> qbuf_;
             std::vector<uint16_t> dbuf8_;
             mutable double dt_ctx_ = 0, dt_layers_ = 0, dt_head_ = 0;

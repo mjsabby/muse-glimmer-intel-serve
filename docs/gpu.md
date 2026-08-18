@@ -433,13 +433,42 @@ reading it back, i.e. 3× the traffic of just reading bf16:
 
 | drafter tier | VRAM | draft/round | spec tok/s (code) |
 |---|---:|---:|---:|
-| BF16 | 4.89 GiB | 16.4 ms | **119.9** |
-| Q8_0 | **2.79 GiB** | 48.0 ms | 89.3 |
+| BF16 | 4.89 GiB | 16.1 ms | **122.4** |
+| Q8_0 (dequantize-to-scratch) | 2.79 GiB | 48.0 ms | 89.3 |
+| **Q8_0 (small-M GEMM)** | **2.79 GiB** | **36.0 ms** | **100.3** |
 
-A dedicated small-M Q8 GEMM (one sub-group per output row, accumulating all 16
-activation rows from a single pass over the weight) would read 1.06 bytes per
-weight instead of expanding it, and should make the Q8 drafter *faster* than
-BF16 rather than slower. Not written.
+`k_gemm_q8_smallm` reads the weight once and reuses each dequantized value
+across all M activation rows, with the activations staged in local memory so
+they are not re-fetched per output row. That took the Q8 drafter's overhead from
+25% of speculative throughput to 18%.
+
+**It does not close the gap, and measurement says it cannot.** At the drafter's
+shape (M=16, 6656→9984), with incompressible weights:
+
+| | time | effective |
+|---|---:|---|
+| bf16 via oneDNN | **0.231 ms** | 576 GB/s — the streaming ceiling |
+| q8 → bf16 dequant, then the same GEMM | 1.955 ms | traffic-bound, 3× the bytes |
+| q8 small-M, hand-written | 0.792 ms | 90 GB/s — ALU-bound |
+
+BF16 is *already at the memory ceiling*, so there is nothing to win back there.
+At M = 16 the arithmetic intensity is 16 FMA per weight element, and a scalar
+kernel pays ~35 operations per weight byte — more than halving the bytes saves.
+The bf16 path gets that arithmetic from the **matrix engines**; the Q8 path
+cannot, because oneDNN exposes no grouped-scale int8 entry on this stack.
+
+This is the mirror image of the decode case, and the reason is the same
+quantity: at M = 1 the intensity is *one* FMA per weight element, nothing can
+use the matrix engines anyway, and Q8's halved bytes win outright (1.04–2.02×,
+measured). At M = 16 they lose.
+
+Closing it properly needs **int8 DPAS** — `joint_matrix` s8×s8→s32 with the K
+loop broken at 32-element boundaries so each block's scale can be applied
+between accumulations (Q8_0's block size and the int8 DPAS K happen to both be
+32, which is what makes it viable). That is llama.cpp's MMQ shape. Not written.
+
+So `--q8-assistant` is a **memory** decision, not a speed one — and it is what
+lets a drafter run at the full 131 072 context.
 
 Against 31.89 GiB physical, so BF16 target **and** BF16 drafter do fit two
 cards — which the build plan predicted would not happen (it budgeted 2.38
