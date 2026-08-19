@@ -467,7 +467,8 @@ namespace muse::gpu
         // Flash-style attention: S and P never materialize at BF16, matching
         // `--attn flash` and the twin's online-softmax loop. One sub-group per
         // (token, query head); each lane carries head_dim/SG accumulators.
-        void k_attention(sycl::queue &q, const uint16_t *qb, const uint16_t *kc,
+        template <int NA, bool PART>
+        void k_attention_na(sycl::queue &q, const uint16_t *qb, const uint16_t *kc,
                          const uint16_t *vc, float *out, int64_t n, int64_t nq, int64_t D,
                          int64_t KD, int64_t ld, int64_t pos0, int64_t groups, int64_t cap,
                          int64_t window, float scaling, int64_t head0)
@@ -488,15 +489,26 @@ namespace muse::gpu
                         const int64_t qpos = pos0 + t, g = (head0 + hh) / groups;
                         const int64_t lo = window > 0 ? sycl::max<int64_t>(0, qpos - window + 1) : 0;
 
-                        // at head_dim 128 and SG 32 this is 4 accumulators
-                        constexpr int MAXACC = 16;
-                        float acc[MAXACC];
-                        float qv[MAXACC];
-                        int na = 0;
-                        for (int64_t i = lane; i < D; i += SG, ++na)
+                        // NA = head_dim / SG, and it is a COMPILE-TIME constant
+                        // for a reason: as a runtime bound (`na`, counted by a
+                        // loop over D) these arrays cannot live in registers,
+                        // and every key paid a private-memory round trip for
+                        // its accumulators. Same arithmetic, same order; only
+                        // the storage class changes. Worth +7.5% on decode at
+                        // 16 K, which was more than every scheduling change
+                        // tried around it put together.
+                        // PART covers head_dim < the sub-group width (the tiny
+                        // models): the spare lanes carry a zero query and read
+                        // element 0, so they contribute nothing and never index
+                        // past the row.
+                        const bool on = !PART || lane < D;
+                        const int64_t li = on ? lane : 0;
+                        float acc[NA], qv[NA];
+                        #pragma unroll
+                        for (int a = 0; a < NA; ++a)
                         {
-                            acc[na] = 0.f;
-                            qv[na] = bf2f(qb[(hh * D + i) * ld + t]);
+                            acc[a] = 0.f;
+                            qv[a] = on ? bf2f(qb[(hh * D + li + a * SG) * ld + t]) : 0.f;
                         }
 
                         float mx = -INFINITY, sum = 0.f;
@@ -505,8 +517,9 @@ namespace muse::gpu
                             const int64_t slot = j % cap;
                             const uint16_t *kp = kc + slot * KD + g * D;
                             float part = 0.f;
-                            for (int a = 0, i = lane; a < na; ++a, i += SG)
-                                part += qv[a] * bf2f(kp[i]);
+                            #pragma unroll
+                            for (int a = 0; a < NA; ++a)
+                                part += qv[a] * bf2f(kp[li + a * SG]);
                             const float s =
                                 sycl::reduce_over_group(sg, part, sycl::plus<float>()) * scaling;
 
@@ -515,15 +528,45 @@ namespace muse::gpu
                             const float e = sycl::exp(s - m2);
                             sum = sum * corr + e;
                             const uint16_t *vp = vc + slot * KD + g * D;
-                            for (int a = 0, i = lane; a < na; ++a, i += SG)
-                                acc[a] = acc[a] * corr + e * bf2f(vp[i]);
+                            #pragma unroll
+                            for (int a = 0; a < NA; ++a)
+                                acc[a] = acc[a] * corr + e * bf2f(vp[li + a * SG]);
                             mx = m2;
                         }
                         const float inv = 1.0f / sum;
-                        for (int a = 0, i = lane; a < na; ++a, i += SG)
-                            out[(hh * D + i) * ld + t] = acc[a] * inv;
+                        if (on)
+                        #pragma unroll
+                            for (int a = 0; a < NA; ++a)
+                                out[(hh * D + li + a * SG) * ld + t] = acc[a] * inv;
                     });
             });
+        }
+
+
+        // head_dim is 1, 2 or 4 sub-group widths on every configuration this
+        // engine supports; anything else would need a different lane mapping
+        // and should say so rather than silently drop the tail.
+        inline void k_attention(sycl::queue &q, const uint16_t *qb, const uint16_t *kc,
+                                const uint16_t *vc, float *out, int64_t n, int64_t nq,
+                                int64_t D, int64_t KD, int64_t ld, int64_t pos0,
+                                int64_t groups, int64_t cap, int64_t window, float scaling,
+                                int64_t head0)
+        {
+            if (D == 4 * SG)
+                k_attention_na<4, false>(q, qb, kc, vc, out, n, nq, D, KD, ld, pos0, groups,
+                                         cap, window, scaling, head0);
+            else if (D == 2 * SG)
+                k_attention_na<2, false>(q, qb, kc, vc, out, n, nq, D, KD, ld, pos0, groups,
+                                         cap, window, scaling, head0);
+            else if (D == SG)
+                k_attention_na<1, false>(q, qb, kc, vc, out, n, nq, D, KD, ld, pos0, groups,
+                                         cap, window, scaling, head0);
+            else if (D < SG)
+                k_attention_na<1, true>(q, qb, kc, vc, out, n, nq, D, KD, ld, pos0, groups,
+                                        cap, window, scaling, head0);
+            else
+                throw std::runtime_error(
+                    "attention: head_dim must be 1, 2 or 4 x the sub-group width, or below it");
         }
 
         // Tiled prefill attention.
@@ -1461,6 +1504,114 @@ namespace muse::gpu
         // sequential recurrence -- the rescalings happen in a different order --
         // so like --flash-prefill it is a looser contract, gated on the
         // envelope rather than bitwise. Hence opt-in.
+        // Split-K decode attention, HPG query heads per work-group.
+        //
+        // The GQA ratio here is 16:1 — every query head in a shard reads the
+        // SAME KV head — and the one-head-per-work-group version therefore
+        // streamed the key/value cache once per head. At 65 536 context that
+        // is 954 MB of KV re-read 16 times per token, 15 GB, which is 34 ms
+        // against a decode step of 61 ms even before the weights are counted.
+        // (L2 was catching about half of it, hence ~16 ms measured.)
+        //
+        // Loading K and V once per work-group and running HPG heads against
+        // them in registers cuts that by HPG. The cost is HPG sub-group
+        // reductions per key instead of one, so HPG is a compile-time
+        // parameter and the dispatch picks the measured best: too large and
+        // the per-head (max, sum, acc[na]) state plus the q vectors spill.
+        template <int HPG>
+        void k_attn_decode_split_g(sycl::queue &q, const uint16_t *qb, const uint16_t *kc,
+                                   const uint16_t *vc, float *pm, float *pl, float *pa,
+                                   int64_t nq, int64_t D, int64_t KD, int64_t ld, int64_t pos0,
+                                   int64_t groups, int64_t cap, int64_t window, float scaling,
+                                   int64_t head0, int64_t nsplit)
+        {
+            const int64_t hgroups = nq / HPG;
+            q.submit([&](sycl::handler &h) {
+                h.parallel_for(
+                    sycl::nd_range<1>(size_t(hgroups * nsplit) * SG, SG),
+                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                        const int64_t gid = int64_t(it.get_group(0));
+                        const int64_t sp = gid % nsplit, hg = gid / nsplit;
+                        const int64_t h0 = hg * HPG;
+                        auto sg = it.get_sub_group();
+                        const int lane = int(sg.get_local_id()[0]);
+
+                        const int64_t qpos = pos0, g = (head0 + h0) / groups;
+                        const int64_t lo = window > 0 ? sycl::max<int64_t>(0, qpos - window + 1) : 0;
+                        const int64_t total = qpos - lo + 1;
+                        const int64_t per = (total + nsplit - 1) / nsplit;
+                        const int64_t j0 = lo + sp * per;
+                        const int64_t j1 = sycl::min<int64_t>(qpos, j0 + per - 1);
+
+                        constexpr int MAXACC = 8;
+                        float acc[HPG][MAXACC], qv[HPG][MAXACC];
+                        float mx[HPG], sum[HPG];
+                        int na = 0;
+                        for (int64_t i = lane; i < D; i += SG, ++na)
+                        {
+#pragma unroll
+                            for (int u = 0; u < HPG; ++u)
+                            {
+                                acc[u][na] = 0.f;
+                                qv[u][na] = bf2f(qb[((h0 + u) * D + i) * ld]);
+                            }
+                        }
+#pragma unroll
+                        for (int u = 0; u < HPG; ++u)
+                        {
+                            mx[u] = -INFINITY;
+                            sum[u] = 0.f;
+                        }
+                        for (int64_t j = j0; j <= j1; ++j)
+                        {
+                            const int64_t slot = j % cap;
+                            const uint16_t *kp = kc + slot * KD + g * D;
+                            // K once, HPG dots
+                            float kv[MAXACC];
+                            for (int a = 0, i = lane; a < na; ++a, i += SG)
+                                kv[a] = bf2f(kp[i]);
+                            float e[HPG], corr[HPG];
+#pragma unroll
+                            for (int u = 0; u < HPG; ++u)
+                            {
+                                float part = 0.f;
+                                for (int a = 0; a < na; ++a)
+                                    part += qv[u][a] * kv[a];
+                                const float sc =
+                                    sycl::reduce_over_group(sg, part, sycl::plus<float>()) *
+                                    scaling;
+                                const float m2 = sycl::max(mx[u], sc);
+                                corr[u] = sycl::exp(mx[u] - m2);
+                                e[u] = sycl::exp(sc - m2);
+                                sum[u] = sum[u] * corr[u] + e[u];
+                                mx[u] = m2;
+                            }
+                            const uint16_t *vp = vc + slot * KD + g * D;
+                            float vv[MAXACC];
+                            for (int a = 0, i = lane; a < na; ++a, i += SG)
+                                vv[a] = bf2f(vp[i]);
+#pragma unroll
+                            for (int u = 0; u < HPG; ++u)
+                                for (int a = 0; a < na; ++a)
+                                    acc[u][a] = acc[u][a] * corr[u] + e[u] * vv[a];
+                        }
+#pragma unroll
+                        for (int u = 0; u < HPG; ++u)
+                        {
+                            const int64_t base = ((h0 + u) * nsplit + sp);
+                            if (lane == 0)
+                            {
+                                pm[base] = (j0 > j1) ? -INFINITY : mx[u];
+                                pl[base] = (j0 > j1) ? 0.f : sum[u];
+                            }
+                            for (int a = 0, i = lane; a < na; ++a, i += SG)
+                                pa[base * D + i] = acc[u][a];
+                        }
+                    });
+            });
+        }
+
+        template <int KPI, int NA, bool PART>
         void k_attn_decode_split(sycl::queue &q, const uint16_t *qb, const uint16_t *kc,
                                  const uint16_t *vc, float *pm, float *pl, float *pa,
                                  int64_t nq, int64_t D, int64_t KD, int64_t ld, int64_t pos0,
@@ -1483,22 +1634,81 @@ namespace muse::gpu
                         const int64_t j0 = lo + sp * per;
                         const int64_t j1 = sycl::min<int64_t>(qpos, j0 + per - 1);
 
-                        constexpr int MAXACC = 16;
-                        float acc[MAXACC], qv[MAXACC];
-                        int na = 0;
-                        for (int64_t i = lane; i < D; i += SG, ++na)
+                        // NA = head_dim / SG as a COMPILE-TIME constant. It used
+                        // to be a runtime `na`, which is the same arithmetic and
+                        // a different kernel: an array indexed by a
+                        // runtime-bounded loop cannot live in registers, so
+                        // every accumulator and every q element went to private
+                        // memory and each key paid a round trip to it. Fixing
+                        // the bound is worth more than any of the scheduling
+                        // changes tried around it.
+                        // PART: head_dim below the sub-group width (the tiny
+                        // models). Spare lanes hold a zero query and read
+                        // element 0, contributing nothing and never indexing
+                        // past the row.
+                        const bool on = !PART || lane < D;
+                        const int64_t li = on ? lane : 0;
+                        float acc[NA], qv[NA];
+#pragma unroll
+                        for (int a = 0; a < NA; ++a)
                         {
-                            acc[na] = 0.f;
-                            qv[na] = bf2f(qb[(hh * D + i) * ld]);
+                            acc[a] = 0.f;
+                            qv[a] = on ? bf2f(qb[(hh * D + (li + a * SG)) * ld]) : 0.f;
                         }
+                        const int na = NA;
+                        (void)na;
                         float mx = -INFINITY, sum = 0.f;
-                        for (int64_t j = j0; j <= j1; ++j)
+                        // KPI keys per iteration. One key at a time is a fully
+                        // dependent chain — load, dot, sub-group reduce, exp,
+                        // rescale — and the reduce alone is five shuffle steps
+                        // of pure latency with nothing behind it. Issuing KPI
+                        // independent dots and KPI independent reductions lets
+                        // them pipeline; the softmax update stays strictly per
+                        // key, so the arithmetic is unchanged.
+                        int64_t j = j0;
+                        for (; j + KPI - 1 <= j1; j += KPI)
+                        {
+                            float part[KPI];
+                            const uint16_t *kp[KPI], *vp[KPI];
+#pragma unroll
+                            for (int u = 0; u < KPI; ++u)
+                            {
+                                const int64_t slot = (j + u) % cap;
+                                kp[u] = kc + slot * KD + g * D;
+                                vp[u] = vc + slot * KD + g * D;
+                                part[u] = 0.f;
+                            }
+#pragma unroll
+                            for (int u = 0; u < KPI; ++u)
+#pragma unroll
+                                for (int a = 0; a < NA; ++a)
+                                    part[u] += qv[a] * bf2f(kp[u][li + a * SG]);
+#pragma unroll
+                            for (int u = 0; u < KPI; ++u)
+                                part[u] =
+                                    sycl::reduce_over_group(sg, part[u], sycl::plus<float>()) *
+                                    scaling;
+#pragma unroll
+                            for (int u = 0; u < KPI; ++u)
+                            {
+                                const float m2 = sycl::max(mx, part[u]);
+                                const float corr = sycl::exp(mx - m2);
+                                const float e = sycl::exp(part[u] - m2);
+                                sum = sum * corr + e;
+#pragma unroll
+                                for (int a = 0; a < NA; ++a)
+                                    acc[a] = acc[a] * corr + e * bf2f(vp[u][li + a * SG]);
+                                mx = m2;
+                            }
+                        }
+                        for (; j <= j1; ++j)
                         {
                             const int64_t slot = j % cap;
                             const uint16_t *kp = kc + slot * KD + g * D;
                             float part = 0.f;
-                            for (int a = 0, i = lane; a < na; ++a, i += SG)
-                                part += qv[a] * bf2f(kp[i]);
+#pragma unroll
+                            for (int a = 0; a < NA; ++a)
+                                part += qv[a] * bf2f(kp[li + a * SG]);
                             const float sc =
                                 sycl::reduce_over_group(sg, part, sycl::plus<float>()) * scaling;
                             const float m2 = sycl::max(mx, sc);
@@ -1506,8 +1716,9 @@ namespace muse::gpu
                             const float e = sycl::exp(sc - m2);
                             sum = sum * corr + e;
                             const uint16_t *vp = vc + slot * KD + g * D;
-                            for (int a = 0, i = lane; a < na; ++a, i += SG)
-                                acc[a] = acc[a] * corr + e * bf2f(vp[i]);
+#pragma unroll
+                            for (int a = 0; a < NA; ++a)
+                                acc[a] = acc[a] * corr + e * bf2f(vp[li + a * SG]);
                             mx = m2;
                         }
                         const int64_t base = (hh * nsplit + sp);
@@ -1516,14 +1727,17 @@ namespace muse::gpu
                             pm[base] = (j0 > j1) ? -INFINITY : mx;
                             pl[base] = (j0 > j1) ? 0.f : sum;
                         }
-                        for (int a = 0, i = lane; a < na; ++a, i += SG)
-                            pa[base * D + i] = acc[a];
+                        if (on)
+#pragma unroll
+                            for (int a = 0; a < NA; ++a)
+                                pa[base * D + li + a * SG] = acc[a];
                     });
             });
         }
 
         // merge the slices in split order and normalize
-        void k_attn_decode_combine(sycl::queue &q, const float *pm, const float *pl,
+        template <int NA>
+        void k_attn_decode_combine_na(sycl::queue &q, const float *pm, const float *pl,
                                    const float *pa, float *out, int64_t nq, int64_t D,
                                    int64_t ld, int64_t nsplit)
         {
@@ -1534,11 +1748,14 @@ namespace muse::gpu
                         const int64_t hh = int64_t(it.get_group(0));
                         auto sg = it.get_sub_group();
                         const int lane = int(sg.get_local_id()[0]);
-                        constexpr int MAXACC = 16;
-                        float acc[MAXACC];
-                        int na = 0;
-                        for (int64_t i = lane; i < D; i += SG, ++na)
-                            acc[na] = 0.f;
+                        // Compile-time NA for the same reason as the split
+                        // kernel: a runtime-bounded array is private memory.
+                        const bool on = lane < D;
+                        const int64_t li = on ? lane : 0;
+                        float acc[NA];
+#pragma unroll
+                        for (int a = 0; a < NA; ++a)
+                            acc[a] = 0.f;
                         float mx = -INFINITY, sum = 0.f;
                         for (int64_t sp = 0; sp < nsplit; ++sp)
                         {
@@ -1549,15 +1766,29 @@ namespace muse::gpu
                             const float c0 = sycl::exp(mx - m2);
                             const float c1 = sycl::exp(pm[base] - m2);
                             sum = sum * c0 + pl[base] * c1;
-                            for (int a = 0, i = lane; a < na; ++a, i += SG)
-                                acc[a] = acc[a] * c0 + pa[base * D + i] * c1;
+                            #pragma unroll
+                            for (int a = 0; a < NA; ++a)
+                                acc[a] = acc[a] * c0 + pa[base * D + li + a * SG] * c1;
                             mx = m2;
                         }
                         const float inv = 1.0f / sum;
-                        for (int a = 0, i = lane; a < na; ++a, i += SG)
-                            out[(hh * D + i) * ld] = acc[a] * inv;
+                        #pragma unroll
+                        for (int a = 0; a < NA; ++a)
+                            out[(hh * D + li + a * SG) * ld] = on ? acc[a] * inv : 0.f;
                     });
             });
+        }
+
+        inline void k_attn_decode_combine(sycl::queue &q, const float *pm, const float *pl,
+                                          const float *pa, float *out, int64_t nq, int64_t D,
+                                          int64_t ld, int64_t nsplit)
+        {
+            if (D == 4 * SG)
+                k_attn_decode_combine_na<4>(q, pm, pl, pa, out, nq, D, ld, nsplit);
+            else if (D == 2 * SG)
+                k_attn_decode_combine_na<2>(q, pm, pl, pa, out, nq, D, ld, nsplit);
+            else
+                k_attn_decode_combine_na<1>(q, pm, pl, pa, out, nq, D, ld, nsplit);
         }
 
         // output gate from the PRE-attention normed input: one BF16
@@ -1890,12 +2121,18 @@ namespace muse::gpu
                     fd_splits_ = std::max<int64_t>(1, atoll(e));
                 if (const char *e = getenv("MUSE_GPU_FD_KPS"); e && *e)
                     fd_kps_ = std::max<int64_t>(16, atoll(e));
+                if (const char *e = getenv("MUSE_GPU_FD_HPG"); e && *e)
+                    fd_hpg_ = std::max<int64_t>(1, atoll(e));
+                if (const char *e = getenv("MUSE_GPU_FD_KPI"); e && *e)
+                    fd_kpi_ = std::max<int64_t>(1, atoll(e));
                 trace_dir_ = getenv("MUSE_GPU_TRACE");
                 // direct card-to-card by default; MUSE_GPU_XFER=host selects
                 // the pinned-host staging path (same speed, one hop longer)
                 p2p_ = true;
                 if (const char *e = getenv("MUSE_GPU_XFER"); e && std::string(e) == "host")
                     p2p_ = false;
+                if (const char *e = getenv("MUSE_GPU_XFER"); e && std::string(e) == "serial")
+                    xfer_serial_ = true;
                 if (const char *e = getenv("MUSE_GPU_PROFILE"); e && *e && *e != '0')
                     prof_on_ = true;
                 // k_attention carries head_dim/SG accumulators per lane in a
@@ -2631,20 +2868,37 @@ namespace muse::gpu
                     // PULL, not push: issued on the DESTINATION's queue, which
                     // is how both sibling repos do it.
                     //
-                    // SERIALIZED, one leg at a time. Letting both cards pull
-                    // from each other concurrently is bimodal on this driver:
-                    // the same 13.6 MB disjoint exchange measures 0.56 ms
-                    // (48 GB/s) on one run and 639 ms on the next, with no
-                    // change in size, alignment or aliasing. Serializing costs
-                    // the concurrency but is stable at 28 GB/s — the same rate
-                    // host staging achieves, and PCIe is the limit either way.
+                    // CONCURRENT, both legs in flight at once. This used to be
+                    // serialized, because concurrent pulls were bimodal on this
+                    // driver — the same 13.6 MB disjoint exchange measured
+                    // 0.56 ms on one run and 639 ms on the next. Re-measured
+                    // (200 reps at 1, 6, 13 and 26 MiB) that pathology is gone
+                    // and concurrency is the *steadier* of the two:
+                    //
+                    //   13 MiB/leg   median   min     max
+                    //   serialized   0.963   0.962   5.862 ms   28.3 GB/s
+                    //   concurrent   0.551   0.551   0.555 ms   49.4 GB/s
+                    //
+                    // 1.75x, bit-for-bit the same bytes, and the outliers are
+                    // now on the serialized path. It matters because the
+                    // exchange is 33% of prefill: 104 all-reduces per block at
+                    // 52 layers, 5.5 MB per token. MUSE_GPU_XFER=serial keeps
+                    // the old behaviour for anyone whose driver disagrees.
                     for (int64_t r = 0; r < ns; ++r)
                         for (int64_t sh = 0; sh < ns; ++sh)
                             if (r != sh)
-                                shards_[size_t(r)]
-                                    .q.memcpy(shards_[size_t(r)].peer + sh * slot,
-                                              shards_[size_t(sh)].peer + sh * slot, bytes)
-                                    .wait();
+                            {
+                                auto e = shards_[size_t(r)].q.memcpy(
+                                    shards_[size_t(r)].peer + sh * slot,
+                                    shards_[size_t(sh)].peer + sh * slot, bytes);
+                                if (xfer_serial_)
+                                    e.wait();
+                                else
+                                    ev.push_back(e);
+                            }
+                    for (auto &e : ev)
+                        e.wait();
+                    ev.clear();
                 }
                 else
                 {
@@ -3956,10 +4210,51 @@ namespace muse::gpu
                                 window > 0 ? std::min<int64_t>(pos0 + 1, window) : pos0 + 1;
                             const int64_t nsp = std::min<int64_t>(
                                 fd_splits_, (total + fd_kps_ - 1) / fd_kps_);
-                            k_attn_decode_split(d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)],
-                                                d.pm, d.pl, d.pa, nqs, D, KD, B, pos0, groups,
-                                                l.cap, window, scaling, sh * nqs,
-                                                std::max<int64_t>(1, nsp));
+                            const int64_t nspc = std::max<int64_t>(1, nsp);
+                            // HPG heads share one KV load. Valid only while
+                            // every head in a group reads the same KV head,
+                            // which needs HPG to divide both the shard's head
+                            // count and the GQA ratio.
+                            if (fd_hpg_ >= 8 && nqs % 8 == 0 && groups % 8 == 0)
+                                k_attn_decode_split_g<8>(
+                                    d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.pm, d.pl,
+                                    d.pa, nqs, D, KD, B, pos0, groups, l.cap, window, scaling,
+                                    sh * nqs, nspc);
+                            else if (fd_hpg_ >= 4 && nqs % 4 == 0 && groups % 4 == 0)
+                                k_attn_decode_split_g<4>(
+                                    d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.pm, d.pl,
+                                    d.pa, nqs, D, KD, B, pos0, groups, l.cap, window, scaling,
+                                    sh * nqs, nspc);
+                            else if (fd_hpg_ >= 2 && nqs % 2 == 0 && groups % 2 == 0)
+                                k_attn_decode_split_g<2>(
+                                    d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.pm, d.pl,
+                                    d.pa, nqs, D, KD, B, pos0, groups, l.cap, window, scaling,
+                                    sh * nqs, nspc);
+                            else if (D == 4 * SG && fd_kpi_ >= 4)
+                                k_attn_decode_split<4, 4, false>(
+                                    d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.pm, d.pl,
+                                    d.pa, nqs, D, KD, B, pos0, groups, l.cap, window, scaling,
+                                    sh * nqs, nspc);
+                            else if (D == 4 * SG)
+                                k_attn_decode_split<1, 4, false>(
+                                    d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.pm, d.pl,
+                                    d.pa, nqs, D, KD, B, pos0, groups, l.cap, window, scaling,
+                                    sh * nqs, nspc);
+                            else if (D == 2 * SG)
+                                k_attn_decode_split<1, 2, false>(
+                                    d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.pm, d.pl,
+                                    d.pa, nqs, D, KD, B, pos0, groups, l.cap, window, scaling,
+                                    sh * nqs, nspc);
+                            else if (D == SG)
+                                k_attn_decode_split<1, 1, false>(
+                                    d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.pm, d.pl,
+                                    d.pa, nqs, D, KD, B, pos0, groups, l.cap, window, scaling,
+                                    sh * nqs, nspc);
+                            else
+                                k_attn_decode_split<1, 1, true>(
+                                    d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)], d.pm, d.pl,
+                                    d.pa, nqs, D, KD, B, pos0, groups, l.cap, window, scaling,
+                                    sh * nqs, nspc);
                             k_attn_decode_combine(d.q, d.pm, d.pl, d.pa, d.of, nqs, D, B,
                                                   std::max<int64_t>(1, nsp));
                         }
@@ -4341,12 +4636,33 @@ namespace muse::gpu
             //    16 384        10.02           14.85
             //    65 536         7.53           12.79
             //
-            // Past ~256 slices the merge kernel — one work-group per head,
-            // walking the partials serially — starts taking it back, which is
-            // where the cap comes from. Both are overridable from the
-            // environment because the right value is a measurement, not a
-            // principle.
-            int64_t fd_splits_ = 256, fd_kps_ = 64, fd_min_ctx_ = 1024, nq_ = 1;
+            // Then the accumulators moved from private memory to registers
+            // (see NA in the kernel) and the balance moved with them: the
+            // slice is no longer latency-bound, so per-work-group overhead
+            // matters more than occupancy and the best slice grew back to 128
+            // keys with a 128-slice cap.
+            //
+            //   context   64-key/256 cap   128-key/128 cap
+            //    16 384       16.28            16.42
+            //    65 536       14.76*           15.65      (*64-key/64 cap)
+            //
+            // Both are overridable from the environment because the right
+            // value is a measurement, not a principle.
+            int64_t fd_splits_ = 128, fd_kps_ = 128, fd_min_ctx_ = 1024, nq_ = 1;
+            // Query heads per work-group in the split-K decode kernel.
+            //
+            // 1, and that is a MEASURED result rather than a default nobody
+            // tried. The GQA ratio is 16:1, so every query head in a shard
+            // reads the same KV rows, and loading them once for HPG heads
+            // looked like an obvious 8x cut in KV traffic. It is slower:
+            // 14.98 -> 14.78 -> 14.03 tok/s at 16 384 for HPG 1, 2, 4. The KV
+            // re-read is evidently already being served by L2, and what the
+            // grouped form actually adds is HPG sub-group reductions per key
+            // plus HPG*(2+na) live floats of state. The kernel stays behind
+            // MUSE_GPU_FD_HPG because the negative result is worth keeping.
+            int64_t fd_hpg_ = 1;
+            // Keys per iteration in the split-K decode kernel (see KPI there).
+            int64_t fd_kpi_ = 4;
             int64_t tap_cap_ = 0;
             bool flash_prefill_ = false;
             // ---- DFlash drafter state (empty until bind_drafter) ----
@@ -4400,6 +4716,7 @@ namespace muse::gpu
             std::vector<std::map<std::array<int64_t, 8>, dnnl::matmul>> bprims_;
 #endif
             float *host_ring_ = nullptr; // pinned staging, ns * block * H floats
+            bool xfer_serial_ = false;   // MUSE_GPU_XFER=serial: one leg at a time
             const char *trace_dir_ = nullptr;
             // Stage attribution. Only armed by MUSE_GPU_PROFILE, because it
             // inserts a queue wait per stage and so changes the very thing it
