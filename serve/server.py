@@ -522,8 +522,14 @@ def build_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--assistant", default=None,
                     help="DFlash drafter repo/dir; enables speculative decoding")
     ap.add_argument("--gpus", type=int, default=2)
+    ap.add_argument("--pin-gpu", default=None, metavar="IDX[,IDX]",
+                    help="pin to specific Level-Zero cards, e.g. 0 or 1 or 0,1. Sets "
+                         "ONEAPI_DEVICE_SELECTOR and overrides --gpus with the pin count; "
+                         "must happen before the runtime enumerates anything")
     ap.add_argument("--shards", type=int, default=0)
-    ap.add_argument("--max-seq", type=int, default=32768)
+    ap.add_argument("--max-seq", type=int, default=None,
+                    help="KV allocation ceiling (default: derived from the checkpoint "
+                         "size, the card count and the tier)")
     ap.add_argument("--chunk", type=int, default=512)
     ap.add_argument("--q8", action="store_true", help="Q8_0 weights for the target")
     ap.add_argument("--q8-assistant", action="store_true", help="Q8_0 weights for the drafter")
@@ -553,6 +559,31 @@ def build_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--no-thinking", action="store_true",
                     help="set Reasoning strength: low (the template always emits a line)")
     ap.add_argument("--verbose", action="store_true")
+
+
+def apply_gpu_pin(a) -> None:
+    """Restrict SYCL to the chosen cards. Must run before any Engine exists:
+    the selector is read when the runtime first enumerates devices, and setting
+    it afterwards silently does nothing."""
+    if not a.pin_gpu:
+        return
+    idx = [x.strip() for x in str(a.pin_gpu).split(",") if x.strip() != ""]
+    os.environ["ONEAPI_DEVICE_SELECTOR"] = "level_zero:" + ",".join(idx)
+    a.gpus = len(idx)
+
+
+def resolve_max_seq(a) -> None:
+    if a.max_seq:
+        return
+    try:
+        a.max_seq = chatlib.auto_max_seq(
+            a.model, gpus=a.gpus, q8=a.q8, assistant=a.assistant,
+            q8_assistant=a.q8_assistant, vision_on_card=(a.vision == "gpu"),
+            chunk=a.chunk)
+    except ValueError as e:
+        raise SystemExit(f"[serve] {e}")
+    print(f"[serve] --max-seq {a.max_seq} (derived; pass --max-seq to override)",
+          file=sys.stderr)
 
 
 def make_runner(a) -> Runner:
@@ -588,6 +619,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     build_args(ap)
     a = ap.parse_args()
+    apply_gpu_pin(a)
+    resolve_max_seq(a)
     runner = make_runner(a)
     app = create_app(runner, a)
     import uvicorn

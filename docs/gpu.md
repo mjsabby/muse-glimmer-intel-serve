@@ -659,8 +659,14 @@ the argv limit.
 | BF16 | **131 072** (the model's max) | 1143 tok/s | 5.67 tok/s |
 | Q8_0 | **131 072** | 946 tok/s | 5.70 tok/s |
 | BF16 + BF16 drafter | ~16 384 | — | — |
-| BF16 + Q8_0 drafter | ~65 536 | — | — |
+| BF16 + Q8_0 drafter | **131 072** (0.36 GiB/card left) | — | — |
 | Q8_0 + Q8_0 drafter | **131 072** | — | — |
+
+The drafter row is now measured rather than estimated: a BF16 target with a Q8
+drafter prewarms and serves at the **full 131 072**, leaving 0.36 GiB/card. The
+serving frontend's capacity planner still defaults that configuration to 65 536,
+because it targets ~1.2 GiB/card of headroom rather than the last byte; pass
+`--max-seq 131072` to take it.
 
 So **the 30B runs its full 131 072-token window on two cards, on either tier** —
 114.7 s to prefill 131 072 tokens. The KV cache is only 3.56 GiB there, because

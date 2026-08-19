@@ -230,6 +230,70 @@ def kv_bytes_per_token(model: str) -> float:
     return n_global * heads * dim * 2 * 2  # K and V, bf16
 
 
+def cache_terms(model: str, chunk: int) -> tuple[float, float]:
+    """(bytes per token, fixed bytes) for ONE shard's KV cache.
+
+    Only the global layers grow with context. The sliding ones hold a ring of
+    `window + chunk` rows whatever the context is, which is why long context is
+    unusually cheap on this model and why a planner that ignores the split gets
+    the slope wrong by 4x.
+    """
+    cfg = load_json(model, "config.json")
+    txt = cfg.get("text_config", cfg)
+    types = [str(t) for t in (txt.get("layer_types") or [])]
+    heads = int(txt.get("num_key_value_heads", 1))
+    dim = int(txt.get("head_dim") or (int(txt["hidden_size"]) // int(txt["num_attention_heads"])))
+    row = heads * dim * 2 * 2                       # K and V, bf16
+    n_global = sum(1 for t in types if "sliding" not in t) or int(
+        txt.get("num_hidden_layers", 0))
+    n_sliding = len(types) - n_global
+    window = int(txt.get("sliding_window") or 0)
+    return row * n_global, row * n_sliding * (window + chunk)
+
+
+def auto_max_seq(model: str, *, gpus: int, q8: bool, assistant: str | None,
+                 q8_assistant: bool, vision_on_card: bool, chunk: int) -> int:
+    """A --max-seq that fits, derived from the checkpoint rather than guessed.
+
+    Paper arithmetic against a MEASURED reserve: on this box, a BF16 target
+    with a Q8 drafter leaves 2.01 GiB/card free at 8192, which puts scratch,
+    oneDNN workspaces and the runtime's own overhead at ~0.9 GiB/card. The
+    reserve below is that plus insurance.
+
+    It is an ALLOCATION ceiling only. gpu.md's rule stands: the number worth
+    publishing is the deepest position that prewarms *and* decodes — and
+    prewarm either confirms this at startup or fails there, which is what the
+    seal is for.
+    """
+    GiB = float(1 << 30)
+    card = 31.89 * GiB                              # Arc Pro B70, reported
+    total = card * max(1, gpus)
+    w = weight_bytes(model) / (2 if q8 else 1)
+    if assistant:
+        w += weight_bytes(assistant) / (2 if q8_assistant else 1)
+    if vision_on_card:
+        w += 1.86 * GiB * max(1, gpus)              # the tower, sharded, measured
+    reserve = 1.7 * GiB * max(1, gpus) * max(1.0, chunk / 512.0)
+    slope, fixed = cache_terms(model, chunk)
+    free = total - w - reserve - fixed * max(1, gpus)
+    cfg = load_json(model, "config.json")
+    ceiling = int(cfg.get("text_config", cfg).get("max_position_embeddings", 131072))
+    per_token = slope * max(1, gpus)                # the cache is replicated per shard
+    if free <= 0 or per_token <= 0:
+        # Say WHY, with the numbers. A config that cannot hold its weights
+        # will otherwise fail as an opaque byte count somewhere inside the
+        # loader, and the fix is a flag the message can name.
+        raise ValueError(
+            f"this configuration does not fit {gpus} card(s): weights "
+            f"{w / GiB:.1f} GiB + {reserve / GiB:.1f} GiB scratch reserve + "
+            f"{fixed * max(1, gpus) / GiB:.1f} GiB of sliding-window rings against "
+            f"{total / GiB:.1f} GiB.\n  Try --q8, --vision cpu, a smaller --chunk, "
+            f"a quantized drafter (--q8-assistant), or more --gpus.")
+    n = min(int(free / per_token), ceiling)
+    p2 = 1 << max(11, int(n).bit_length() - 1)      # round DOWN to a power of two
+    return max(2048, min(p2, ceiling))
+
+
 def weight_bytes(model: str) -> int:
     d = Path(resolve_dir(model))
     idx = d / "model.safetensors.index.json"

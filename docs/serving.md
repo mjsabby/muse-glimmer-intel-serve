@@ -21,6 +21,45 @@ and the speculative accept rule.** Logits come back as f32 over the C ABI —
 808 KiB per step at this vocabulary, which at decode rates is nothing — and
 everything above them is easier to change in Python.
 
+## Capacity, and failing at startup
+
+`--max-seq` defaults to a value **derived from the checkpoint**: card count,
+weight bytes at the chosen tier, the drafter, whether the tower is resident,
+and the KV slope — which for this model is only the 13 global layers, since the
+39 sliding ones hold a fixed `window + chunk` ring whatever the context is. A
+planner that ignores that split gets the slope wrong by 4×.
+
+| configuration | derived `--max-seq` |
+|---|---:|
+| BF16 + Q8 drafter, 2 cards | 65 536 |
+| BF16 plain, 2 cards | 131 072 |
+| Q8 + Q8 drafter, 2 cards | 131 072 |
+| Q8 plain, 1 card | 131 072 |
+| BF16 + Q8 drafter + tower on the cards | *refused, with the arithmetic* |
+
+The reserve is measured, not guessed: BF16 + Q8 drafter leaves 2.01 GiB/card
+free at 8192, which puts scratch, oneDNN workspaces and runtime overhead at
+~0.9 GiB/card. The default targets ~1.2 GiB/card of headroom, so it is
+deliberately short of the maximum — `--max-seq 131072` in that configuration
+does prewarm and serve, with 0.36 GiB/card left.
+
+None of this is trusted. The engine prewarms every reachable shape at the
+deepest position it was built for and then seals, so **a configuration that
+cannot serve fails during startup**:
+
+```
+RuntimeError: muse_open failed: gpu: device 0: out of memory allocating 24 MiB
+  The KV cache is sized by --max-seq (currently 8192). Retry with a smaller
+  --max-seq, add --q8 to halve the weights, use --vision cpu to keep the tower
+  off the cards, or spread across more of them with --gpus.
+```
+
+That is the whole point: memory failure is a startup event with a message that
+names the flag, not a request that dies halfway through somebody's agent turn.
+`--pin-gpu 0` or `--pin-gpu 0,1` selects Level-Zero cards explicitly (it sets
+`ONEAPI_DEVICE_SELECTOR` before anything enumerates devices, which is the only
+time it can work).
+
 ## One request at a time
 
 `serve.server.Runner` holds a lock for the whole of every request. That is not
