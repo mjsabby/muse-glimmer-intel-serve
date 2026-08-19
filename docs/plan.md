@@ -486,7 +486,7 @@ model tier, GPU count, quantization, and depth.
 | 6 Vision oracle | ✅ | | tower + projector **done** on CPU and GPU (20.8x, see [gpu.md](gpu.md)); pixel ingestion and video not started |
 | 7 SYCL single-GPU | design only | ✅ | **done** (text; see [gpu.md](gpu.md), incl. the opt-in `--flash-prefill` matrix-engine attention tier. No Q8 tier yet, no vision/DFlash on GPU) |
 | 8 Dual-GPU TP | design only | ✅ | **done** (text; head/FFN/vocab split, KV replicated — see [gpu.md](gpu.md)). 14.81 tok/s decode, 1030 tok/s prefill, full 131 072 context fits |
-| 9 Serving frontend | ✅ except live gates | ✅ for `live_api_tests.py` | not started |
+| 9 Serving frontend | ✅ except live gates | ✅ for `live_api_tests.py` | **done** — three protocols, guided JSON, grammar-forced recipients, media; `serve_tests.py` 41/41 with no GPU, `live_api_tests.py` 30/30 on the box. See [serving.md](serving.md) |
 | 10 DFlash serving | design only | ✅ | **done** as an engine loop: `--draft-rounds N`, gated on producing the f64 oracle's sequence. Up to 11 tokens/round and 119.9 tok/s on code. The HTTP serving layer around it is Phase 9. |
 | 11 Benchmarks | | ✅ | not started |
 
@@ -524,14 +524,18 @@ regression baseline.
 
 **Next, in order of value:**
 
-1. **Phase 4, GGUF ingest** — nothing about it changed; the three conversions in
+1. **Phase 11, benchmarks** — `tools/bench.py` on the serving path and a
+   head-to-head against llama.cpp's SYCL backend. Everything it needs now
+   exists; what is published so far are per-feature numbers, not a sweep.
+2. **Phase 4, GGUF ingest** — nothing about it changed; the three conversions in
    that section are still the whole job, and `assert_norm_flavours()` in
    `src/muse_glimmer.hpp` documents why the +1 check has to be the cross-source
    one rather than a per-tensor statistic.
-2. **The rest of Phase 6**: C++ pixel ingestion (see the correction below) and a
-   video (`t > 1`) gate. The tower takes `t` already; no video gate has been run.
-3. **Phase 9, the serving frontend** — the largest remaining CPU-side chunk.
-4. Phases 7, 8, 10, 11 need the B70 box.
+3. **The rest of Phase 6**: C++ pixel ingestion (see the correction below) and a
+   video (`t > 1`) gate. The tower takes `t` already, and the server reaches it
+   through the checkpoint's own video processor, but no video gate has been run.
+4. Q8 for the vision tower and for the embedding table (~1.2 GiB/card, possibly
+   enough to fit the 30B on one card).
 
 Three things that are already known and must not be rediscovered the hard way:
 
@@ -541,6 +545,19 @@ Three things that are already known and must not be rediscovered the hard way:
   *in addition to* `head_dim^-0.5`.
 
 ### Corrections this plan needed, found while implementing it
+
+- **Phase 10's exit gate as written is not achievable.** "greedy spec output
+  bit-identical to plain greedy" cannot hold on a stack whose decode and prefill
+  paths are different kernels: a verified token's logits come from a 16-row
+  forward (oneDNN matmul, tile-softmax attention) and a plain decode's from a
+  1-row forward (hand-written GEMV, split-K attention). Measured, every
+  divergence is a near-tie — in each observed case one path saw an EXACT tie
+  where the other saw 0.06-0.25 logprob. The gate now checks that property,
+  which is the one that can hold. See [serving.md](serving.md).
+- **The same request twice can differ**, because the cache is part of the
+  input: prefix reuse changes the prefill chunking and the fast tiers are
+  envelope-level. `--no-prefix-reuse` makes the answer a function of the prompt
+  alone; the gates ask for "same state, same answer".
 
 - **The DFlash open item is closed.** One pass per block, no denoising loop;
   a round proposes `block_size - 1` = **15** tokens, not 16; the head is the
@@ -576,5 +593,5 @@ checkpoint is ever revised.
 - `VERIFICATION.md` — methodology, per-layer error tables, measured gates.
   **Written** for Phases 0–3, 5, 6.
 - `docs/gpu.md` — engine design, memory model, hardware pitfalls, kernel tracker.
-- `docs/serving.md` — protocols, tools, JSON, media.
+- `docs/serving.md` — protocols, tools, JSON, media. **Written.**
 - `docs/comparison.md` — head-to-head vs llama.cpp and the sibling engines.

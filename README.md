@@ -6,10 +6,13 @@ deterministic float64 CPU implementation defines the model function exactly, a
 bf16/f16 twin defines the deviation band any correct low-precision kernel must
 stay inside, and every GPU kernel is gated against them.
 
-**Status: the oracle is done and gated** — the f64 text path, its bf16/f16
-twins, the DFlash block drafter, and the vision tower + projector (Phases 0–3,
-5 and most of 6). GGUF ingest, C++ pixel ingestion, the SYCL engine and the
-serving frontend are not started.
+**Status: it serves.** The f64 oracle and its bf16/f16 twins, the DFlash block
+drafter and the vision tower (Phases 0–3, 5, most of 6); the SYCL engine on two
+Arc Pro B70s with tensor parallelism, a Q8_0 weight tier, int8-DPAS speculative
+drafting and a prewarmed-then-sealed static allocation (7, 8, 10); and the
+three-protocol HTTP frontend with guided JSON, grammar-forced tool recipients
+and image input (9). GGUF ingest and the published benchmark sweep are not
+started.
 
 ```bash
 ./build.sh --cpu-only                     # g++ only, no oneAPI needed
@@ -38,9 +41,10 @@ methodology and the traps found along the way are in
 | 4 | GGUF ingest | ⬜ |
 | 5 | DFlash drafter in the oracle | ✅ |
 | 6 | vision tower + projector | ✅ · pixel ingestion ⬜ |
-| 7–8 | SYCL engine, dual-GPU tensor parallelism | ⬜ needs the B70 box |
-| 9 | serving frontend | ⬜ |
-| 10–11 | DFlash serving, benchmarks | ⬜ needs the B70 box |
+| 7–8 | SYCL engine, dual-GPU tensor parallelism | ✅ 28 GPU gates green |
+| 9 | serving frontend | ✅ 41 offline + 30 live gates green |
+| 10 | DFlash speculative serving | ✅ 15 → 98 tok/s |
+| 11 | benchmark sweep vs llama.cpp | ⬜ |
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — the exact model specification the oracle
   implements: config, tensor inventory, op-by-op semantics for the text
@@ -51,6 +55,12 @@ methodology and the traps found along the way are in
   reference environment, and every measured number.
 - [docs/oracle.md](docs/oracle.md) — how to build and run the oracle, and what
   each flag means.
+- [docs/gpu.md](docs/gpu.md) — the SYCL engine: layout decisions, tensor
+  parallelism, the attention and Q8 tiers, the memory model, prewarm and the
+  allocation seal, and every hardware trap found the hard way.
+- [docs/serving.md](docs/serving.md) — the HTTP stack: the channel protocol,
+  `tool_choice` as a grammar, guided JSON, what speculative decoding actually
+  guarantees, prefix reuse, and media.
 - [docs/plan.md](docs/plan.md) — the build plan, phase by phase, with exit gates
   and a cloud-vs-hardware split.
 
@@ -69,6 +79,30 @@ logits agreeing to 3.7e-13. See
     --ids tools/prompts/fact.ids --out out/draft --draft-rounds 6
 tools/spec_baseline.sh            # the acceptance-rate regression baseline
 ```
+
+## Serving
+
+```bash
+./build.sh                                # oracle + SYCL engine + the .so
+source /opt/intel/oneapi/setvars.sh
+
+ZES_ENABLE_SYSMAN=1 .venv/bin/python -m serve.server \
+    --model meta-models/Muse-Glimmer-30B \
+    --assistant meta-models/Muse-Glimmer-30B-assistant --q8-assistant \
+    --gpus 2 --max-seq 8192 --vision cpu --port 8123
+
+curl localhost:8123/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is the capital of France?"}]}'
+```
+
+OpenAI Chat Completions / Completions / Responses and Anthropic Messages, SSE
+on all three chat protocols, ATEM tool calling with grammar-forced recipients,
+guided `json_object` / `json_schema`, image and video input, `Reasoning
+strength` control, prefix reuse across turns, cancellation, auth, CORS,
+`/metrics` and request tracing. Measured on two B70s with a BF16 target and a
+Q8 drafter: **15 tok/s plain decode, 31–98 tok/s speculative** depending on how
+predictable the text is, and a footprint that does not move after startup.
+Details and the gate list are in [docs/serving.md](docs/serving.md).
 
 ## The model
 
