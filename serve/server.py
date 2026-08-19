@@ -530,7 +530,8 @@ def build_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--max-seq", type=int, default=None,
                     help="KV allocation ceiling (default: derived from the checkpoint "
                          "size, the card count and the tier)")
-    ap.add_argument("--chunk", type=int, default=512)
+    ap.add_argument("--chunk", type=int, default=2048,
+                    help="widest prefill block. 2048 measured 1.11x the BF16 prefill of 512 and 1.9x the Q8 prefill (the Q8 tier dequantizes a weight per BLOCK, so a wider block amortizes it), at ~0.8 GiB/card more scratch")
     ap.add_argument("--q8", action="store_true", help="Q8_0 weights for the target")
     ap.add_argument("--q8-assistant", action="store_true", help="Q8_0 weights for the drafter")
     ap.add_argument("--no-flash-prefill", action="store_true")

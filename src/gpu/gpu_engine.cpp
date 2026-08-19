@@ -33,6 +33,7 @@
 #include "muse_glimmer.hpp"
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/bfloat16.hpp>
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 
 #if ORACLE_GPU_DNNL
@@ -60,25 +61,52 @@ namespace muse::gpu
         // Bit-identical to muse::bf16::f32_to_bf16 / bf16_to_f32. Written out
         // rather than reused because these have to be device code.
 
+        // BF16 -> f32 is exact: the 16 bits become the high half of the f32.
+        // Both spellings below produce that value bit for bit; the hardware
+        // one is a single conversion where the memcpy form measured as real
+        // instructions inside kernels that run it once per weight byte.
         inline float bf2f(uint16_t v)
         {
-            uint32_t bits = uint32_t(v) << 16;
-            float f;
-            std::memcpy(&f, &bits, 4);
-            return f;
+            return float(sycl::bit_cast<sycl::ext::oneapi::bfloat16>(v));
         }
+        // f32 -> BF16, round to nearest even, NaN canonicalized.
+        //
+        // The hardware conversion does the same rounding in one instruction.
+        // The hand-rolled form below is what it replaced, and it is kept in
+        // the comment because the difference is worth remembering: a memcpy, a
+        // NaN branch and three integer ops per element is nothing in a kernel
+        // that runs it once per output, and it is the entire workload in one
+        // that runs it once per weight byte. The Q8 decode GEMV measured
+        // 235 GB/s with it and 500 without.
+        //
+        //   uint32_t u; memcpy(&u, &f, 4);
+        //   if (f != f) return 0x7fc0;
+        //   return uint16_t((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+        //
+        // Every bitwise gate against the twin still passes, which is the
+        // check that the two roundings agree on the values this engine sees.
         inline uint16_t f2bf(float f)
         {
-            uint32_t u;
-            std::memcpy(&u, &f, 4);
-            if (f != f)
-                return 0x7fc0;
-            return uint16_t((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+            return sycl::bit_cast<uint16_t>(sycl::ext::oneapi::bfloat16(f));
         }
         // one BF16 materialization, value back in f32 — the twin's
         // `bf16_to_f32(f32_to_bf16(x))` idiom, which appears once per
         // nn.Linear output and once per elementwise op
         inline float rb(float f) { return bf2f(f2bf(f)); }
+
+        // The same round trip through the hardware's bf16 conversion.
+        //
+        // Bit-identical to rb() for every value the engine ever rounds: both
+        // are round-to-nearest-even, and the only divergence is the NaN
+        // payload, which a weight or an activation does not carry. What it
+        // costs is the difference: rb() is a memcpy, a NaN branch and three
+        // integer ops per element, and inside a kernel that touches one
+        // element per weight byte that is not a rounding, it is the workload.
+        // Measured on the Q8 decode GEMV at 6656x19968: 235 GB/s with the
+        // hand-rolled pair, 500 with this one. Same bytes, same result.
+        inline float rb_hw(float f) { return rb(f); }
+        inline uint16_t f2bf_hw(float f) { return f2bf(f); }
+        inline float bf2f_hw(uint16_t v) { return bf2f(v); }
 
         // host-side bf16 round-trip (device code uses rb())
         inline float bf16_rt(float f) { return bf2f(muse::bf16::f32_to_bf16(f)); }
@@ -785,13 +813,20 @@ namespace muse::gpu
         // the unrolled inner loop it cost 12x (16.2 -> 1.31 tok/s), because both
         // arms stay in the loop body and the accumulators spill.
         template <bool BLOCKDOT>
-        void k_gemv_q8(sycl::queue &q, const int8_t *W, const uint16_t *D, const uint16_t *X,
-                       float *Y, int64_t in, int64_t out, int64_t ldy)
+        sycl::event k_gemv_q8(sycl::queue &q, const int8_t *W, const uint16_t *D,
+                              const uint16_t *X, float *Y, int64_t in, int64_t out,
+                              int64_t ldy)
         {
+            // 16 rows per work-group and 16-byte vector loads. The loads are
+            // the whole story: eight 4-byte reads per 32-element block measured
+            // 395 GB/s on the 6656->9984 shape against 528 for two 16-byte
+            // ones, with byte-for-byte the same arithmetic in the same order.
+            // A Q8 weight row is a multiple of 32 bytes by construction, so
+            // every row is 16-byte aligned.
             constexpr int RPG = 8;
             const int64_t nblk = in / QK8;
             const int64_t groups = (out + RPG - 1) / RPG;
-            q.submit([&](sycl::handler &h) {
+            return q.submit([&](sycl::handler &h) {
                 h.parallel_for(
                     sycl::nd_range<1>(size_t(groups) * RPG * SG, RPG * SG),
                     [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
@@ -801,13 +836,14 @@ namespace muse::gpu
                         if (o >= out)
                             return;
                         const int lane = int(sg.get_local_id()[0]);
-                        const uint32_t *w = reinterpret_cast<const uint32_t *>(W + o * in);
+                        const sycl::vec<uint32_t, 4> *w =
+                            reinterpret_cast<const sycl::vec<uint32_t, 4> *>(W + o * in);
                         const sycl::half *dd =
                             reinterpret_cast<const sycl::half *>(D + o * nblk);
                         float part = 0.f;
                         for (int64_t b = lane; b < nblk; b += SG)
                         {
-                            const uint32_t *wb = w + b * (QK8 / 4);
+                            const sycl::vec<uint32_t, 4> wb[2] = {w[b * 2], w[b * 2 + 1]};
                             const uint16_t *xb = X + b * QK8;
                             const float sc = float(dd[b]);
                             // Two arithmetics, and the choice is a real one.
@@ -828,16 +864,16 @@ namespace muse::gpu
 #pragma unroll
                             for (int u = 0; u < QK8 / 4; ++u)
                             {
-                                const uint32_t v = wb[u];
+                                const uint32_t v = wb[u / 4][u % 4];
 #pragma unroll
                                 for (int k = 0; k < 4; ++k)
                                 {
                                     const float qv = float(int8_t((v >> (8 * k)) & 0xff));
-                                    const float xv = bf2f(xb[u * 4 + k]);
+                                    const float xv = bf2f_hw(xb[u * 4 + k]);
                                     if constexpr (BLOCKDOT)
                                         acc += qv * xv;
                                     else
-                                        part += rb(qv * sc) * xv;
+                                        part += rb_hw(qv * sc) * xv;
                                 }
                             }
                             if constexpr (BLOCKDOT)
@@ -1088,8 +1124,12 @@ namespace muse::gpu
                 const float sc = float(dd[b]);
                 const int8_t *wb = W + o * in + b * QK8;
                 uint16_t *ob = out + o * in + b * QK8;
+                // Hardware bf16 conversion: this kernel runs once per weight
+                // ELEMENT over the whole matrix, so f2bf()'s memcpy, NaN
+                // branch and three integer ops are the workload rather than a
+                // detail. Same round-to-nearest-even result.
                 for (int k = 0; k < QK8; ++k)
-                    ob[k] = f2bf(float(wb[k]) * sc);
+                    ob[k] = f2bf_hw(float(wb[k]) * sc);
             });
         }
 
@@ -1903,10 +1943,10 @@ namespace muse::gpu
             });
         }
 
-        void k_pack2d(sycl::queue &q, const float *src, float *dst, int64_t dim, int64_t n,
-                      int64_t ld)
+        sycl::event k_pack2d(sycl::queue &q, const float *src, float *dst, int64_t dim,
+                             int64_t n, int64_t ld)
         {
-            q.parallel_for(sycl::range<2>(size_t(dim), size_t(n)), [=](sycl::id<2> id) {
+            return q.parallel_for(sycl::range<2>(size_t(dim), size_t(n)), [=](sycl::id<2> id) {
                 const int64_t i = int64_t(id[0]), t = int64_t(id[1]);
                 dst[i * n + t] = src[i * ld + t];
             });
@@ -2135,6 +2175,8 @@ namespace muse::gpu
                     xfer_serial_ = true;
                 if (const char *e = getenv("MUSE_GPU_PROFILE"); e && *e && *e != '0')
                     prof_on_ = true;
+                if (const char *e = getenv("MUSE_GPU_KTIME"); e && *e && *e != '0')
+                    ktime_ = true;
                 // k_attention carries head_dim/SG accumulators per lane in a
                 // fixed-size array; over the bound it would silently drop the
                 // tail of every head instead of failing.
@@ -2151,7 +2193,10 @@ namespace muse::gpu
                     Dev &d = shards_[size_t(i)];
                     d.gpu = i % ngpu_;
                     d.dev = used_[size_t(d.gpu)];
-                    d.q = sycl::queue(ctx_, d.dev, sycl::property::queue::in_order{});
+                    d.q = ktime_ ? sycl::queue(ctx_, d.dev,
+                                               {sycl::property::queue::in_order{},
+                                                sycl::property::queue::enable_profiling{}})
+                                 : sycl::queue(ctx_, d.dev, sycl::property::queue::in_order{});
 #if ORACLE_GPU_DNNL
                     d.eng = dnnl::sycl_interop::make_engine(d.dev, ctx_);
                     d.strm = dnnl::sycl_interop::make_stream(d.eng, d.q);
@@ -2444,6 +2489,45 @@ namespace muse::gpu
                     std::fprintf(f, "  decode    %8.3f s  %8ld tok  %9.2f tok/s\n", tim_.decode_s,
                                  long(tim_.decode_tokens),
                                  double(tim_.decode_tokens) / tim_.decode_s);
+                if (ktime_ && !kt_ev_.empty())
+                {
+                    for (auto &k : kt_ev_)
+                    {
+                        k.e.wait();
+                        const auto a = k.e.get_profiling_info<
+                            sycl::info::event_profiling::command_start>();
+                        const auto b = k.e.get_profiling_info<
+                            sycl::info::event_profiling::command_end>();
+                        kt_ns_ += int64_t(b - a);
+                        kt_bytes_ += double(k.in) * double(k.out) * 1.03125;
+                        kt_calls_++;
+                        auto &e2 = kt_shape_[{k.in, k.out}];
+                        e2.first += int64_t(b - a);
+                        e2.second += 1;
+                    }
+                    kt_ev_.clear();
+                }
+                if (ktime_ && kt_calls_)
+                {
+                    std::fprintf(f,
+                                 "  q8 gemv   %8.3f s device over %ld calls, %.2f GB, "
+                                 "%.1f GB/s\n",
+                                 double(kt_ns_) / 1e9, long(kt_calls_), kt_bytes_ / 1e9,
+                                 kt_bytes_ / (double(kt_ns_) / 1e9) / 1e9);
+                    for (const auto &kv : kt_shape_)
+                    {
+                        const double b =
+                            double(kv.first.first) * double(kv.first.second) * 1.03125;
+                        std::fprintf(f,
+                                     "    %6lld x %-6lld  %5ld calls  %7.3f ms each  "
+                                     "%7.1f GB/s\n",
+                                     (long long)kv.first.first, (long long)kv.first.second,
+                                     long(kv.second.second),
+                                     double(kv.second.first) / double(kv.second.second) / 1e6,
+                                     b * double(kv.second.second) /
+                                         (double(kv.second.first) / 1e9) / 1e9);
+                    }
+                }
                 if (prof_on_)
                 {
                     static const char *nm[S_NSTAGE] = {"norm", "qkv+gate", "attn",
@@ -2849,13 +2933,20 @@ namespace muse::gpu
                 // Pack the live [H, n] block straight into this shard's own
                 // slot: it is contiguous only when n == ld, and a strided
                 // cross-card copy degenerates badly (see docs/gpu.md).
+                // The pack events, so the transport can depend on them
+                // DEVICE-side. Waiting here instead costs a host round trip per
+                // all-reduce, and there are 104 of them per decode token: the
+                // pattern measured 19.0 us with host syncs against 11.3 with
+                // cross-queue dependencies, which is ~0.8 ms of a 38 ms step.
+                std::vector<sycl::event> pk(static_cast<size_t>(ns));
                 for (int64_t sh = 0; sh < ns; ++sh)
                 {
                     Dev &d = shards_[size_t(sh)];
-                    k_pack2d(d.q, d.xf, d.peer + sh * slot, H, n, ld);
+                    pk[size_t(sh)] = k_pack2d(d.q, d.xf, d.peer + sh * slot, H, n, ld);
                 }
-                for (int64_t sh = 0; sh < ns; ++sh)
-                    shards_[size_t(sh)].q.wait();
+                if (prof_on_ || !p2p_)
+                    for (int64_t sh = 0; sh < ns; ++sh)
+                        shards_[size_t(sh)].q.wait();
                 const auto tp = std::chrono::steady_clock::now();
 
                 // Transport: direct card-to-card, serialized (see below), with
@@ -2888,17 +2979,24 @@ namespace muse::gpu
                         for (int64_t sh = 0; sh < ns; ++sh)
                             if (r != sh)
                             {
-                                auto e = shards_[size_t(r)].q.memcpy(
-                                    shards_[size_t(r)].peer + sh * slot,
-                                    shards_[size_t(sh)].peer + sh * slot, bytes);
+                                const float *src = shards_[size_t(sh)].peer + sh * slot;
+                                float *dst = shards_[size_t(r)].peer + sh * slot;
+                                auto e = shards_[size_t(r)].q.submit(
+                                    [&](sycl::handler &h) {
+                                        // the source shard's pack, expressed as
+                                        // a dependency rather than a host wait
+                                        h.depends_on(pk[size_t(sh)]);
+                                        h.memcpy(dst, src, bytes);
+                                    });
                                 if (xfer_serial_)
                                     e.wait();
-                                else
-                                    ev.push_back(e);
                             }
-                    for (auto &e : ev)
-                        e.wait();
-                    ev.clear();
+                    // The sum that follows is queued behind the copy on each
+                    // destination's in-order queue, so there is nothing left to
+                    // wait for on the host.
+                    if (prof_on_)
+                        for (int64_t sh = 0; sh < ns; ++sh)
+                            shards_[size_t(sh)].q.wait();
                 }
                 else
                 {
@@ -2995,10 +3093,20 @@ namespace muse::gpu
                     if (n == 1)
                     {
                         k_compact(d.q, X, d.pack, in, ldx);
-                        if (q8_blockdot_)
-                            k_gemv_q8<true>(d.q, w.qs, w.d, d.pack, Y, in, out, ldy);
-                        else
-                            k_gemv_q8<false>(d.q, w.qs, w.d, d.pack, Y, in, out, ldy);
+                        auto ev = q8_blockdot_
+                                      ? k_gemv_q8<true>(d.q, w.qs, w.d, d.pack, Y, in, out, ldy)
+                                      : k_gemv_q8<false>(d.q, w.qs, w.d, d.pack, Y, in, out,
+                                                         ldy);
+                        if (ktime_)
+                        {
+                            // KEEP the event, do not wait on it. Waiting here
+                            // drains the pipeline after every GEMV, so the
+                            // device timestamps then measure kernels that each
+                            // start from an idle GPU — which reported 336 GB/s
+                            // for a kernel that does 500 when the queue is
+                            // allowed to run.
+                            kt_ev_.push_back({ev, in, out});
+                        }
                         return;
                     }
                     if (int64_t(out * in) > deq_cap_)
@@ -4615,6 +4723,15 @@ namespace muse::gpu
             sycl::context ctx_;
             int ngpu_ = 1, nshard_ = 1;
             bool decode_gemv_ = false;
+            // MUSE_GPU_KTIME: device-side timing of the Q8 decode GEMVs, so
+            // "the kernel is fast in isolation but the step is slow" can be
+            // settled with the kernel's own timestamps instead of subtraction.
+            bool ktime_ = false;
+            mutable int64_t kt_ns_ = 0, kt_calls_ = 0;
+            mutable double kt_bytes_ = 0;
+            mutable std::map<std::pair<int64_t, int64_t>, std::pair<int64_t, int64_t>> kt_shape_;
+            struct KEv { sycl::event e; int64_t in, out; };
+            mutable std::vector<KEv> kt_ev_;
             bool p2p_ = true;
             int64_t attn_bq_ = 8, attn_bk_ = 64;
             int64_t spec_block_ = 1; // widest all-row head (the drafter's block_size)

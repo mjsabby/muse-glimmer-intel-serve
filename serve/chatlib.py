@@ -273,7 +273,11 @@ def auto_max_seq(model: str, *, gpus: int, q8: bool, assistant: str | None,
         w += weight_bytes(assistant) / (2 if q8_assistant else 1)
     if vision_on_card:
         w += 1.86 * GiB * max(1, gpus)              # the tower, sharded, measured
-    reserve = 1.7 * GiB * max(1, gpus) * max(1.0, chunk / 512.0)
+    # Measured: 0.9 GiB/card of scratch at chunk 512 and 1.7 at chunk 2048, so
+    # the fixed part is about 0.55 and the per-chunk part about 0.35 per 512
+    # rows. Plus insurance, because this only has to avoid asking for something
+    # absurd -- prewarm is what actually proves the configuration.
+    reserve = (0.9 + 0.35 * (chunk / 512.0)) * GiB * max(1, gpus)
     slope, fixed = cache_terms(model, chunk)
     free = total - w - reserve - fixed * max(1, gpus)
     cfg = load_json(model, "config.json")

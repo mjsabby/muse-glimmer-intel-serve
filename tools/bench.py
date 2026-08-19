@@ -126,7 +126,7 @@ def main() -> int:
                          "shard spans both GQA groups and the tier refuses")
     ap.add_argument("--q8", action="store_true")
     ap.add_argument("--q8-assistant", action="store_true")
-    ap.add_argument("--chunk", type=int, default=512)
+    ap.add_argument("--chunk", type=int, default=2048)
     ap.add_argument("--max-seq", type=int, default=None)
     ap.add_argument("--no-flash-prefill", action="store_true")
     ap.add_argument("--no-flash-decode", action="store_true")

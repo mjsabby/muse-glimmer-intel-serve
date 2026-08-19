@@ -101,7 +101,7 @@ def _bind(lib: ctypes.CDLL) -> None:
 
 class Engine:
     def __init__(self, model: str, *, revision: str = "main", assistant: str | None = None,
-                 gpus: int = 2, shards: int = 0, max_seq: int = 32768, chunk: int = 512,
+                 gpus: int = 2, shards: int = 0, max_seq: int = 32768, chunk: int = 2048,
                  q8: bool = False, q8_assistant: bool = False, flash_prefill: bool = True,
                  flash_decode: bool = True, vision: int = VISION_CPU,
                  max_patches: int = 4096, prewarm: bool = True, seal: int = 2,
