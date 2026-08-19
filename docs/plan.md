@@ -7,12 +7,13 @@ across two Arc Pro B70s, and a Python serving frontend speaking OpenAI Chat
 Completions / OpenAI Responses / Anthropic Messages with streaming, guided JSON,
 tool calling, speculative decoding, and image/video input.
 
-The two references are vendored as submodules and are the primary design input:
+The two references are the primary design input (upstream repos; not vendored
+here):
 
-| submodule | what to lift from it |
+| repo | what to lift from it |
 |---|---|
-| `vendor/gemma4-intel-serve` | sliding-window ring KV caches, Q8_0 tier, GGUF+mmproj ingest, MTP/draft-model serving, grammar-forced tool names, three-protocol server, `--trace-dir`, PIL-exact image prep |
-| `vendor/qwen35-intel-serve` | the oracle skeleton (`simd.hpp`, `fmath.hpp`, `rounding.hpp`, `bf16exec.hpp`), the instrumented HF reference harness (`py/ref_forward.py`), allocation planning and seal modes, ViT window attention + 2-D RoPE + pixel-shuffle merge, video preprocessing |
+| [`gemma4-intel-serve`](https://github.com/mjsabby/gemma4-intel-serve) | sliding-window ring KV caches, Q8_0 tier, GGUF+mmproj ingest, MTP/draft-model serving, grammar-forced tool names, three-protocol server, `--trace-dir`, PIL-exact image prep |
+| [`qwen35-intel-serve`](https://github.com/mjsabby/qwen35-intel-serve) | the oracle skeleton (`simd.hpp`, `fmath.hpp`, `rounding.hpp`, `bf16exec.hpp`), the instrumented HF reference harness (`py/ref_forward.py`), allocation planning and seal modes, ViT window attention + 2-D RoPE + pixel-shuffle merge, video preprocessing |
 
 Muse Glimmer's text stack is closer to gemma4 (Gemma-style sandwich norms,
 sliding/global mix, softcapped logits) and its vision tower is closer to qwen35
@@ -61,7 +62,7 @@ Cloud-friendly; no GPU needed.
 - `CMakeLists.txt` with two isolated build trees, following qwen35: `build/`
   (plain g++, oracle + tests, no oneAPI) and `build-gpu/` (icpx, AOT for
   `bmg-g31`). `build.sh --cpu-only` must work on a machine with no oneAPI.
-- Port verbatim from `vendor/qwen35-intel-serve/src`: `simd.hpp`, `fmath.hpp`,
+- Port verbatim from `qwen35-intel-serve/src`: `simd.hpp`, `fmath.hpp`,
   `rounding.hpp`, `json.{h,cpp}`, `json_grammar.h`, `json_schema.h`,
   `safetensors.{h,cpp,hpp}`, `sha256.*`, `hf_resolver.*`, `tensor.*`,
   `tokenizer.*`. These are model-independent and already gated in that repo.
@@ -468,7 +469,7 @@ It is explicitly **not** in this repo's scope to train one.
 `tools/bench.py` on the same split-final-token prefill / logits download / host
 sampling / decode path as serving; `tools/longctx.py` for depth curves and
 needle retrieval. Head-to-head vs llama.cpp's SYCL backend on identical token
-streams, per `vendor/qwen35-intel-serve/docs/comparison.md`. Publish per
+streams, per `qwen35-intel-serve/docs/comparison.md`. Publish per
 model tier, GPU count, quantization, and depth.
 
 ---

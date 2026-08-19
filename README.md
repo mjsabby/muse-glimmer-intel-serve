@@ -136,19 +136,14 @@ resident drafter. See [the memory budget](docs/plan.md#memory-budget-and-weight-
 
 ## References
 
-Two prior stacks by the same author are vendored as submodules and are the
-design input for this one:
+Two prior stacks by the same author were the design input for this one. What
+they contributed has been ported in-tree, so they are no longer vendored —
+consult them upstream:
 
-| path | model | what it contributes |
+| repo | model | what it contributed |
 |---|---|---|
-| [`vendor/gemma4-intel-serve`](https://github.com/mjsabby/gemma4-intel-serve) | Gemma 4 (E2B…31B) | sliding-window ring KV caches, Q8_0 tier, GGUF + mmproj ingest, three-protocol server, grammar-forced tool names, speculative decoding |
-| [`vendor/qwen35-intel-serve`](https://github.com/mjsabby/qwen35-intel-serve) | Qwen3.5 / Qwen3.6 | the f64 oracle skeleton and instrumented HF reference, the bf16/f16 twin, allocation planning, ViT window attention + 2-D RoPE + pixel-shuffle merge, video preprocessing |
-
-```bash
-git clone --recurse-submodules https://github.com/mjsabby/muse-glimmer-intel-serve
-# or, in an existing clone:
-git submodule update --init --depth 1
-```
+| [`gemma4-intel-serve`](https://github.com/mjsabby/gemma4-intel-serve) | Gemma 4 (E2B…31B) | sliding-window ring KV caches, Q8_0 tier, GGUF + mmproj ingest, three-protocol server, grammar-forced tool names, speculative decoding |
+| [`qwen35-intel-serve`](https://github.com/mjsabby/qwen35-intel-serve) | Qwen3.5 / Qwen3.6 | the f64 oracle skeleton and instrumented HF reference, the bf16/f16 twin, allocation planning, ViT window attention + 2-D RoPE + pixel-shuffle merge, video preprocessing |
 
 ## Planned scope
 
