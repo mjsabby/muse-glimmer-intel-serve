@@ -5,9 +5,21 @@ which reference, what "agreement" means for each gate, and every number
 measured so far. Everything below is reproducible with `./run_tiny.sh` and the
 commands quoted in each section.
 
-Status: Phases 0–3 of [docs/plan.md](docs/plan.md) are complete (repo skeleton,
-tiny harness, f64 text oracle, bf16/f16 twin). Phases 4–11 are not started; the
-sections for their gates are marked *not yet measured*.
+Status: every phase of [docs/plan.md](docs/plan.md) except **4 (GGUF ingest)**
+is implemented and gated — the oracle and its twins (0–3), the DFlash drafter
+(5), the vision tower (6, model function only), the SYCL engine and dual-GPU
+tensor parallelism (7–8), the serving frontend (9), speculative serving (10)
+and the head-to-head against llama.cpp (11). §8 lists what is still not
+measured, which is shorter than it was and no less honest for it.
+
+Gate counts, all green as of this writing:
+
+| suite | checks | needs |
+|---|---:|---|
+| `./run_tiny.sh` | 26 | CPU only |
+| `./run_gpu_gates.sh` | 28 | the B70 box |
+| `.venv/bin/python -m tests.serve_tests` | 41 | CPU only |
+| `.venv/bin/python -m tests.live_api_tests` | 30 | the box, a running server |
 
 ---
 
@@ -467,6 +479,127 @@ PIL port would be off by up to 1/255 per channel before the model even starts.
 `smart_resize`, rescale/normalize and `patchify` are deterministic integer/affine
 work and are the easy part.
 
+## 6d. GPU engine gates (Phases 7–8) — `./run_gpu_gates.sh`
+
+The engine is a **candidate under the referee stack, not a second oracle**. The
+four claim classes of §2 map onto it directly, and the mapping is the point:
+where a GPU kernel performs the twin's operations in the twin's order the gate
+is bitwise, and where a reduction order necessarily differs the gate is an
+envelope against the f64 oracle with the twin's own deviation as the budget.
+Calling the second kind "close enough" without naming the budget is how a
+quantization bug hides.
+
+28 checks on `tiny/tiny_text`, `tiny/tiny_vision` and `tiny/tiny_dflash`:
+
+| gate | compares | strength |
+|---|---|---|
+| gpu (1 shard) == bf16 twin | `muse-gpu` vs `muse-oracle --exec bf16` | **bitwise** |
+| gpu (2 shards) == bf16 twin | the same at 2 shards | **bitwise** |
+| chunk 1 == 2 == 4 == 8 == 16 | prefill block width | **bitwise** |
+| oneDNN == hand-written SYCL GEMM | `--no-dnnl` A/B | **bitwise** |
+| decode path == prefill path | N decode steps vs prefilling the same sequence | **bitwise** |
+| rerun bit-identical | the engine against itself | **bitwise** |
+| shards 2: 1 card == 2 cards, prefill **and** decode | placement is not arithmetic | **bitwise** |
+| 2-card rerun bit-identical | the all-reduce is order-fixed | **bitwise** |
+| flash tier inside the twin's envelope | `--flash-prefill` | envelope (max abs 3.906e-03, argmax 1/1, top-20 90%) |
+| flash tier differs from the exact tier | the tier is actually engaged | inequality |
+| flash tier rerun + 1 card == 2 cards | looser numerics, not sloppy ones | **bitwise** |
+| flash-decode inside the exact path's envelope | `--flash-decode` split-K | envelope (max abs 0.000e+00 on this model) |
+| flash-decode rerun bit-identical | | **bitwise** |
+| drafter proposals == the f64 oracle's | DFlash on GPU | **token-exact** |
+| q8 drafter (int8 DPAS) proposals == the f64 oracle's | quantized activations | **token-exact** |
+| drafter: 1 card == 2 cards | | **bitwise** |
+| spec sequence == the f64 oracle's | the accept rule and the rollback | **token-exact** |
+| spec loop rerun deterministic | oneDNN's atomic split-K, which one forward cannot see | **bitwise** |
+| vision features vs the f64 oracle | max 1.958e-02 against the **twin's own** 2.419e-02 | envelope |
+| image+text logits | argmax 189 vs 189, top-20 100% | envelope |
+| q8 vs the f64 oracle | argmax 47 vs 47, top-20 100%, max 1.200e-02 | separate tier |
+| q8 chunk-invariant (1 == 16), q8 rerun | | **bitwise** |
+| sealed engine: 15 prompt lengths | no post-seal allocation, no VRAM drift | exact (0 bytes) |
+| the seal fires without prewarm | a tripwire nobody has seen trip is untested code | behaviour |
+
+Three of these deserve their reason recorded, because each was written after a
+bug got past the others:
+
+* **decode == prefill** exists because the decode path collapses the leading
+  dimension to 1 and takes a different GEMM route. It is a second
+  implementation of the same function and it once produced a stuck token with
+  no error ([gpu.md](docs/gpu.md)'s one-column oneDNN bug).
+* **shards 2: 1 card == 2 cards, at DECODE** was added after the prefill-only
+  version passed while `hand_off` assumed a contiguity that only holds for
+  prefill.
+* **spec loop rerun deterministic** was added after speculative decoding
+  produced 220 tokens on one run and 176 on the next, with every single-forward
+  gate green. oneDNN's atomic split-K; fixed with `set_deterministic(true)`.
+
+Numbers on the real 30B are in [gpu.md](docs/gpu.md) and
+[comparison.md](docs/comparison.md); this file records what the gates prove,
+not how fast it is.
+
+---
+
+## 6e. Serving gates (Phase 9)
+
+Two suites, split by what they can prove without the weights.
+
+**`tests/serve_tests.py` — 41 checks, no GPU.** The engine is faked by a
+deterministic target *addressed by cache position*: the distribution after a
+cache of length L is a point mass on `script[L - prompt_len]`. That detail is
+the test. A fake that advanced a cursor per call passes the speculative accept
+path and diverges on the reject path — the one the test exists for.
+
+Covers: the generation prompt is a bare `<|start|>assistant` (the premise
+`serve/recipient.py` is built on); the reasoning-strength line is always
+emitted and a system prompt's own line wins; `tool_calls[].function.arguments`
+must be deserialized or the template `raise_exception`s; `<|eom|>` is not an
+eos id; the ATEM channel machine (reasoning never leaks into content, tool
+calls whole, truncated turns still emit); the recipient grammar (a forced tool
+name is the only legal recipient, `none` leaves no tool addressable, `self` is
+withdrawn after one use, the mask is `None` inside the body); greedy
+speculative output identical to greedy plain on the fake; raw `/v1/completions`
+using the prompt verbatim; and all three wire formats end to end, including the
+second turn of a tool call, an api key, and the errors that must stay errors.
+
+**`tests/live_api_tests.py` — 30 checks, on the box.** What only the weights
+can show: the channel split on a real turn, determinism from a known cache
+state, the speculative tie property (§6f), `tool_choice` forcing a recipient
+the model did not want, guided JSON parsing, streamed == non-streamed,
+prefix reuse being both a speed-up and the same answer, both other protocols,
+an image changing the answer, and context overflow / `input_audio` /
+empty-messages returning 400.
+
+---
+
+## 6f. What speculative decoding guarantees, and what it does not
+
+The tiny-model gate is **token-exact against the f64 oracle**, and that is the
+strongest statement available. It does **not** generalize to "greedy
+speculative output is bit-identical to greedy plain output on the 30B", and the
+plan's Phase 10 exit gate as written asked for exactly that. It cannot hold:
+
+* a speculatively verified token's logits come from a **16-row** forward —
+  oneDNN matmul, tile-softmax attention;
+* a plain decode's come from a **1-row** forward — hand-written GEMV, split-K
+  attention.
+
+Different arithmetic, both inside the twin's envelope, neither of them "the"
+answer. Making them identical would mean verifying 16 tokens with 16 separate
+decode steps, which is the non-speculative path.
+
+Measured on the 30B: identical on 1–3 of 3 gate prompts depending on cache
+state, and **every observed first divergence was a tie** — in each case one of
+the two paths saw an *exact* tie (0.0000 logprob gap between the top two
+candidates) where the other saw 0.06–0.25. The live gate checks that property
+instead of equality, because a real acceptance bug diverges at a comfortable
+margin.
+
+The same caveat applies to prefix reuse: it changes the prefill chunking, and
+the fast attention tiers are envelope-level, so the same request from a
+different cache state can land on the other side of a tie.
+`--no-prefix-reuse` makes the answer a function of the prompt alone.
+
+---
+
 ## 7. DFlash — the plan's one open item, resolved
 
 docs/plan.md leaves one question genuinely open ("the number of denoising
@@ -495,15 +628,12 @@ per-position logit agreement, acceptance rate). Phase 5 is not implemented.
 
 | phase | gate | status |
 |---|---|---|
-| 4 | GGUF ingest, Q8/Q4_K bands vs llama.cpp | **not started** |
-| 6 | vision: byte-exact **preprocessing** (torchvision Lanczos in C++) | **not started** — §6c explains why the plan's PIL target is wrong |
-| 6 | video: `t > 1` grids, 2 fps sampling, per-frame pixel-shuffle offsets | **not started** (the tower code takes `t`, but no video gate has been run) |
-| 7–8 | SYCL kernels, dual-GPU TP | needs the B70 box |
-| 9 | serving: `serve_tests.py`, `live_api_tests.py` | **not started** |
-| 10 | DFlash serving: `spec_parity.py` | needs the B70 box |
-| 11 | benchmarks vs llama.cpp | needs the B70 box |
+| 4 | GGUF ingest, Q8/Q4_K bands vs llama.cpp | **not started** — the only untouched phase |
+| 6 | vision: byte-exact **preprocessing** in C++ | **not started**. The server reaches the checkpoint's own `MuseGlimmerImageProcessor` through Python, so serving is byte-exact by construction; what is missing is a C++ ingestion path for a Python-free deployment. §6c explains why the plan's PIL target is wrong |
+| 6 | video: `t > 1` grids, 2 fps sampling, per-frame pixel-shuffle offsets | **not started**, and it is the one shipped feature with no gate: the tower takes `t`, the server accepts `video_url`, and no `t > 1` grid has been run end to end |
+| 11 | long-context **quality** (needle retrieval at depth) | **not started**. 131 072 is measured as speed — it prefills and decodes — but nothing checks that retrieval still works there |
 
-Two more honest gaps inside what *is* implemented:
+Three more honest gaps inside what *is* implemented:
 
 * the **bf16/f16 twins of the drafter and the tower** are written (`--dtype`
   threads through `src/dflash.hpp` and `src/vision.hpp`) but only the text
@@ -512,3 +642,8 @@ Two more honest gaps inside what *is* implemented:
 * `--hf-f32-compat` covers the vision tower's f32 sites (the
   `apply_rotary_pos_emb_vision` downcast, the f32 softmax) but that path has not
   been compared against stock, only the text one (§5).
+* the GPU gates run on the **tiny** models. The real 30B is checked against the
+  f64 oracle at the logit level (argmax and top-k, §5) and against llama.cpp
+  for throughput, but there is no bitwise 30B GPU gate and there cannot be one:
+  the f64 oracle's 30B forward takes ~17 s for 6 tokens, and the twin is a CPU
+  implementation whose reduction order the GPU does not share at that scale.
