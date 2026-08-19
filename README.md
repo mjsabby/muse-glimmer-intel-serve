@@ -44,7 +44,7 @@ methodology and the traps found along the way are in
 | 7–8 | SYCL engine, dual-GPU tensor parallelism | ✅ 28 GPU gates green |
 | 9 | serving frontend | ✅ 41 offline + 30 live gates green |
 | 10 | DFlash speculative serving | ✅ 15 → 98 tok/s |
-| 11 | benchmark sweep vs llama.cpp | ✅ [comparison.md](docs/comparison.md) |
+| 11 | benchmark sweep vs llama.cpp | ✅ BF16 faster on all 12 tests [comparison.md](docs/comparison.md) |
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — the exact model specification the oracle
   implements: config, tensor inventory, op-by-op semantics for the text
@@ -62,8 +62,10 @@ methodology and the traps found along the way are in
   `tool_choice` as a grammar, guided JSON, what speculative decoding actually
   guarantees, prefix reuse, and media.
 - [docs/comparison.md](docs/comparison.md) — head-to-head with llama.cpp's SYCL
-  backend on the same two cards: BF16 parity, the Q8 tier's 1.6x decode gap and
-  why, and the split-K fix the sweep produced.
+  backend on the same two cards, each in its best configuration: BF16 ahead on
+  all twelve tests (1.01-1.27x), Q8 level on decode and ahead at depth, and the
+  six fixes the sweep produced — including the one where a hand-rolled bf16
+  conversion was costing half the Q8 decode bandwidth.
 - [docs/plan.md](docs/plan.md) — the build plan, phase by phase, with exit gates
   and a cloud-vs-hardware split.
 

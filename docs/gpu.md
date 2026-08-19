@@ -120,6 +120,29 @@ started collapsing the leading dimension to 1, the GEMMs addressed a stride the
 rest of the kernels no longer used, and decode emitted a stuck token with no
 error. Both are now required parameters.
 
+## The bf16 conversion helpers are not free
+
+`f2bf()` was a memcpy, a NaN branch and three integer ops; `bf2f()` a shift
+through a memcpy. Both are now `sycl::ext::oneapi::bfloat16` — the same
+round-to-nearest-even, one hardware instruction — and every bitwise gate still
+passes, which is the check that the two roundings agree on the values this
+engine sees.
+
+It is worth a section because of the size of it. In a kernel that converts once
+per output the hand-rolled form is invisible. In one that converts once per
+weight BYTE it is the workload:
+
+| Q8 decode GEMV, 6656 x 19968 | GB/s |
+|---|---:|
+| hand-rolled `rb()` + `bf2f()` | 235 |
+| hardware round-trip on the weight only | 329 |
+| hardware on both | **500** |
+
+In the engine: 332 → 513 GB/s, and Q8 decode 18.7 → 26.9 tok/s. The hunt that
+found it is written up in [comparison.md](comparison.md#what-the-sweep-found) —
+the short version is that a microbenchmark of "the same kernel" is only
+evidence if it is the same *text*.
+
 ## Kernel notes
 
 * **RMSNorm** has two implementations chosen by shape alone (never by a runtime
