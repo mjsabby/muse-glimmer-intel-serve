@@ -708,15 +708,29 @@ time** past 2 K.
 partial `(max, sumexp, accumulator)`, then merges them. Parallelism goes from 16
 to 16 × splits:
 
-| context | exact | `--flash-decode` |
-|---|---:|---:|
-| 2 048 | 4.48 tok/s | **10.27** |
-| 8 192 | 2.89 | **10.19** |
-| 16 384 | 1.95 | **10.05** |
-| 32 768 | — | 9.05 |
-| 131 072 | — | 5.67 |
+| context | exact | `--flash-decode` | + 64-key slices |
+|---|---:|---:|---:|
+| 2 048 | 4.48 tok/s | 10.27 | **15.80** |
+| 4 096 | — | 10.22 | **15.71** |
+| 8 192 | 2.89 | 10.19 | — |
+| 16 384 | 1.95 | 10.02 | **14.85** |
+| 32 768 | — | 9.05 | — |
+| 65 536 | — | 7.53 | **12.79** |
+| 131 072 | — | 5.67 | — |
 
-Decode goes from degrading linearly to **flat out to 16 K**. It is the same
+Decode goes from degrading linearly to **flat out to 16 K**.
+
+The third column is a later correction, and it is worth the retelling because
+the first version looked finished. One sub-group runs one slice, so the slice
+width *is* the occupancy: at 16 query heads a 512-key slice gives 8 slices and
+128 work-groups of 32 lanes — about 6% of the card, with a dependent chain
+(load, dot, sub-group reduce, exp, fma) per key and nothing to hide its latency
+behind. "Flat" was flat at the wrong level. Cutting the slice to 64 keys is
++48-70% across every depth, and it is why the head-to-head in
+[comparison.md](comparison.md) went from 0.62x of llama.cpp's decode at depth to
+0.93-0.98x. Past ~256 slices the merge kernel — one work-group per head, walking
+the partials serially — starts taking it back, which is where the cap comes
+from. `MUSE_GPU_FD_SPLITS` and `MUSE_GPU_FD_KPS` override both. It is the same
 class of contract as `--flash-prefill` — reordering the softmax rescalings is a
 different schedule of the same function — so it is envelope-gated, not bitwise,
 and therefore opt-in. It produced identical tokens to the exact path on the test

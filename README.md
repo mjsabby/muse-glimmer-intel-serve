@@ -6,7 +6,7 @@ deterministic float64 CPU implementation defines the model function exactly, a
 bf16/f16 twin defines the deviation band any correct low-precision kernel must
 stay inside, and every GPU kernel is gated against them.
 
-**Status: it serves.** The f64 oracle and its bf16/f16 twins, the DFlash block
+**Status: it serves, and it has been measured against llama.cpp.** The f64 oracle and its bf16/f16 twins, the DFlash block
 drafter and the vision tower (Phases 0–3, 5, most of 6); the SYCL engine on two
 Arc Pro B70s with tensor parallelism, a Q8_0 weight tier, int8-DPAS speculative
 drafting and a prewarmed-then-sealed static allocation (7, 8, 10); and the
@@ -44,7 +44,7 @@ methodology and the traps found along the way are in
 | 7–8 | SYCL engine, dual-GPU tensor parallelism | ✅ 28 GPU gates green |
 | 9 | serving frontend | ✅ 41 offline + 30 live gates green |
 | 10 | DFlash speculative serving | ✅ 15 → 98 tok/s |
-| 11 | benchmark sweep vs llama.cpp | ⬜ |
+| 11 | benchmark sweep vs llama.cpp | ✅ [comparison.md](docs/comparison.md) |
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — the exact model specification the oracle
   implements: config, tensor inventory, op-by-op semantics for the text
@@ -61,6 +61,9 @@ methodology and the traps found along the way are in
 - [docs/serving.md](docs/serving.md) — the HTTP stack: the channel protocol,
   `tool_choice` as a grammar, guided JSON, what speculative decoding actually
   guarantees, prefix reuse, and media.
+- [docs/comparison.md](docs/comparison.md) — head-to-head with llama.cpp's SYCL
+  backend on the same two cards: BF16 parity, the Q8 tier's 1.6x decode gap and
+  why, and the split-K fix the sweep produced.
 - [docs/plan.md](docs/plan.md) — the build plan, phase by phase, with exit gates
   and a cloud-vs-hardware split.
 

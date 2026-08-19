@@ -1886,6 +1886,10 @@ namespace muse::gpu
                 }
                 if (const char *e = getenv("MUSE_GPU_DECODE_GEMV"); e && *e && *e != '0')
                     decode_gemv_ = true;
+                if (const char *e = getenv("MUSE_GPU_FD_SPLITS"); e && *e)
+                    fd_splits_ = std::max<int64_t>(1, atoll(e));
+                if (const char *e = getenv("MUSE_GPU_FD_KPS"); e && *e)
+                    fd_kps_ = std::max<int64_t>(16, atoll(e));
                 trace_dir_ = getenv("MUSE_GPU_TRACE");
                 // direct card-to-card by default; MUSE_GPU_XFER=host selects
                 // the pinned-host staging path (same speed, one hop longer)
@@ -3950,8 +3954,8 @@ namespace muse::gpu
                             // differently
                             const int64_t total =
                                 window > 0 ? std::min<int64_t>(pos0 + 1, window) : pos0 + 1;
-                            const int64_t nsp =
-                                std::min<int64_t>(fd_splits_, (total + 511) / 512);
+                            const int64_t nsp = std::min<int64_t>(
+                                fd_splits_, (total + fd_kps_ - 1) / fd_kps_);
                             k_attn_decode_split(d.q, d.qb, l.kc[size_t(sh)], l.vc[size_t(sh)],
                                                 d.pm, d.pl, d.pa, nqs, D, KD, B, pos0, groups,
                                                 l.cap, window, scaling, sh * nqs,
@@ -4321,7 +4325,28 @@ namespace muse::gpu
             int64_t spec_block_ = 1; // widest all-row head (the drafter's block_size)
             bool tiled_attn_ = true;
             bool flash_decode_ = false;
-            int64_t fd_splits_ = 32, fd_min_ctx_ = 1024, nq_ = 1;
+            // Split-K decode attention: how many key-slices to cut the range
+            // into, and how many keys each slice walks. ONE SUB-GROUP PER
+            // SLICE, so `nq_ * nsp` is the entire grid — and that is the whole
+            // story of this tier's performance. A 512-key slice gives 8 slices
+            // at 4K context and 16 query heads, i.e. 128 work-groups of 32
+            // lanes: ~6% of the card, with a dependent chain (load, dot,
+            // sub-group reduce, exp, fma) per key and nothing to hide its
+            // latency behind. A 64-key slice gives 64 slices, and decode at
+            // 4K went 10.22 -> 15.71 tok/s. Measured across depths:
+            //
+            //   context   512-key slices   64-key slices
+            //     2 048        10.31           15.80
+            //     4 096        10.22           15.71
+            //    16 384        10.02           14.85
+            //    65 536         7.53           12.79
+            //
+            // Past ~256 slices the merge kernel — one work-group per head,
+            // walking the partials serially — starts taking it back, which is
+            // where the cap comes from. Both are overridable from the
+            // environment because the right value is a measurement, not a
+            // principle.
+            int64_t fd_splits_ = 256, fd_kps_ = 64, fd_min_ctx_ = 1024, nq_ = 1;
             int64_t tap_cap_ = 0;
             bool flash_prefill_ = false;
             // ---- DFlash drafter state (empty until bind_drafter) ----

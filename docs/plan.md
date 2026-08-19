@@ -488,7 +488,7 @@ model tier, GPU count, quantization, and depth.
 | 8 Dual-GPU TP | design only | ✅ | **done** (text; head/FFN/vocab split, KV replicated — see [gpu.md](gpu.md)). 14.81 tok/s decode, 1030 tok/s prefill, full 131 072 context fits |
 | 9 Serving frontend | ✅ except live gates | ✅ for `live_api_tests.py` | **done** — three protocols, guided JSON, grammar-forced recipients, media; `serve_tests.py` 41/41 with no GPU, `live_api_tests.py` 30/30 on the box. See [serving.md](serving.md) |
 | 10 DFlash serving | design only | ✅ | **done** as an engine loop: `--draft-rounds N`, gated on producing the f64 oracle's sequence. Up to 11 tokens/round and 119.9 tok/s on code. The HTTP serving layer around it is Phase 9. |
-| 11 Benchmarks | | ✅ | not started |
+| 11 Benchmarks | | ✅ | **done** — head-to-head vs llama.cpp's SYCL backend at BF16 and Q8_0, 1 and 2 cards, to depth 65536. See [comparison.md](comparison.md) |
 
 Phases 0–6 and most of 9 are pure CPU work and are the natural first session.
 Everything from Phase 7 on needs the hardware, but its *design* is fixed by the
@@ -524,9 +524,12 @@ regression baseline.
 
 **Next, in order of value:**
 
-1. **Phase 11, benchmarks** — `tools/bench.py` on the serving path and a
-   head-to-head against llama.cpp's SYCL backend. Everything it needs now
-   exists; what is published so far are per-feature numbers, not a sweep.
+1. **The Q8 tier's GEMMs.** The head-to-head found the one place this engine is
+   clearly behind: Q8 decode is 1.6x slower than llama.cpp's and Q8 prefill at
+   depth 0 is 1.9x slower, because decode uses a hand-written GEMV at ~330 GB/s
+   and prefill dequantizes to a BF16 scratch (an extra HBM round trip per
+   block). The fix is the int8-DPAS kernel already written for the drafter,
+   generalized from ≤16 rows to arbitrary M. See [comparison.md](comparison.md).
 2. **Phase 4, GGUF ingest** — nothing about it changed; the three conversions in
    that section are still the whole job, and `assert_norm_flavours()` in
    `src/muse_glimmer.hpp` documents why the +1 check has to be the cross-source
@@ -594,4 +597,4 @@ checkpoint is ever revised.
   **Written** for Phases 0–3, 5, 6.
 - `docs/gpu.md` — engine design, memory model, hardware pitfalls, kernel tracker.
 - `docs/serving.md` — protocols, tools, JSON, media. **Written.**
-- `docs/comparison.md` — head-to-head vs llama.cpp and the sibling engines.
+- `docs/comparison.md` — head-to-head vs llama.cpp. **Written.**
