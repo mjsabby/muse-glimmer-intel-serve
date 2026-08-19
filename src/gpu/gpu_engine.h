@@ -140,9 +140,29 @@ namespace muse::gpu
         // Append one token against the existing cache; same logit contract.
         virtual void decode_step(int64_t id, float *logits_last) = 0;
 
+        // Append `ids` at the CURRENT cache length, chunked by `block`. This
+        // is prefill for a server: a request that shares a prefix with the
+        // last one rolls the cache back with set_cache_len() and appends only
+        // the tail, and a request that shares nothing resets first.
+        virtual void append(const std::vector<int64_t> &ids, float *logits_last) = 0;
+
+        // One forward over `ids` (at most `spec_block` of them) returning
+        // logits for EVERY row — the speculative verification pass. Leaves the
+        // cache holding all of them; the caller rolls back to the accepted
+        // prefix with set_cache_len().
+        virtual void verify(const std::vector<int64_t> &ids, float *logits_all) = 0;
+
         // Logical tokens currently in the KV cache.
         virtual int64_t cache_len() const = 0;
         virtual void reset_cache() = 0;
+        // Roll the cache back (or forward, within what has been written). The
+        // sliding layers hold `window + chunk` rows, so a rollback deeper than
+        // that leaves rows the ring has already overwritten — the caller owns
+        // that bound, which is `sliding_window()`.
+        virtual void set_cache_len(int64_t n) = 0;
+        virtual int64_t sliding_window() const = 0;
+        // The drafter's block_size, or 0 if no drafter is bound.
+        virtual int64_t spec_block() const = 0;
 
         // Binds the drafter onto the same shards as the target. The target's
         // embedding and lm_head are reused (the drafter embeds with the RAW

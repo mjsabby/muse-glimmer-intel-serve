@@ -123,6 +123,14 @@ if(MUSE_GPU)
   target_link_libraries(muse-gpu PRIVATE muse_gpu_backend)
   target_link_options(muse-gpu PRIVATE ${GPU_SYCL_COMPILE} ${GPU_AOT_LINK})
 
+  # The C ABI the Python serving frontend binds with ctypes. Same engine, same
+  # numerics; serve/ owns tokenization, sampling, grammars and protocols.
+  add_library(muse-intel-serve SHARED src/gpu/c_api.cpp)
+  target_compile_options(muse-intel-serve PRIVATE -fp-model=precise)
+  target_link_libraries(muse-intel-serve PRIVATE muse_gpu_backend)
+  target_link_options(muse-intel-serve PRIVATE ${GPU_SYCL_COMPILE} ${GPU_AOT_LINK})
+  set_target_properties(muse-intel-serve PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
   set_target_properties(muse_gpu_backend muse_core
                         PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()

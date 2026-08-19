@@ -1979,8 +1979,47 @@ namespace muse::gpu
                 tim_.decode_tokens += 1;
             }
 
+            void append(const std::vector<int64_t> &ids, float *logits_last) override
+            {
+                const int64_t T = int64_t(ids.size());
+                if (len_ + T > max_seq_)
+                    die("append of " + std::to_string(T) + " past cache length " +
+                        std::to_string(len_) + " exceeds --max-seq " + std::to_string(max_seq_));
+                auto t0 = std::chrono::steady_clock::now();
+                for (int64_t p = 0; p < T; p += block_)
+                {
+                    const int64_t n = std::min(block_, T - p);
+                    forward_block(ids.data() + p, len_, n, (p + n >= T) ? logits_last : nullptr);
+                }
+                tim_.prefill_s +=
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                tim_.prefill_tokens += T;
+            }
+
+            void verify(const std::vector<int64_t> &ids, float *logits_all) override
+            {
+                const int64_t n = int64_t(ids.size());
+                if (n > spec_block_)
+                    die("verify over " + std::to_string(n) + " rows, scratch holds " +
+                        std::to_string(spec_block_));
+                auto t0 = std::chrono::steady_clock::now();
+                forward_block(ids.data(), len_, n, nullptr, logits_all);
+                tim_.decode_s +=
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                tim_.decode_tokens += n;
+            }
+
             int64_t cache_len() const override { return len_; }
             void reset_cache() override { len_ = 0; }
+            void set_cache_len(int64_t n) override
+            {
+                if (n < 0 || n > max_seq_)
+                    die("set_cache_len(" + std::to_string(n) + ") outside [0, " +
+                        std::to_string(max_seq_) + "]");
+                len_ = n;
+            }
+            int64_t sliding_window() const override { return cfg_->sliding_window; }
+            int64_t spec_block() const override { return dlayers_.empty() ? 0 : dcfg_.block_size; }
 
             // ------------------------------------------------------- prewarm
             //
