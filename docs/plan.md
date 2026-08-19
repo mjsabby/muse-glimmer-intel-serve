@@ -524,24 +524,23 @@ regression baseline.
 
 **Next, in order of value:**
 
-1. **Q8 prefill into an empty cache.** The only shape llama.cpp still wins
-   (0.57x at pp512, 0.92x at pp2048, level by pp8192, and ours by 1.15x once
-   there is depth): the Q8 tier dequantizes each weight into a BF16 scratch
-   once per BLOCK, an extra HBM round trip a fused path does not pay. The cost
-   is per block and the benefit is per token, so it vanishes as the block
-   fills. Two ways out, neither started: a fused int8→bf16 GEMM feeding DPAS,
-   or layer-major prefill — loop layers outside blocks, so a weight is
-   dequantized once per prefill rather than once per block.
-   See [comparison.md](comparison.md).
-2. **Phase 4, GGUF ingest** — nothing about it changed; the three conversions in
-   that section are still the whole job, and `assert_norm_flavours()` in
+1. **Phase 4, GGUF ingest** — the only untouched phase. The three conversions
+   in that section are still the whole job, and `assert_norm_flavours()` in
    `src/muse_glimmer.hpp` documents why the +1 check has to be the cross-source
-   one rather than a per-tensor statistic.
-3. **The rest of Phase 6**: C++ pixel ingestion (see the correction below) and a
-   video (`t > 1`) gate. The tower takes `t` already, and the server reaches it
-   through the checkpoint's own video processor, but no video gate has been run.
-4. Q8 for the vision tower and for the embedding table (~1.2 GiB/card, possibly
+   one rather than a per-tensor statistic. It buys a GGUF-only deployment (no
+   HF snapshot) and the Q4_K tiers, which fit one card comfortably.
+2. **C++ pixel ingestion.** Serving reaches the checkpoint's own
+   `MuseGlimmerImageProcessor` through Python, so it is byte-exact by
+   construction; what is missing is an ingestion path for a Python-free
+   deployment. See the correction below for why the plan's PIL target is the
+   wrong one.
+3. **Q8 for the vision tower and the embedding table** (~1.2 GiB/card, possibly
    enough to fit the 30B on one card).
+4. **The last 4% of Q8 prefill at 512 tokens** (0.96x of llama.cpp; everything
+   deeper is 1.15-1.81x). A fused int8→bf16 GEMM would remove the dequantize
+   round trip the short block cannot amortize. Worth naming, not worth doing
+   yet: the same gap looked like 43% until the dequantize pass stopped reading
+   int8 one byte at a time.
 
 Three things that are already known and must not be rediscovered the hard way:
 

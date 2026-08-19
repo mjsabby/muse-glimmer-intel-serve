@@ -1114,22 +1114,59 @@ namespace muse::gpu
         // to bf16 in a scratch tile and the ordinary DPAS GEMM runs on it. That
         // costs a write and a re-read of the tile, which is why Q8 is a decode
         // and memory tier rather than a prefill one.
-        void k_dequant_q8(sycl::queue &q, const int8_t *W, const uint16_t *D, uint16_t *out,
-                          int64_t in, int64_t out_rows)
+        sycl::event k_dequant_q8(sycl::queue &q, const int8_t *W, const uint16_t *D,
+                                 uint16_t *out, int64_t in, int64_t out_rows)
         {
             const int64_t nblk = in / QK8;
-            q.parallel_for(sycl::range<2>(size_t(out_rows), size_t(nblk)), [=](sycl::id<2> id) {
+            // One 32-element block per work-item. Two per item measured the
+            // same (316 vs 320 GB/s), so the simpler form stays: at a 1:2
+            // read:write ratio this is the pattern's rate, not the thread
+            // count's.
+            return q.parallel_for(sycl::range<2>(size_t(out_rows), size_t(nblk)),
+                                  [=](sycl::id<2> id) {
                 const int64_t o = int64_t(id[0]), b = int64_t(id[1]);
                 const sycl::half *dd = reinterpret_cast<const sycl::half *>(D + o * nblk);
                 const float sc = float(dd[b]);
                 const int8_t *wb = W + o * in + b * QK8;
                 uint16_t *ob = out + o * in + b * QK8;
-                // Hardware bf16 conversion: this kernel runs once per weight
-                // ELEMENT over the whole matrix, so f2bf()'s memcpy, NaN
-                // branch and three integer ops are the workload rather than a
-                // detail. Same round-to-nearest-even result.
-                for (int k = 0; k < QK8; ++k)
-                    ob[k] = f2bf_hw(float(wb[k]) * sc);
+                // Vector loads and stores, hardware bf16 conversion. Both
+                // matter and for the same reason: this kernel runs once per
+                // weight ELEMENT over the whole matrix, so a byte-at-a-time
+                // read and a hand-rolled rounding are not details, they are
+                // the workload. Byte loads measured 108 GB/s here — the same
+                // trap the decode GEMV hit, and the dequantize pass is 74% of
+                // Q8 prefill, so it was most of the tier's cost.
+                //
+                // Alignment holds by construction: `in` is a multiple of 32,
+                // so a row starts 32-byte aligned and each block adds 32 more.
+                const sycl::vec<uint32_t, 4> *wv =
+                    reinterpret_cast<const sycl::vec<uint32_t, 4> *>(wb);
+                sycl::vec<uint32_t, 4> *ov = reinterpret_cast<sycl::vec<uint32_t, 4> *>(ob);
+                const sycl::vec<uint32_t, 4> w0 = wv[0], w1 = wv[1];
+                sycl::vec<uint32_t, 4> o0, o1, o2, o3;
+#pragma unroll
+                for (int u = 0; u < 8; ++u)
+                {
+                    const uint32_t packed = (u < 4) ? w0[u] : w1[u - 4];
+                    // four int8 quants -> four bf16, packed two per dword in
+                    // the order they appear
+                    uint32_t lo = 0, hi = 0;
+#pragma unroll
+                    for (int k = 0; k < 2; ++k)
+                        lo |= uint32_t(f2bf_hw(float(int8_t((packed >> (8 * k)) & 0xff)) * sc))
+                              << (16 * k);
+#pragma unroll
+                    for (int k = 2; k < 4; ++k)
+                        hi |= uint32_t(f2bf_hw(float(int8_t((packed >> (8 * k)) & 0xff)) * sc))
+                              << (16 * (k - 2));
+                    sycl::vec<uint32_t, 4> &dst = (u < 2) ? o0 : (u < 4) ? o1 : (u < 6) ? o2 : o3;
+                    dst[(u % 2) * 2] = lo;
+                    dst[(u % 2) * 2 + 1] = hi;
+                }
+                ov[0] = o0;
+                ov[1] = o1;
+                ov[2] = o2;
+                ov[3] = o3;
             });
         }
 
@@ -2507,6 +2544,13 @@ namespace muse::gpu
                     }
                     kt_ev_.clear();
                 }
+                if (ktime_ && kt_deq_ns_)
+                    std::fprintf(f,
+                                 "  q8 prefill: dequant %.3f s (%.2f GB, %.1f GB/s), "
+                                 "gemm %.3f s (%.2f TFLOP, %.1f TFLOP/s)\n",
+                                 double(kt_deq_ns_) / 1e9, kt_deq_bytes_ / 1e9,
+                                 kt_deq_bytes_ / (double(kt_deq_ns_) / 1e9) / 1e9, kt_gemm_s_,
+                                 kt_gemm_flop_ / 1e12, kt_gemm_flop_ / kt_gemm_s_ / 1e12);
                 if (ktime_ && kt_calls_)
                 {
                     std::fprintf(f,
@@ -3112,7 +3156,22 @@ namespace muse::gpu
                     if (int64_t(out * in) > deq_cap_)
                         die("Q8 prefill scratch too small for a " + std::to_string(out) + "x" +
                             std::to_string(in) + " weight");
-                    k_dequant_q8(d.q, w.qs, w.d, d.deq, in, out);
+                    auto de = k_dequant_q8(d.q, w.qs, w.d, d.deq, in, out);
+                    if (ktime_)
+                    {
+                        de.wait();
+                        kt_deq_ns_ += int64_t(
+                            de.get_profiling_info<sycl::info::event_profiling::command_end>() -
+                            de.get_profiling_info<sycl::info::event_profiling::command_start>());
+                        kt_deq_bytes_ += double(in) * double(out) * 3.03125; // 1 read + 2 written
+                        const auto g0 = std::chrono::steady_clock::now();
+                        gemm_bf16(dev, d.deq, X, Y, n, in, out, ldx, ldy);
+                        d.q.wait();
+                        kt_gemm_s_ += std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - g0).count();
+                        kt_gemm_flop_ += 2.0 * double(in) * double(out) * double(n);
+                        return;
+                    }
                     gemm_bf16(dev, d.deq, X, Y, n, in, out, ldx, ldy);
                     return;
                 }
@@ -4732,6 +4791,8 @@ namespace muse::gpu
             mutable std::map<std::pair<int64_t, int64_t>, std::pair<int64_t, int64_t>> kt_shape_;
             struct KEv { sycl::event e; int64_t in, out; };
             mutable std::vector<KEv> kt_ev_;
+            mutable int64_t kt_deq_ns_ = 0;
+            mutable double kt_deq_bytes_ = 0, kt_gemm_s_ = 0, kt_gemm_flop_ = 0;
             bool p2p_ = true;
             int64_t attn_bq_ = 8, attn_bk_ = 64;
             int64_t spec_block_ = 1; // widest all-row head (the drafter's block_size)

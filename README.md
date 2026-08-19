@@ -44,7 +44,7 @@ methodology and the traps found along the way are in
 | 7–8 | SYCL engine, dual-GPU tensor parallelism | ✅ 28 GPU gates green |
 | 9 | serving frontend | ✅ 41 offline + 30 live gates green |
 | 10 | DFlash speculative serving | ✅ 15 → 98 tok/s |
-| 11 | benchmark sweep vs llama.cpp | ✅ BF16 faster on all 12 tests [comparison.md](docs/comparison.md) |
+| 11 | benchmark sweep vs llama.cpp | ✅ BF16 12/12, Q8 9/12 + 2 ties [comparison.md](docs/comparison.md) |
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — the exact model specification the oracle
   implements: config, tensor inventory, op-by-op semantics for the text
@@ -63,9 +63,9 @@ methodology and the traps found along the way are in
   guarantees, prefix reuse, and media.
 - [docs/comparison.md](docs/comparison.md) — head-to-head with llama.cpp's SYCL
   backend on the same two cards, each in its best configuration: BF16 ahead on
-  all twelve tests (1.01-1.27x), Q8 level on decode and ahead at depth, and the
-  six fixes the sweep produced — including the one where a hand-rolled bf16
-  conversion was costing half the Q8 decode bandwidth.
+  all twelve tests (1.01–1.27×), Q8 ahead on nine and level on decode, and the
+  seven fixes the sweep produced — two of which were the same mistake in
+  different kernels, reading quantized weights one byte at a time.
 - [docs/plan.md](docs/plan.md) — the build plan, phase by phase, with exit gates
   and a cloud-vs-hardware split.
 
@@ -105,8 +105,9 @@ on all three chat protocols, ATEM tool calling with grammar-forced recipients,
 guided `json_object` / `json_schema`, image and video input, `Reasoning
 strength` control, prefix reuse across turns, cancellation, auth, CORS,
 `/metrics` and request tracing. Measured on two B70s with a BF16 target and a
-Q8 drafter: **15 tok/s plain decode, 31–98 tok/s speculative** depending on how
-predictable the text is, and a footprint that does not move after startup.
+Q8 drafter: **17.7 tok/s plain decode, 31–97 tok/s speculative** depending on
+how predictable the text is, retrieval verified at the full 131 072-token
+window, and a footprint that does not move after startup.
 Details and the gate list are in [docs/serving.md](docs/serving.md).
 
 ## The model

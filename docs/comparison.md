@@ -54,33 +54,42 @@ are the same format.
 
 | test | llama.cpp | ours | ours / llama.cpp |
 |---|---:|---:|---:|
-| pp512 | 1378.69 ± 4.66 | 789.29 ± 9.67 | 0.57 |
-| pp2048 | 1622.36 ± 1.55 | 1498.88 ± 7.03 | 0.92 |
-| pp8192 | 1504.32 ± 1.54 | 1443.12 ± 0.50 | 0.96 |
-| tg128 | 26.48 ± 0.01 | 26.71 ± 0.04 | **1.01** |
-| pp512 @ d4096 | 724.93 ± 13.87 | 763.84 ± 3.09 | **1.05** |
-| pp2048 @ d4096 | 1242.66 ± 0.72 | 1429.89 ± 0.59 | **1.15** |
-| pp8192 @ d4096 | 1209.95 ± 0.66 | 1395.76 ± 2.24 | **1.15** |
-| tg128 @ d4096 | 25.79 ± 0.01 | 25.58 ± 0.02 | 0.99 |
-| pp512 @ d16384 | 633.30 ± 8.47 | 733.19 ± 1.76 | **1.16** |
-| pp2048 @ d16384 | 1135.74 ± 4.94 | 1317.67 ± 1.74 | **1.16** |
-| pp8192 @ d16384 | 1101.76 ± 0.49 | 1295.13 ± 1.31 | **1.18** |
-| tg128 @ d16384 | 25.27 ± 0.02 | 25.16 ± 0.06 | 1.00 |
+| pp512 | 1378.69 ± 4.66 | 1317.52 ± 12.11 | 0.96 |
+| pp2048 | 1622.36 ± 1.55 | 1859.65 ± 8.87 | **1.15** |
+| pp8192 | 1504.32 ± 1.54 | 1764.49 ± 2.82 | **1.17** |
+| tg128 | 26.48 ± 0.01 | 26.83 ± 0.07 | **1.01** |
+| pp512 @ d4096 | 724.93 ± 13.87 | 1239.33 ± 13.96 | **1.71** |
+| pp2048 @ d4096 | 1242.66 ± 0.72 | 1727.46 ± 5.17 | **1.39** |
+| pp8192 @ d4096 | 1209.95 ± 0.66 | 1688.55 ± 3.54 | **1.40** |
+| tg128 @ d4096 | 25.79 ± 0.01 | 25.59 ± 0.07 | 0.99 |
+| pp512 @ d16384 | 633.30 ± 8.47 | 1145.88 ± 12.45 | **1.81** |
+| pp2048 @ d16384 | 1135.74 ± 4.94 | 1574.21 ± 3.86 | **1.39** |
+| pp8192 @ d16384 | 1101.76 ± 0.49 | 1548.09 ± 3.05 | **1.40** |
+| tg128 @ d16384 | 25.27 ± 0.02 | 25.12 ± 0.10 | 0.99 |
 
-Decode is a dead heat (1.01x, 0.99x, 1.00x — inside the run-to-run spread),
-prefill at depth is ours by 1.15-1.18x, and **prefill into an empty cache is
-llama.cpp's**: 0.57x at 512 tokens, 0.92x at 2048.
+Nine of twelve ours, up to 1.81x; decode is a tie within ±1%; and the one
+llama.cpp still holds is prefilling 512 tokens into an empty cache, at 0.96x.
 
-That last row is one structural difference, and it is not mysterious. This
-engine dequantizes each Q8 weight into a BF16 scratch and runs the ordinary
-DPAS GEMM, which costs an extra HBM round trip **per block** — read q8, write
-bf16, read bf16, or about 2.5x the weight traffic of a fused path. llama.cpp
-fuses the dequantization into its matmul. The cost is per block and the benefit
-is per token, so it disappears as the block fills (pp512 0.57x, pp2048 0.92x,
-pp8192 0.96x) and is more than repaid once attention dominates. Two ways out,
-both identified and neither started: a fused int8→bf16 GEMM feeding DPAS, or
-layer-major prefill (loop layers outside blocks, so a weight is dequantized
-once per prefill rather than once per block).
+**The fix was not the one that had been planned.** This document previously
+said the Q8 prefill gap needed a fused int8→bf16 GEMM or layer-major prefill,
+because the tier dequantizes each weight into a BF16 scratch per block. The
+extra round trip is real, but it was not the cost. Timing the two halves
+separately said the dequantize pass was running at **108 GB/s** against a card
+that streams 550, and the reason was the same one the decode GEMV had already
+been caught by: it read the int8 quants **one byte at a time**. Two 16-byte
+vector loads and four 16-byte stores later it runs at 320 GB/s, prefill went
+
+| | before | after |
+|---|---:|---:|
+| pp512 | 789 | **1318** |
+| pp2048 | 1499 | **1860** |
+| pp8192 | 1443 | **1764** |
+
+and the dequantize pass went from 74% of Q8 prefill to 50%. Two blocks per
+work-item measured the same 316 GB/s, so at a 1:2 read:write ratio that is the
+pattern's rate rather than the thread count's — the remaining round trip is
+what pp512 is still paying, and the fused GEMM is now worth roughly the 4%
+that separates it from llama.cpp rather than the 43% it looked like.
 
 ## Speculative decoding, which llama.cpp cannot do here
 
@@ -100,7 +109,7 @@ so this is a capability difference rather than a race.
 
 Benchmarking against another implementation is worth doing precisely because it
 turns "this seems fine" into a number with something to compare it to. This one
-produced four fixes, in the order they were found.
+produced seven fixes, in the order they were found.
 
 **1. Split-K decode slices were four times too large.** One sub-group runs one
 slice, so the slice width *is* the occupancy: at 16 query heads a 512-key slice
@@ -147,11 +156,20 @@ difference between the two texts. `rb()` alone was 2x.
 The lesson is the one this repo keeps relearning: a microbenchmark of "the same
 kernel" is only evidence if it is the same *text*.
 
-**5. Prefill chunk 512 → 2048** (default changed). BF16 prefill +11%, Q8
+**5. The Q8 dequantize pass read bytes one at a time.** The same trap as #4 in
+a different kernel, and the one that had been mistaken for a structural
+limitation: 108 GB/s where the card streams 550, because
+`ob[k] = f2bf(float(wb[k]) * sc)` loads one int8 per iteration. Two 16-byte
+vector loads and four 16-byte stores take it to 320 GB/s, Q8 pp512 from 789 to
+1318 tok/s and pp2048 from 1499 to 1860. The lesson generalizes: every kernel
+in this engine that touches quantized weights element-wise is worth checking
+for the access width before anything cleverer is designed for it.
+
+**6. Prefill chunk 512 → 2048** (default changed). BF16 prefill +11%, Q8
 prefill +91% — the Q8 tier dequantizes per block, so a wider block amortizes
 it. ~0.8 GiB/card more scratch.
 
-**6. The all-reduce no longer host-syncs.** The pack's event is a cross-queue
+**7. The all-reduce no longer host-syncs.** The pack's event is a cross-queue
 dependency for the transport instead: 19.0 µs per all-reduce becomes 11.3, and
 there are 104 of them per decode token.
 
