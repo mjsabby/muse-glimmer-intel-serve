@@ -228,6 +228,17 @@ torchvision ≥ 0.27 (below that it silently substitutes BICUBIC).
 `--vision cpu` keeps it out of VRAM entirely and pays ~3–13 s per image on the
 host, and is the bitwise-gated path. `--vision off` refuses media.
 
+Video containers are decoded through the **ffmpeg binary** — no Python video
+decoder is installed (`pyav`, `decord`, `opencv` and torchvision's reader are
+all absent), and ffmpeg is what all four of them wrap. Sampling is the
+checkpoint's own (2 fps, 96 frames), applied before the processor so it does
+not sample twice. A video can also be sent as an explicit frame list —
+`{"type": "video_url", "video_url": {"frames": [...]}}` — which needs no
+decoder and is what the live gate uses. Measured end to end: a 2-second
+`testsrc2` clip comes back described as SMPTE colour bars "timed from
+00:00:00.500 to 00:00:01.500", which is the frames and their order arriving
+intact.
+
 `input_audio` returns a capability error. This model has no audio tower, no
 audio config and no audio tensors; answering anyway would be worse than saying
 so.
@@ -269,6 +280,11 @@ cache position** — a point mass on `script[L - prompt_len]` — rather than a
 cursor advanced per call. That distinction is the test: a call-counting fake
 passes the speculative accept path and quietly diverges on the reject path,
 which is the one that needs testing.
+
+`tools/longctx.py` is the long-context quality check: one distinctive sentence
+at a known depth in a haystack, randomized per run, asked for back. 12 of 12
+across 4 161 / 16 491 / 65 632 / **131 517** tokens at 5%, 50% and 95% depth.
+The live suite runs the short version of it.
 
 `live_api_tests.py` covers what only the weights can show: the channel split,
 determinism from a known cache state, the speculative tie property above,

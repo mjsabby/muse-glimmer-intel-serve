@@ -253,6 +253,42 @@ print("  %s image+text logits (argmax %d vs %d, top-%d %.0f%%)" %
 sys.exit(0 if (ok and ok2) else 1)
 PY
 
+# Video: the same tower with t > 1. On the CPU side this is bitwise
+# (run_tiny.sh); here it is the same envelope as the image case, and the point
+# is that the temporal grid reaches the GPU intact -- the window index, the
+# 2-D position taps and the pixel-shuffle offsets are all computed per frame.
+VVIDS=$(.venv/bin/python -c "print(','.join(['1'] + ['501']*48 + ['7']))")
+.venv/bin/python py/ref_vision.py --model "$VM" --video 4,112,168,3 --out "$OUT/vidref" \
+    --pure --fixed-reduce --threads 1 --ids "$VVIDS" >/dev/null 2>&1
+VVGRID=$(.venv/bin/python -c "import json;print(json.load(open('$OUT/vidref/meta.json'))['grid_arg'])")
+$CPU --model "$VM" --ids "$VVIDS" --out "$OUT/vidorc" --pixels "$OUT/vidref/pixel_values.bin" \
+    --grid "$VVGRID" >/dev/null 2>&1
+$CPU --model "$VM" --ids "$VVIDS" --out "$OUT/vidtwin" --pixels "$OUT/vidref/pixel_values.bin" \
+    --grid "$VVGRID" --dtype bf16 >/dev/null 2>&1
+$GPU --model "$VM" --ids "$VVIDS" --out "$OUT/vidgpu" --shards 1 --gpus 1 --chunk 50 \
+    --max-seq 128 --pixels "$OUT/vidref/pixel_values.bin" --grid "$VVGRID" >/dev/null 2>&1
+.venv/bin/python - "$OUT" "$VVGRID" <<'PYV' || rc=1
+import numpy as np, sys
+o = np.fromfile(sys.argv[1] + "/vidorc/vision.bin", dtype=np.float64)
+t = np.fromfile(sys.argv[1] + "/vidtwin/vision.bin", dtype=np.float64)
+g = np.fromfile(sys.argv[1] + "/vidgpu/vision.bin", dtype=np.float64)
+budget = max(1.5 * np.abs(t - o).max(), 1e-6)
+err = np.abs(g - o).max()
+ok = g.shape == o.shape and err <= budget
+print("  %s video features vs oracle (grid %s, max %.3e, twin's own %.3e)" %
+      ("\033[32mPASS\033[0m" if ok else "\033[31mFAIL\033[0m", sys.argv[2], err,
+       np.abs(t - o).max()))
+lg = np.fromfile(sys.argv[1] + "/vidgpu/logits.bin", dtype=np.float64)
+lt = np.fromfile(sys.argv[1] + "/vidorc/logits.bin", dtype=np.float64)[-lg.size:]
+k = 20
+ov = len(set(np.argsort(-lg)[:k]) & set(np.argsort(-lt)[:k])) / k
+ok2 = lg.argmax() == lt.argmax() and ov >= 0.85
+print("  %s video+text logits (argmax %d vs %d, top-%d %.0f%%)" %
+      ("\033[32mPASS\033[0m" if ok2 else "\033[31mFAIL\033[0m", lg.argmax(), lt.argmax(),
+       k, 100 * ov))
+sys.exit(0 if (ok and ok2) else 1)
+PYV
+
 echo "== --flash-decode (split-K decode attention, LOOSER contract) =="
 # Same class as --flash-prefill: splitting the key range across work-groups
 # reorders the softmax rescalings, so it is envelope-gated, not bitwise. What

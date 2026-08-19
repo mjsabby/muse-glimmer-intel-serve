@@ -152,12 +152,41 @@ def build_vision_streamed(snap, cfg, with_text=False):
     return model
 
 
+def load_model(a, cfg, snap):
+    if a.load == "full":
+        model = RF.model_class(cfg).from_pretrained(
+            snap, dtype=torch.float64, attn_implementation="eager", local_files_only=True)
+        model.eval()
+        return model
+    return build_vision_streamed(snap, cfg, with_text=bool(getattr(a, "ids", None)))
+
+
+def run_tower(a, model, pixel_values, grid_thw):
+    """Tower + adapter + projection + norm, dumped. Images and video take the
+    same path here on purpose: `get_video_features` is `get_image_features`
+    with a t > 1 grid, so anything that only works for t == 1 is a bug in the
+    grid handling and this is where it shows."""
+    with torch.inference_mode():
+        tower = model.model.vision_tower(pixel_values=pixel_values, grid_thw=grid_thw)
+        feats = model.model.vision_adapter(tower.last_hidden_state)
+        feats = model.model.vision_projection(feats)
+        feats = model.model.perception_emb_norm(feats)
+    write_f64(os.path.join(a.out, "tower.bin"), tower.last_hidden_state.to(torch.float64).numpy())
+    write_f64(os.path.join(a.out, "vision.bin"), feats.to(torch.float64).numpy())
+    return tower.last_hidden_state, feats
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--load", choices=["full", "streamed"], default="full")
-    p.add_argument("--images", nargs="+", required=True,
+    p.add_argument("--images", nargs="+",
                    help="image files, or SYNTH:H,W[:seed] for a deterministic test image")
+    p.add_argument("--video", default=None, metavar="FRAMES,H,W[,SEED]",
+                   help="a synthetic video instead of images: FRAMES frames of HxW. "
+                        "Routes through MuseGlimmerVideoProcessor and the SAME tower "
+                        "(get_video_features just calls get_image_features), so the only "
+                        "thing that changes is a grid with t > 1")
     p.add_argument("--out", required=True)
     p.add_argument("--pure", action="store_true")
     p.add_argument("--fixed-reduce", action="store_true")
@@ -190,8 +219,24 @@ def main():
 
     from PIL import Image
 
+    if a.video:
+        # t > 1: temporal_patch_size 2 pairs frames, so FRAMES frames give
+        # t = FRAMES / 2. The tower is the same one; the grid is not.
+        from transformers import AutoVideoProcessor
+
+        parts = [int(x) for x in a.video.split(",")]
+        nfr, vh, vw = parts[0], parts[1], parts[2]
+        seed = parts[3] if len(parts) > 3 else 0
+        rng = np.random.default_rng(seed)
+        frames = rng.integers(0, 256, (nfr, vh, vw, 3), dtype=np.uint8)
+        vp = AutoVideoProcessor.from_pretrained(snap, local_files_only=True)
+        batch = vp(videos=[frames], return_tensors="pt", do_sample_frames=False)
+        video_pixels = batch["pixel_values_videos"].to(torch.float64)
+        video_grid = batch["video_grid_thw"]
+    if not a.video and not a.images:
+        p.error("one of --images or --video is required")
     images = []
-    for spec in a.images:
+    for spec in (a.images or []):
         if spec.startswith("SYNTH:"):
             parts = spec.split(":")[1].split(",")
             h, wdt = int(parts[0]), int(parts[1])
@@ -201,30 +246,20 @@ def main():
         else:
             images.append(Image.open(spec).convert("RGB"))
 
-    ip = AutoImageProcessor.from_pretrained(snap, local_files_only=True)
-    batch = ip(images=images, return_tensors="pt")
-    pixel_values = batch["pixel_values"].to(torch.float64)
-    grid_thw = batch["image_grid_thw"]
+    if a.video:
+        pixel_values, grid_thw = video_pixels, video_grid
+    else:
+        ip = AutoImageProcessor.from_pretrained(snap, local_files_only=True)
+        batch = ip(images=images, return_tensors="pt")
+        pixel_values = batch["pixel_values"].to(torch.float64)
+        grid_thw = batch["image_grid_thw"]
     print("pixel_values", tuple(pixel_values.shape), "grid", grid_thw.tolist())
 
     # the oracle consumes exactly these pixels
     write_f64(os.path.join(a.out, "pixel_values.bin"), pixel_values.numpy())
 
-    if a.load == "full":
-        model = RF.model_class(cfg).from_pretrained(
-            snap, dtype=torch.float64, attn_implementation="eager", local_files_only=True)
-        model.eval()
-    else:
-        model = build_vision_streamed(snap, cfg, with_text=bool(a.ids))
-
-    with torch.inference_mode():
-        tower = model.model.vision_tower(pixel_values=pixel_values, grid_thw=grid_thw)
-        feats = model.model.vision_adapter(tower.last_hidden_state)
-        feats = model.model.vision_projection(feats)
-        feats = model.model.perception_emb_norm(feats)
-
-    write_f64(os.path.join(a.out, "tower.bin"), tower.last_hidden_state.to(torch.float64).numpy())
-    write_f64(os.path.join(a.out, "vision.bin"), feats.to(torch.float64).numpy())
+    model = load_model(a, cfg, snap)
+    tower_out, feats = run_tower(a, model, pixel_values, grid_thw)
 
     # optional end-to-end: the same features scattered into inputs_embeds at the
     # image placeholders, then the text stack
@@ -236,10 +271,17 @@ def main():
         n_ph = sum(1 for i in ids if i in (cfg.image_token_id, cfg.video_token_id))
         assert n_ph == feats.shape[0], (
             f"{n_ph} placeholder tokens in --ids but {feats.shape[0]} vision features")
+        # Video goes in as pixel_values_videos/video_grid_thw and is masked at
+        # video_token_id. `get_video_features` is `get_image_features`, so the
+        # tower output is the same either way — but the SCATTER is keyed on the
+        # placeholder id, and handing video pixels in through the image
+        # argument scatters nothing ("tokens: 0, features: 48").
+        media = ({"pixel_values_videos": pixel_values, "video_grid_thw": grid_thw}
+                 if a.video else
+                 {"pixel_values": pixel_values, "image_grid_thw": grid_thw})
         with torch.inference_mode():
             out = model.model(input_ids=torch.tensor([ids], dtype=torch.long),
-                              pixel_values=pixel_values, image_grid_thw=grid_thw,
-                              use_cache=False)
+                              use_cache=False, **media)
             logits = model.lm_head(out.last_hidden_state)
             logits = RF.output_tail(logits, cfg.get_text_config())
         lg = logits[0].to(torch.float64).numpy()
@@ -258,7 +300,7 @@ def main():
                                          for g in grid_thw.tolist()),
                        torch=torch.__version__, transformers=transformers.__version__), f,
                   indent=1)
-    print("tower", tuple(tower.last_hidden_state.shape), "-> features", tuple(feats.shape))
+    print("tower", tuple(tower_out.shape), "-> features", tuple(feats.shape))
     print("feature[0][:6]", [round(float(v), 6) for v in feats[0, :6]])
 
 

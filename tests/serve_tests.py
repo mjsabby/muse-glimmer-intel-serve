@@ -525,6 +525,45 @@ class TestProtocols(unittest.TestCase):
         self.assertTrue(r.json()["choices"][0]["text"].startswith("Paris"),
                         r.json()["choices"][0]["text"][:40])
 
+    def test_video_part_expands_to_its_merged_tokens(self):
+        """The one shipped feature that had no gate. A video is the same tower
+        with t > 1, and the thing that can silently go wrong at the serving
+        layer is the placeholder count: the template writes ONE `<|video|>` and
+        the prompt needs one per merged token, or the features scatter into the
+        wrong rows."""
+        from PIL import Image
+        import base64, io as _io
+
+        from serve import media as M
+        try:
+            pre = M.Preprocessor(chatlib.resolve_dir(MODEL))
+        except Exception as e:                                   # pragma: no cover
+            raise unittest.SkipTest(f"processor unavailable: {e}")
+        if pre.video is None:
+            raise unittest.SkipTest("no MuseGlimmerVideoProcessor in this build")
+
+        def frame(seed: int) -> str:
+            a = (np.random.RandomState(seed).rand(112, 168, 3) * 255).astype("uint8")
+            buf = _io.BytesIO()
+            Image.fromarray(a).save(buf, format="PNG")
+            return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": "what happens here?"},
+            {"type": "video_url", "video_url": {"frames": [frame(i) for i in range(4)]}}]}]
+        plain, med = M.split_parts(msgs, pre)
+        self.assertEqual(len(med), 1)
+        self.assertEqual(med[0].kind, "video")
+        self.assertEqual(med[0].grid[0], 2, "4 frames pair into t=2")
+        text = chatlib.render(self.tok, plain, reasoning="low")
+        self.assertEqual(text.count(M.VIDEO), 1, "the template writes one placeholder")
+        text = M.expand_placeholders(text, med, 4)
+        want = med[0].tokens(4)
+        self.assertEqual(text.count(M.VIDEO), want)
+        ids = chatlib.encode(self.tok, text)
+        self.assertEqual(sum(1 for t in ids if t == 200091), want,
+                         "one video token id per merged vision token")
+
     def test_health_and_models(self):
         c, _ = self._client(" to=user<|message|>x<|eot|>")
         self.assertEqual(c.get("/health").json()["status"], "ok")

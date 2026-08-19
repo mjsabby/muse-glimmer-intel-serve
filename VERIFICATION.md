@@ -16,10 +16,10 @@ Gate counts, all green as of this writing:
 
 | suite | checks | needs |
 |---|---:|---|
-| `./run_tiny.sh` | 26 | CPU only |
-| `./run_gpu_gates.sh` | 28 | the B70 box |
-| `.venv/bin/python -m tests.serve_tests` | 41 | CPU only |
-| `.venv/bin/python -m tests.live_api_tests` | 30 | the box, a running server |
+| `./run_tiny.sh` | 30 | CPU only |
+| `./run_gpu_gates.sh` | 30 | the B70 box |
+| `.venv/bin/python -m tests.serve_tests` | 42 | CPU only |
+| `.venv/bin/python -m tests.live_api_tests` | 33 | the box, a running server |
 
 ---
 
@@ -600,6 +600,60 @@ different cache state can land on the other side of a tie.
 
 ---
 
+## 6g. Video and long-context retrieval
+
+Two gaps that were closed after the rest of the stack shipped, both because
+"it is implemented" and "it has ever been run" are different statements.
+
+### Video: the same tower, a temporal grid
+
+`get_video_features` is `get_image_features` with a `t > 1` grid, so the tower
+is not the risk — the grid handling is (window index, 2-D position taps and
+pixel-shuffle offsets are all computed per frame), and so is the placeholder
+id, which is `video_token_id` and not `image_token_id`.
+
+| gate | grid | strength |
+|---|---|---|
+| `run_tiny.sh` video features, 4 frames | 2,8,12 | **bitwise** (0 differing bytes) |
+| `run_tiny.sh` video+text logits, 4 frames | 2,8,12 | **bitwise** |
+| `run_tiny.sh` video features + logits, 8 frames | 4,6,10 | **bitwise** |
+| `run_gpu_gates.sh` video features vs the f64 oracle | 2,8,12 | envelope (2.218e-02 against the twin's own 2.459e-02) |
+| `run_gpu_gates.sh` video+text logits | 2,8,12 | argmax + top-20 |
+| `live_api_tests.py` frame-list video | | temporal order (red shot then blue) |
+
+Writing the reference's video path found the first bug immediately: the
+end-to-end call handed video pixels in through the *image* argument, which
+scatters nothing (`tokens: 0, features: 48`) because the mask is keyed on the
+placeholder id.
+
+Serving decodes containers through the **ffmpeg binary** rather than a Python
+decoder — `pyav`, `decord`, `opencv` and torchvision's video reader are all
+absent from the pinned environment, and ffmpeg is what all four of them wrap.
+A 2-second `testsrc2` clip end to end returns "SMPTE color-bars … timed from
+00:00:00.500 to 00:00:01.500", which is the frames *and* their order arriving
+intact. A frame-list form (`video_url: {frames: [...]}`) needs no decoder at
+all and is what the gate uses.
+
+### Retrieval at depth
+
+Speed at depth is not retrieval at depth. `tools/longctx.py` places one
+distinctive sentence at a known fraction of a haystack of numbered filler
+paragraphs and asks for it back; the needle is a random word and number drawn
+per run, so a pass cannot come from the checkpoint having memorized anything.
+
+| prompt tokens | 5% | 50% | 95% |
+|---:|---|---|---|
+| 4 161 | found | found | found |
+| 16 491 | found | found | found |
+| 65 632 | found | found | found |
+| **131 517** | **found** | **found** | **found** |
+
+12 of 12, the last three at 111 s of prefill each on two B70s. The answer is
+scored across both channels: a code recalled in `reasoning_content` and not
+repeated is still retrieval, and scoring only `content` would call it a miss.
+
+---
+
 ## 7. DFlash — the plan's one open item, resolved
 
 docs/plan.md leaves one question genuinely open ("the number of denoising
@@ -630,8 +684,7 @@ per-position logit agreement, acceptance rate). Phase 5 is not implemented.
 |---|---|---|
 | 4 | GGUF ingest, Q8/Q4_K bands vs llama.cpp | **not started** — the only untouched phase |
 | 6 | vision: byte-exact **preprocessing** in C++ | **not started**. The server reaches the checkpoint's own `MuseGlimmerImageProcessor` through Python, so serving is byte-exact by construction; what is missing is a C++ ingestion path for a Python-free deployment. §6c explains why the plan's PIL target is wrong |
-| 6 | video: `t > 1` grids, 2 fps sampling, per-frame pixel-shuffle offsets | **not started**, and it is the one shipped feature with no gate: the tower takes `t`, the server accepts `video_url`, and no `t > 1` grid has been run end to end |
-| 11 | long-context **quality** (needle retrieval at depth) | **not started**. 131 072 is measured as speed — it prefills and decodes — but nothing checks that retrieval still works there |
+| 6 | video: 2 fps sampling from a container | **gated for the grid, not for the sampling.** `t > 1` is now bitwise on the CPU, envelope-gated on the GPU and checked end to end through the server (§6g); what is *not* gated is the frame selection ffmpeg does before the processor sees the frames |
 
 Three more honest gaps inside what *is* implemented:
 

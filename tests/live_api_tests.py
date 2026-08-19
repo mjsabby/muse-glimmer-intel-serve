@@ -346,6 +346,55 @@ def gate_vision(url: str, image: str | None) -> None:
     check(bool(txt), "an image prompt answers", txt[:60])
 
 
+def gate_video(url: str) -> None:
+    """Video is the same tower with t > 1, and what can go wrong at this layer
+    is temporal: frames pair into t = frames/2, and if the ordering or the
+    per-frame pixel-shuffle offset is wrong the model still answers — with the
+    shots in the wrong order. So the gate asks for the order."""
+    print("== video ==")
+    import base64
+    import io as _io
+    try:
+        import numpy as np
+        from PIL import Image
+    except Exception as e:                                       # pragma: no cover
+        print(f"  skipped (numpy/PIL unavailable: {e})")
+        return
+
+    def frame(channel: int) -> str:
+        a = np.zeros((112, 168, 3), dtype="uint8")
+        a[..., channel] = 230
+        buf = _io.BytesIO()
+        Image.fromarray(a).save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    frames = [frame(0), frame(0), frame(2), frame(2)]          # red, red, blue, blue
+    r = post(url, "/v1/chat/completions", brief(messages=[{"role": "user", "content": [
+        {"type": "text", "text": "This video has two shots. Name the colour of the first "
+                                 "shot and then the second, in that order."},
+        {"type": "video_url", "video_url": {"frames": frames}}]}]), timeout=2400)
+    txt = text_of(r).lower()
+    check("red" in txt and "blue" in txt, "a frame-list video reaches the model", txt[:70])
+    check(txt.find("red") < txt.find("blue") if ("red" in txt and "blue" in txt) else False,
+          "and the shots are in temporal order")
+
+
+def gate_needle(url: str) -> None:
+    """Retrieval at depth, briefly. Everything else here measures long context
+    as speed; this asks whether the answer is still in there. The full sweep
+    (to 131 072) is `tools/longctx.py` — this is the short version so the gate
+    stays a gate."""
+    print("== retrieval at depth ==")
+    import subprocess
+    r = subprocess.run(
+        [sys.executable, "tools/longctx.py", "--url", url, "--lengths", "4096",
+         "--depths", "0.05,0.5,0.95", "--seed", "3"],
+        capture_output=True, text=True)
+    hits = r.stdout.count("PASS")
+    check(r.returncode == 0 and hits == 3, "a needle at 5%, 50% and 95% of 4096 tokens",
+          r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[:80])
+
+
 def gate_errors(url: str) -> None:
     print("== errors are errors ==")
     for body, want, what in (
@@ -395,6 +444,8 @@ def main() -> int:
         gate_prefix_reuse(a.url)
         gate_protocols(a.url)
         gate_vision(a.url, a.image)
+        gate_video(a.url)
+        gate_needle(a.url)
         gate_errors(a.url)
     finally:
         if proc:

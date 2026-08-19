@@ -102,6 +102,25 @@ if cmp -s "$OUT/vision_oracle/vision.bin" "$OUT/vision_ref/vision.bin"; then
 if cmp -s "$OUT/vision_oracle/logits.bin" "$OUT/vision_ref/logits.bin"; then
     pass "image+text logits"; else fail "image+text logits"; fi
 
+# Video is the same tower with t > 1: `get_video_features` is
+# `get_image_features` with a temporal grid, so anything that only works for
+# t == 1 is a grid-handling bug and shows up here and nowhere else. The
+# placeholder id differs too (video_token_id, not image_token_id), which is
+# what the end-to-end half checks.
+for VSPEC in "4,112,168,3 48" "8,84,140,7 60"; do
+    set -- $VSPEC
+    VVIDS="$($PY -c "print(','.join(['1'] + ['501'] * $2 + ['7']))")"
+    $PY py/ref_vision.py --model "$TINY/tiny_vision" --video "$1" \
+        --out "$OUT/video_ref" --pure --fixed-reduce --threads 1 --ids "$VVIDS" >/dev/null
+    VGRID=$($PY -c "import json;print(json.load(open('$OUT/video_ref/meta.json'))['grid_arg'])")
+    $ORACLE --model "$TINY/tiny_vision" --ids "$VVIDS" --out "$OUT/video_oracle" \
+        --pixels "$OUT/video_ref/pixel_values.bin" --grid "$VGRID" >/dev/null
+    if cmp -s "$OUT/video_oracle/vision.bin" "$OUT/video_ref/vision.bin"; then
+        pass "video features (grid $VGRID)"; else fail "video features (grid $VGRID)"; fi
+    if cmp -s "$OUT/video_oracle/logits.bin" "$OUT/video_ref/logits.bin"; then
+        pass "video+text logits (grid $VGRID)"; else fail "video+text logits (grid $VGRID)"; fi
+done
+
 echo "== tiny_text: fast bf16 engine vs the twin (envelope, not bitwise) =="
 for ch in 256 4 1; do
     if $PY tools/bf16_parity.py --model "$TINY/tiny_text" --ids "$IDS" --topk 20 \

@@ -685,6 +685,21 @@ the argv limit.
 | BF16 + Q8_0 drafter | **131 072** (0.36 GiB/card left) | — | — |
 | Q8_0 + Q8_0 drafter | **131 072** | — | — |
 
+**And the answer is still in there.** Speed at depth is not retrieval at depth,
+so `tools/longctx.py` places one distinctive sentence at a known fraction of a
+haystack and asks for it back, with the needle randomized per run so a pass
+cannot come from memorization:
+
+| prompt | needle at 5% | 50% | 95% |
+|---:|---|---|---|
+| 4 161 | found | found | found |
+| 16 491 | found | found | found |
+| 65 632 | found | found | found |
+| **131 517** | **found** | **found** | **found** |
+
+12 of 12, the last three at 111 s of prefill each. Until this existed the
+131 072 claim was "it prefills and decodes", which is a different claim.
+
 The drafter row is now measured rather than estimated: a BF16 target with a Q8
 drafter prewarms and serves at the **full 131 072**, leaving 0.36 GiB/card. The
 serving frontend's capacity planner still defaults that configuration to 65 536,
